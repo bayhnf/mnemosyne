@@ -1150,3 +1150,93 @@ def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, mon
     provider.initialize("hygiene-followup", agent_context="subagent")
 
     assert provider._beam is None
+
+
+# ---------------------------------------------------------------------------
+# Task 1 / Wave 1 P0: per-candidate savepoint isolation + idempotent restore
+# ---------------------------------------------------------------------------
+
+
+class TestHygieneSavepointIsolation:
+    """Hygiene mutation, auxiliary cleanup, and audit writes must be isolated
+    by a per-candidate savepoint so one bad candidate does not partially
+    mutate another."""
+
+    def test_bad_candidate_partial_mutation_rolled_back_good_candidate_preserved(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "good", "good content", importance=0.7)
+        _insert_row(beam, "working_memory", "bad", "bad content", importance=0.7)
+        # A non-JSON-serializable noise_reason makes json.dumps raise during
+        # bad's audit-log INSERT, AFTER bad's DELETE has staged.
+        candidates = [
+            NoiseCandidate(
+                memory_id="good", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="bad", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=[object()],  # not JSON-serializable
+                suggested_action="delete",
+            ),
+        ]
+        result = clean_noise(db_path, candidates, action="delete", confirm=True, dry_run=False)
+
+        conn = sqlite3.connect(str(db_path))
+        good = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'good'"
+        ).fetchone()[0]
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'bad'"
+        ).fetchone()[0]
+        good_log = conn.execute(
+            "SELECT COUNT(*) FROM hygiene_audit_log WHERE memory_id = 'good'"
+        ).fetchone()[0]
+        bad_log = conn.execute(
+            "SELECT COUNT(*) FROM hygiene_audit_log WHERE memory_id = 'bad'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert good == 0, "good candidate should be deleted"
+        assert bad == 1, (
+            "bad candidate must survive — its partial DELETE should have been "
+            "rolled back by the per-candidate savepoint"
+        )
+        assert good_log == 1, "good candidate audit entry committed"
+        assert bad_log == 0, "bad candidate audit entry must not have committed"
+        assert any("bad" in e for e in result.errors)
+
+
+class TestHygieneRestoreIdempotent:
+    """restore_archived() must be idempotent — calling it twice must not
+    corrupt the restored importance value."""
+
+    def test_restore_twice_does_not_corrupt_importance(self, temp_db):
+        db_path, beam = temp_db
+        _insert_row(beam, "working_memory", "n1", "heartbeat", importance=0.8,
+                    metadata={"original": "data"})
+        candidates = [NoiseCandidate(
+            memory_id="n1", table_name="working_memory",
+            content_preview="heartbeat", noise_score=0.6,
+            noise_reasons=["trivial"], suggested_action="archive",
+        )]
+        clean_noise(db_path, candidates, action="archive", confirm=True, dry_run=False)
+
+        first = restore_archived(db_path)
+        second = restore_archived(db_path)
+
+        assert first >= 1, "first restore should recover the archived row"
+        conn = sqlite3.connect(str(db_path))
+        importance, metadata_json = conn.execute(
+            "SELECT importance, metadata_json FROM working_memory WHERE id = 'n1'"
+        ).fetchone()
+        conn.close()
+        assert importance == 0.8, (
+            "second restore overwrote the restored importance — restore is not "
+            "idempotent"
+        )
+        meta = json.loads(metadata_json)
+        assert "_archived" not in meta
+        assert "_original_importance" not in meta
+        assert meta.get("original") == "data"

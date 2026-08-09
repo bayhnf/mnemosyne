@@ -674,6 +674,14 @@ def clean_noise(
         for c in candidates:
             effective_action = action if action != "keep" else c.suggested_action
 
+            # Isolate each candidate in its own savepoint so a failure on one
+            # candidate (partial mutation, audit-log write error, etc.) rolls
+            # back ONLY that candidate's staged changes. Without this, a
+            # mid-candidate raise leaves the partial mutation staged in the
+            # shared transaction and committed at the end alongside every
+            # other candidate, producing a half-applied row that the audit
+            # log does not describe.
+            cursor.execute("SAVEPOINT hygiene_candidate")
             try:
                 # Fetch original content + metadata for audit log
                 cursor.execute(
@@ -682,6 +690,8 @@ def clean_noise(
                 )
                 row = cursor.fetchone()
                 if row is None:
+                    cursor.execute("ROLLBACK TO hygiene_candidate")
+                    cursor.execute("RELEASE hygiene_candidate")
                     result.errors.append(f"Row not found: {c.table_name}:{c.memory_id}")
                     continue
 
@@ -755,8 +765,15 @@ def clean_noise(
                     ),
                 )
                 result.log_entries += 1
+                cursor.execute("RELEASE hygiene_candidate")
 
             except Exception as e:
+                try:
+                    cursor.execute("ROLLBACK TO hygiene_candidate")
+                    cursor.execute("RELEASE hygiene_candidate")
+                except sqlite3.Error:
+                    logger.warning("Failed to roll back hygiene savepoint for %s:%s",
+                                   c.table_name, c.memory_id, exc_info=True)
                 result.errors.append(f"Error processing {c.table_name}:{c.memory_id}: {e}")
                 logger.warning("Hygiene cleanup error for %s:%s: %s",
                                c.table_name, c.memory_id, e)
@@ -832,6 +849,16 @@ def restore_archived(
                 continue
             current_meta = row["metadata_json"] or "{}"
             meta = json.loads(current_meta)
+
+            # Idempotency guard: only restore rows that are still archived.
+            # The audit log is append-only, so a second restore_archived()
+            # call would otherwise re-select already-restored entries, find
+            # no _original_importance (it was popped on the first restore),
+            # fall back to 0.5, and overwrite the correct importance value.
+            # Skipping rows whose _archived flag is gone makes repeat calls a
+            # safe no-op.
+            if not meta.get("_archived"):
+                continue
 
             # Use the preserved _original_importance from metadata if
             # available; fall back to 0.5 for entries archived before
