@@ -1249,10 +1249,40 @@ def init_beam(db_path: Path = None):
             last_error_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            metadata_json TEXT
+            metadata_json TEXT,
+            claim_worker_id TEXT,
+            claim_worker_lease TEXT
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_retry ON ingest_receipts(status, index_status, created_at)")
+    # Additive claim columns for pre-existing receipt rows (older DBs).
+    existing_receipt_cols = {
+        row[1] for row in cursor.execute("PRAGMA table_info(ingest_receipts)")
+    }
+    if "claim_worker_id" not in existing_receipt_cols:
+        cursor.execute(
+            "ALTER TABLE ingest_receipts ADD COLUMN claim_worker_id TEXT"
+        )
+    if "claim_worker_lease" not in existing_receipt_cols:
+        cursor.execute(
+            "ALTER TABLE ingest_receipts ADD COLUMN claim_worker_lease TEXT"
+        )
+    # Durable, append-only conflict audit trail. Conflicts are NOT recorded
+    # on the original receipt row (which would conflate conflict bookkeeping
+    # with the indexing lifecycle and terminalize a still-retryable original).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_conflicts (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL,
+            stored_payload_hash TEXT NOT NULL,
+            conflicting_payload_hash TEXT NOT NULL,
+            observed_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ingest_conflicts_event "
+        "ON ingest_conflicts(event_id, observed_at)"
+    )
 
 
 class _BeamConnection(sqlite3.Connection):

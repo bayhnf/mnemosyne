@@ -29,11 +29,33 @@ from mnemosyne.core.sync import _parse_sync_timestamp
 logger = logging.getLogger(__name__)
 
 ROLES = frozenset({"user", "assistant", "tool", "system"})
+
+
+class _InhaleTransactionError(RuntimeError):
+    """Caller-owned/deferred transaction context is unsupported.
+
+    The Inhale APIs own a short atomic transaction and must not (a) leave a
+    ``_defer_commit`` flag set across network enrichment, or (b) roll back a
+    transaction the caller opened. Detect and reject this before any
+    mutation so the caller's context is preserved untouched.
+    """
+
+
+def _iso_from_epoch(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def _now_epoch() -> float:
+    return datetime.now(timezone.utc).timestamp()
 MAX_ATTEMPTS = 5
 MAX_CONTENT_CHARS = 1_000_000
 MAX_FIELD_CHARS = 255
 MAX_METADATA_BYTES = 128 * 1024
 RETRYABLE_INDEX_STATES = ("pending", "failed_retryable", "degraded")
+# A retry worker holds a claim for at most this long; stale claims older than
+# this are reclaimed deterministically so a crashed worker cannot strand a
+# receipt. Keep short enough that enrichment never overlaps a DB transaction.
+CLAIM_LEASE_SECONDS = 60.0
 _MEMORIA_SOURCE_TABLES = (
     "memoria_facts",
     "memoria_timelines",
@@ -118,6 +140,7 @@ def remember_event(beam, event: IngestEvent) -> IngestReceipt:
 
     payload_hash = _payload_hash(event)
     conn = beam.conn
+    _assert_inhale_transaction_context(conn)
     engine = _get_sync_engine(beam)
     now = _now_iso()
     provenance = _provenance(event)
@@ -130,45 +153,38 @@ def remember_event(beam, event: IngestEvent) -> IngestReceipt:
         ).fetchone()
         if row is not None:
             if row["payload_hash"] == payload_hash:
-                # Identical payload replay: the original is already stored,
-                # so this attempt is a duplicate regardless of whether an
-                # intervening different-payload attempt later flipped the
-                # row to 'conflict'. The dedup authority is payload_hash,
-                # which the conflict path never overwrites.
+                # Identical payload replay: the original is already stored.
+                # Return the ORIGINAL receipt (its truthful index state,
+                # e.g. ready/pending) surfaced as a duplicate. The dedup
+                # authority is payload_hash, which the conflict path never
+                # touches.
                 conn.rollback()
                 return _receipt_from_row(row, status="duplicate")
-            # Event id reused with a different payload: terminal, no mutation.
-            # CRITICAL: do NOT overwrite payload_hash, memory_ids,
-            # metadata_json, or created_at -- those are the original
-            # receipt's identity and must stay intact so a later identical
-            # replay of the ORIGINAL payload still deduplicates. Only the
-            # conflict bookkeeping (status/index/error counters) flips.
-            conflicting_hash = payload_hash
+            # Event id reused with a different payload: structured conflict.
+            # The original receipt row is the indexing-lifecycle authority
+            # and is NOT mutated -- not status, not index_status, not
+            # memory_ids, not payload_hash, not attempts, not error fields.
+            # Conflict observability is a separate durable audit trail so a
+            # pending/failed_retryable original stays exactly as retryable
+            # as before the conflict.
             conn.execute(
-                """UPDATE ingest_receipts
-                   SET status = 'conflict',
-                       index_status = 'failed_terminal',
-                       attempts = attempts + 1,
-                       last_error_code = 'event_id_conflict',
-                       last_error_at = ?,
-                       updated_at = ?
-                   WHERE event_id = ?""",
-                (now, now, event.event_id),
+                """INSERT INTO ingest_conflicts
+                   (event_id, stored_payload_hash, conflicting_payload_hash,
+                    observed_at)
+                   VALUES (?, ?, ?, ?)""",
+                (event.event_id, row["payload_hash"], payload_hash, now),
             )
             conn.commit()
             logger.warning(
                 "ingest conflict event_id=%r: stored payload_hash=%s, "
-                "conflicting payload_hash=%s (original preserved)",
+                "conflicting payload_hash=%s (original receipt untouched)",
                 event.event_id,
                 row["payload_hash"],
-                conflicting_hash,
+                payload_hash,
             )
-            return _receipt_from_row(
-                conn.execute(
-                    "SELECT * FROM ingest_receipts WHERE event_id = ?",
-                    (event.event_id,),
-                ).fetchone()
-            )
+            # Synthesize the conflict outcome WITHOUT persisting it on the
+            # original lifecycle row.
+            return _conflict_receipt(row, payload_hash, now)
 
         memory_id = _memory_id_for_event(event.event_id)
         metadata_json = json.dumps(_memory_metadata(event), sort_keys=True, default=str)
@@ -262,13 +278,25 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
     authority, and enrichment re-runs are idempotent (MEMORIA rows keyed by
     source_memory_id are reset before re-extraction; graph/annotation writes
     are INSERT OR REPLACE / INSERT OR IGNORE).
+
+    Concurrency: each receipt is claimed via an atomic lease before
+    enrichment so two workers cannot duplicate work. Claims are acquired and
+    released in short SQLite transactions; enrichment (network/embedding)
+    never runs while a transaction is open. Stale claims (crashed worker /
+    expired lease) are reclaimed deterministically.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive integer")
     conn = beam.conn
+    _assert_inhale_transaction_context(conn)
+    now = _now_epoch()
+    now_iso = _iso_from_epoch(now)
+    worker_id = f"{threading.get_ident()}:{now}:{_event_id_token()}"
     placeholders = ",".join("?" * len(RETRYABLE_INDEX_STATES))
-    rows = conn.execute(
-        f"""SELECT * FROM ingest_receipts
+    # Select candidates outside any transaction; the claim is the real gate.
+    candidates = conn.execute(
+        f"""SELECT event_id, memory_ids, attempts, payload_hash
+            FROM ingest_receipts
             WHERE status = 'stored'
               AND index_status IN ({placeholders})
             ORDER BY created_at
@@ -276,52 +304,71 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
         (*RETRYABLE_INDEX_STATES, limit),
     ).fetchall()
     report = RetryReport()
-    # ponytail: no per-event claim row; concurrent retry workers on the SAME
-    # event can both re-run enrichment (memory rows stay safe — the receipt is
-    # the authority). Add a claimed/worker state when multi-worker retry is a
-    # requirement.
-    for row in rows:
+    for row in candidates:
         event_id = row["event_id"]
         attempts = int(row["attempts"] or 0)
-        if attempts >= MAX_ATTEMPTS:
-            _finalize_receipt(
-                beam, event_id, "failed_terminal", "max_attempts_exceeded", attempts
-            )
-            report.attempted += 1
-            report.failed_terminal += 1
-            report.receipts.append(_final_row(conn, event_id))
-            continue
 
-        memory_rows = _load_memory_rows(conn, row["memory_ids"])
-        if not memory_rows:
-            _finalize_receipt(
-                beam, event_id, "failed_terminal", "memory_row_missing", attempts + 1
-            )
-            report.attempted += 1
-            report.failed_terminal += 1
-            report.receipts.append(_final_row(conn, event_id))
-            continue
+        # Claim the receipt in a short transaction. The atomic UPDATE ensures
+        # only one worker wins; a stale lease (older than now) is reclaimable.
+        lease_iso = _iso_from_epoch(now + CLAIM_LEASE_SECONDS)
+        claimed = _try_claim(conn, event_id, worker_id, lease_iso, now_iso)
+        if not claimed:
+            continue  # Another worker owns it (live claim).
 
-        final_status, final_code = "ready", None
-        severity = {
-            "ready": 0,
-            "degraded": 1,
-            "failed_retryable": 2,
-            "failed_terminal": 3,
-        }
-        for memory_row in memory_rows:
-            status, code = _index_memory(
-                beam,
-                memory_row["id"],
-                memory_row["content"],
-                memory_row["source"],
-                memory_row["timestamp"],
-            )
-            # Worst state wins so the receipt never overclaims.
-            if severity[status] > severity[final_status]:
-                final_status, final_code = status, code
+        try:
+            if attempts >= MAX_ATTEMPTS:
+                _finalize_claimed(
+                    conn, event_id, "failed_terminal",
+                    "max_attempts_exceeded", attempts, release=True,
+                )
+                report.attempted += 1
+                report.failed_terminal += 1
+                report.receipts.append(_final_row(conn, event_id))
+                continue
 
-        _finalize_receipt(beam, event_id, final_status, final_code, attempts + 1)
+            memory_rows = _load_memory_rows(conn, row["memory_ids"])
+            if not memory_rows:
+                _finalize_claimed(
+                    conn, event_id, "failed_terminal",
+                    "memory_row_missing", attempts + 1, release=True,
+                )
+                report.attempted += 1
+                report.failed_terminal += 1
+                report.receipts.append(_final_row(conn, event_id))
+                continue
+
+            final_status, final_code = "ready", None
+            severity = {
+                "ready": 0,
+                "degraded": 1,
+                "failed_retryable": 2,
+                "failed_terminal": 3,
+            }
+            for memory_row in memory_rows:
+                status, code = _index_memory(
+                    beam,
+                    memory_row["id"],
+                    memory_row["content"],
+                    memory_row["source"],
+                    memory_row["timestamp"],
+                )
+                # Worst state wins so the receipt never overclaims.
+                if severity[status] > severity[final_status]:
+                    final_status, final_code = status, code
+
+            _finalize_claimed(
+                conn, event_id, final_status, final_code,
+                attempts + 1, release=True,
+            )
+        except Exception:
+            # Crash during enrichment: release the claim so the receipt is
+            # not stranded (its index_status stays as-is, still retryable).
+            try:
+                _release_claim(conn, event_id)
+            except Exception:
+                pass
+            raise
+
         report.attempted += 1
         if final_status == "ready":
             report.succeeded += 1
@@ -333,6 +380,108 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
             report.failed_terminal += 1
         report.receipts.append(_final_row(conn, event_id))
     return report
+
+
+def _try_claim(
+    conn: sqlite3.Connection,
+    event_id: str,
+    worker_id: str,
+    lease_iso: str,
+    now_iso: str,
+) -> bool:
+    """Atomically claim a receipt for this worker in a short transaction.
+
+    Wins only if the receipt is unclaimed or its lease has expired (stale
+    claim from a crashed worker). Returns True if this worker now owns it.
+    """
+    _begin_write(conn)
+    try:
+        cur = conn.execute(
+            """UPDATE ingest_receipts
+               SET claim_worker_id = ?,
+                   claim_worker_lease = ?
+               WHERE event_id = ?
+                 AND (
+                   claim_worker_id IS NULL
+                   OR claim_worker_lease IS NULL
+                   OR claim_worker_lease < ?
+                 )""",
+            (worker_id, lease_iso, event_id, now_iso),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _release_claim(conn: sqlite3.Connection, event_id: str) -> None:
+    """Clear a claim so a crashed/finished worker does not strand the receipt."""
+    _begin_write(conn)
+    try:
+        conn.execute(
+            """UPDATE ingest_receipts
+               SET claim_worker_id = NULL,
+                   claim_worker_lease = NULL
+               WHERE event_id = ?""",
+            (event_id,),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _finalize_claimed(
+    conn: sqlite3.Connection,
+    event_id: str,
+    index_status: str,
+    error_code: Optional[str],
+    attempts: int,
+    *,
+    release: bool,
+) -> None:
+    """Move a claimed receipt to its terminal/retryable state and release the
+    claim in one short transaction."""
+    now = _now_iso()
+    _begin_write(conn)
+    try:
+        conn.execute(
+            """UPDATE ingest_receipts
+               SET index_status = ?,
+                   attempts = ?,
+                   last_error_code = ?,
+                   last_error_at = ?,
+                   updated_at = ?"""
+            + (", claim_worker_id = NULL, claim_worker_lease = NULL" if release else "")
+            + """ WHERE event_id = ?""",
+            (
+                index_status,
+                attempts,
+                error_code,
+                now if error_code else None,
+                now,
+                event_id,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _event_id_token() -> str:
+    """Short unique token for worker ids."""
+    return hashlib.sha256(_now_iso().encode("utf-8")).hexdigest()[:8]
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +604,30 @@ def _begin_write(conn: sqlite3.Connection) -> None:
             conn.execute("BEGIN IMMEDIATE")
         else:
             raise
+
+
+def _assert_inhale_transaction_context(conn: sqlite3.Connection) -> None:
+    """Reject caller-owned / deferred transaction contexts before mutation.
+
+    The Inhale API must own its short atomic transaction. Running inside a
+    deferred-commit context would leave ``_defer_commit`` set across network
+    enrichment; running inside an already-open transaction would either nest
+    illegally or cause the API's rollback to discard the caller's work. In
+    both cases, reject loudly before touching anything.
+    """
+    if getattr(conn, "_defer_commit", False):
+        raise _InhaleTransactionError(
+            "Inhale APIs cannot run inside a deferred-commit context "
+            "(_defer_commit is active); they require their own atomic "
+            "transaction. Open a fresh BeamMemory or finish the deferred "
+            "batch before ingesting."
+        )
+    if conn.in_transaction:
+        raise _InhaleTransactionError(
+            "Inhale APIs require their own transaction; the connection "
+            "already has an open transaction. Commit or roll back the "
+            "caller-owned transaction before calling ingest."
+        )
 
 
 def _index_memory(beam, memory_id: str, content: str, source: str, timestamp: str):
@@ -674,6 +847,36 @@ def _receipt_from_row(row: Any, status: Optional[str] = None) -> IngestReceipt:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         metadata=metadata,
+    )
+
+
+def _conflict_receipt(row: Any, conflicting_hash: str, now: str) -> IngestReceipt:
+    """Build a structured conflict outcome for THIS attempt without
+    persisting conflict bookkeeping on the original lifecycle row.
+
+    The returned receipt reports the conflict (status='conflict') but keeps
+    the original's payload_hash, memory_ids, and indexing state so the
+    caller sees both the rejection and the truthful underlying state.
+    """
+    try:
+        memory_ids = json.loads(row["memory_ids"] or "[]")
+    except json.JSONDecodeError:
+        memory_ids = []
+    return IngestReceipt(
+        event_id=row["event_id"],
+        payload_hash=row["payload_hash"],
+        memory_ids=memory_ids if isinstance(memory_ids, list) else [],
+        status="conflict",
+        index_status=row["index_status"],
+        attempts=int(row["attempts"] or 0),
+        last_error_code="event_id_conflict",
+        last_error_at=now,
+        created_at=row["created_at"],
+        updated_at=now,
+        metadata={
+            "conflicting_payload_hash": conflicting_hash,
+            "original_index_status": row["index_status"],
+        },
     )
 
 

@@ -10,16 +10,20 @@ Regression coverage for the receipt-backed ingest API:
     failed_terminal, and retry without duplicate memory
   - concurrent duplicate races
 
-The embedding backend is mocked (this environment has no fastembed model and
-no sqlite-vec extension); the pipeline state machine is what is under test.
+The embedding backend is mocked for deterministic state-machine coverage;
+a real sqlite-vec + fastembed regression (test_real_sqlite_vec_upsert_marks_
+receipt_ready) guards the live vector path and skips where the extension is
+unavailable.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -31,6 +35,8 @@ from mnemosyne.core.inhale import (
     IngestEvent,
     IngestReceipt,
     TurnEvent,
+    _InhaleTransactionError,
+    _iso_from_epoch,
     retry_pending_ingest,
 )
 from mnemosyne.core.sync import SyncEngine
@@ -196,25 +202,30 @@ def test_100_identical_replays_return_duplicate_without_duplicate_memory(
 def test_same_event_id_different_payload_is_conflict_without_mutation(beam, vec_ready):
     first = beam.remember_event(_event())
     assert first.status == "stored"
+    orig_index_status = first.index_status
     conflicted = beam.remember_event(
         _event(content="latency dropped to 500ms", event_id="evt-1")
     )
 
     assert conflicted.status == "conflict"
-    assert conflicted.index_status == "failed_terminal"
     assert conflicted.last_error_code == "event_id_conflict"
+    # Conflict does NOT conflate with indexing lifecycle: the returned
+    # receipt surfaces the ORIGINAL index state, never failed_terminal.
+    assert conflicted.index_status == orig_index_status
     assert len(_working_rows(beam.conn)) == 1
     assert _sync_event_count(beam.conn) == 1
 
     persisted = _receipt_rows(beam.conn)[0]
-    assert persisted["status"] == "conflict"
-    assert persisted["index_status"] == "failed_terminal"
+    # The durable original receipt stays 'stored' with its real index state.
+    assert persisted["status"] == "stored"
+    assert persisted["index_status"] == orig_index_status
 
-    # Replaying the conflicting payload returns the same conflict receipt.
+    # Replaying the conflicting payload is still a conflict (audit grows).
     replay = beam.remember_event(
         _event(content="latency dropped to 500ms", event_id="evt-1")
     )
     assert replay.status == "conflict"
+    assert replay.index_status == orig_index_status
 
 
 def test_validation_rejection_is_rejected_and_writes_nothing(beam, vec_ready):
@@ -567,3 +578,291 @@ def test_conflict_then_original_replay_across_two_connections(temp_db, vec_ready
     # must be intact for dedup.
     conn = beam_module._get_connection(temp_db)
     assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 1: conflict must not corrupt the original receipt lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_conflict_does_not_mutate_original_receipt_lifecycle(beam, vec_ready):
+    """A same-event_id, different-payload request returns a structured
+    'conflict' outcome but changes NOTHING about the original receipt:
+    status stays 'stored', index_status keeps its real value, memory_ids /
+    payload_hash / attempts / original error fields are untouched."""
+    first = beam.remember_event(_event(content="original content", event_id="evt-L"))
+    assert first.status == "stored"
+    assert first.index_status == "ready"
+    orig_index_status = first.index_status
+    orig_attempts = first.attempts
+    orig_memory_ids = list(first.memory_ids)
+
+    conflict = beam.remember_event(
+        _event(content="different content", event_id="evt-L")
+    )
+    assert conflict.status == "conflict"
+
+    persisted = _receipt_rows(beam.conn)[0]
+    # The original receipt lifecycle is authoritative and untouched.
+    assert persisted["status"] == "stored", (
+        "conflict mutated the original receipt status"
+    )
+    assert persisted["index_status"] == orig_index_status, (
+        "conflict mutated the original index_status"
+    )
+    assert persisted["attempts"] == orig_attempts, (
+        "conflict inflated the original indexing attempts"
+    )
+    assert json.loads(persisted["memory_ids"]) == orig_memory_ids
+    assert persisted["last_error_code"] is None, (
+        "conflict polluted the original indexing error code"
+    )
+
+    # A later original-payload replay returns duplicate with the ORIGINAL
+    # index state (ready), never failed_terminal.
+    replay = beam.remember_event(_event(content="original content", event_id="evt-L"))
+    assert replay.status == "duplicate"
+    assert replay.index_status == orig_index_status
+
+
+def test_pending_original_remains_retryable_after_conflict(beam, vec_ready, monkeypatch):
+    """Exact sequence: raw commit leaves stored/pending; a conflict occurs;
+    retry_pending_ingest() can still claim and finish the original without
+    duplicate memory/sync rows and without stranding it terminal."""
+    import mnemosyne.core.inhale as inhale
+
+    def _flaky_embed(texts):
+        raise RuntimeError("embedding service down")
+
+    monkeypatch.setattr(beam_module._embeddings, "embed", _flaky_embed)
+    r = beam.remember_event(_event(event_id="evt-PR"))
+    assert r.status == "stored"
+    assert r.index_status == "failed_retryable"
+    assert _sync_event_count(beam.conn) == 1
+
+    # Conflict happens while the original is still retryable.
+    c = beam.remember_event(_event(content="different", event_id="evt-PR"))
+    assert c.status == "conflict"
+
+    # Original receipt is still stored + retryable (NOT terminalized).
+    persisted = _receipt_rows(beam.conn)[0]
+    assert persisted["status"] == "stored"
+    assert persisted["index_status"] in ("pending", "failed_retryable", "degraded")
+
+    monkeypatch.undo()
+    report = retry_pending_ingest(beam)
+    assert report.attempted == 1
+    assert report.succeeded == 1
+    assert report.receipts[0].index_status == "ready"
+    # No duplicate memory/sync rows.
+    assert len(_working_rows(beam.conn)) == 1
+    assert _sync_event_count(beam.conn) == 1
+
+
+def test_conflict_durable_audit_trail(beam, vec_ready):
+    """Conflicts are durably observable without mutating the original
+    receipt's indexing lifecycle."""
+    beam.remember_event(_event(content="original", event_id="evt-AU"))
+    beam.remember_event(_event(content="challenger-1", event_id="evt-AU"))
+    beam.remember_event(_event(content="challenger-2", event_id="evt-AU"))
+
+    audit = [
+        dict(row)
+        for row in beam.conn.execute("SELECT * FROM ingest_conflicts ORDER BY seq")
+    ]
+    assert len(audit) == 2
+    for entry in audit:
+        assert entry["event_id"] == "evt-AU"
+        assert entry["conflicting_payload_hash"]
+        assert entry["observed_at"]
+    # Original receipt attempts untouched by conflicts.
+    assert _receipt_rows(beam.conn)[0]["attempts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 1: real sqlite-vec path (no mock)
+# ---------------------------------------------------------------------------
+
+
+def test_real_sqlite_vec_upsert_marks_receipt_ready(temp_db, monkeypatch):
+    """When sqlite-vec is actually available, the ingest path writes to
+    vec_working and the receipt reaches 'ready' on the live path -- not via
+    a mock."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.enable_load_extension(True)
+        import sqlite_vec
+
+        conn.load_extension(sqlite_vec.loadable_path())
+    except Exception:
+        pytest.skip("sqlite-vec extension unavailable in this runtime")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    BeamMemory(session_id="realvec", db_path=temp_db)
+    b = BeamMemory(session_id="realvec", db_path=temp_db)
+    # Use the real embedding model (no embed mock); only mocking away any
+    # network is unnecessary -- fastembed runs locally.
+    receipt = b.remember_event(_event(event_id="evt-RV", content="vec upsert live"))
+    assert receipt.status == "stored"
+    assert receipt.index_status == "ready", receipt
+    assert receipt.last_error_code is None
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 1: reject caller-owned / deferred transaction context
+# ---------------------------------------------------------------------------
+
+
+def test_remember_event_rejects_deferred_commit_context(beam, vec_ready):
+    """The Inhale API owns its short atomic transaction; it must not run
+    inside a caller's deferred-commit context (which would leave _defer_commit
+    set across network enrichment or rollback a caller-owned txn)."""
+    from mnemosyne.core.beam import _deferred_commits
+
+    with _deferred_commits(beam.conn):
+        with pytest.raises(_InhaleTransactionError):
+            beam.remember_event(_event(event_id="evt-DF"))
+
+
+def test_remember_event_rejects_open_caller_transaction(beam, vec_ready):
+    """If the caller already opened a transaction (in_transaction True) the
+    API must reject before mutating rather than rolling back the caller's
+    work."""
+    beam.conn.execute("BEGIN")
+    try:
+        with pytest.raises(_InhaleTransactionError):
+            beam.remember_event(_event(event_id="evt-OT"))
+    finally:
+        beam.conn.rollback()
+    # The caller's transaction was not rolled back by the API; rollback here
+    # is the test's own cleanup. The API must have written nothing.
+    receipt = beam.remember_event(_event(event_id="evt-OT"))
+    assert receipt.status == "stored"
+
+
+def test_retry_pending_ingest_rejects_deferred_commit_context(beam, vec_ready):
+    from mnemosyne.core.beam import _deferred_commits
+
+    beam.remember_event(_event(event_id="evt-RD"))
+    # Force it back to pending so retry has work.
+    beam.conn.execute(
+        "UPDATE ingest_receipts SET index_status='pending' WHERE event_id='evt-RD'"
+    )
+    beam.conn.commit()
+    with _deferred_commits(beam.conn):
+        with pytest.raises(_InhaleTransactionError):
+            retry_pending_ingest(beam)
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 1: claim-safe concurrent retries
+# ---------------------------------------------------------------------------
+
+
+def test_two_retry_workers_do_not_duplicate_enrichment(
+    temp_db, vec_ready, monkeypatch
+):
+    """Two independent retry workers on the same pending receipt: exactly one
+    does enrichment; the other observes the claimed/finished state. Memory
+    and sync rows stay exactly-once."""
+    BeamMemory(session_id="rw", db_path=temp_db)
+    b0 = BeamMemory(session_id="rw", db_path=temp_db)
+    b0.conn.execute("PRAGMA busy_timeout=10000")
+
+    # Store a receipt, leave it pending.
+    import mnemosyne.core.inhale as inhale
+
+    monkeypatch.setattr(
+        inhale,
+        "_finalize_receipt",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError):
+        b0.remember_event(_event(event_id="evt-2W"))
+    monkeypatch.undo()
+
+    persisted = _receipt_rows(b0.conn)[0]
+    assert persisted["index_status"] == "pending"
+
+    call_count = {"n": 0}
+    real_index = inhale._index_memory
+
+    def _counting_index(beam, memory_id, content, source, timestamp):
+        call_count["n"] += 1
+        return real_index(beam, memory_id, content, source, timestamp)
+
+    monkeypatch.setattr(inhale, "_index_memory", _counting_index)
+
+    results: dict = {}
+    exceptions: List[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker(tag):
+        try:
+            b = BeamMemory(session_id=f"rw-{tag}", db_path=temp_db)
+            b.conn.execute("PRAGMA busy_timeout=10000")
+            barrier.wait()
+            results[tag] = retry_pending_ingest(b)
+        except BaseException as exc:
+            exceptions.append(exc)
+
+    t1 = threading.Thread(target=worker, args=("a",))
+    t2 = threading.Thread(target=worker, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not exceptions, exceptions
+    total_attempted = sum(r.attempted for r in results.values())
+    total_succeeded = sum(r.succeeded for r in results.values())
+    assert total_attempted == 1, results
+    assert total_succeeded == 1, results
+
+    conn = beam_module._get_connection(temp_db)
+    assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT index_status FROM ingest_receipts WHERE event_id='evt-2W'"
+        ).fetchone()[0]
+        == "ready"
+    )
+
+    monkeypatch.undo()
+
+
+def test_stale_retry_claim_is_reclaimed(temp_db, vec_ready, monkeypatch):
+    """A claim whose lease has expired (crashed worker) must be reclaimable by
+    a later retry pass so the receipt is not stranded."""
+    BeamMemory(session_id="sc", db_path=temp_db)
+    b = BeamMemory(session_id="sc", db_path=temp_db)
+
+    import mnemosyne.core.inhale as inhale
+
+    monkeypatch.setattr(
+        inhale,
+        "_finalize_receipt",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError):
+        b.remember_event(_event(event_id="evt-SC"))
+    monkeypatch.undo()
+
+    # Simulate a crashed worker: claim the receipt with an expired lease.
+    stale = (datetime.now(timezone.utc).timestamp() - 3600)
+    b.conn.execute(
+        "UPDATE ingest_receipts SET claim_worker_id='dead-worker',"
+        " claim_worker_lease=? WHERE event_id='evt-SC'",
+        (_iso_from_epoch(stale),),
+    )
+    b.conn.commit()
+
+    report = retry_pending_ingest(b)
+    assert report.attempted == 1
+    assert report.succeeded == 1
+    assert report.receipts[0].index_status == "ready"
