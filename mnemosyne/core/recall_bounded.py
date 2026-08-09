@@ -273,6 +273,9 @@ def _apply_token_budget(
                 r.get("content") or "", policy.max_item_tokens
             )
         line = _render_row(r)
+        # Drop candidates whose content is empty after truncation.
+        if not (r.get("content") or "").strip():
+            continue
         if policy.max_tokens is not None:
             line_tokens = _estimate_tokens(line)
             projected = _estimate_tokens("\n".join(lines + [line])) if lines else line_tokens
@@ -469,26 +472,46 @@ def _hydrate_candidates(
         memoria = beam.memoria_retrieve(query, top_k=max(policy.top_k, 3))
         if memoria and memoria.get("source") != "fallback":
             ctx = memoria.get("context", "")
+            source_memory_ids = [
+                sid for sid in (memoria.get("source_memory_ids") or []) if sid
+            ]
+            # Determine safe scope/session from cited source rows so the
+            # MEMORIA synthetic candidate inherits real provenance rather
+            # than being hard-coded global (which default policy rejects).
+            memoria_scope = "session"
+            memoria_session = beam.session_id
+            if source_memory_ids:
+                ph = ",".join("?" * len(source_memory_ids))
+                src_rows = conn.execute(
+                    f"SELECT session_id, scope FROM working_memory WHERE id IN ({ph})",
+                    tuple(source_memory_ids),
+                ).fetchall()
+                if src_rows:
+                    # Inherit from the first cited source row.
+                    memoria_session = src_rows[0]["session_id"] or beam.session_id
+                    memoria_scope = src_rows[0]["scope"] or "session"
             if ctx:
-                # MEMORIA contributes a synthetic candidate that enters the gate.
                 mid = f"memoria_{memoria.get('source', 'unknown')}"
                 candidates.setdefault(mid, {
                     "id": mid,
                     "_memoria": True,
                     "_content_override": f"[MEMORIA {memoria.get('source', '')}] {ctx}",
+                    "_memoria_scope": memoria_scope,
+                    "_memoria_session": memoria_session,
                 })
-                # Also pull source memory ids that MEMORIA references.
-                for sid in memoria.get("source_memory_ids", []) or []:
-                    if sid:
-                        candidates.setdefault(sid, {"id": sid, "_memoria_source": True})
+            # Also pull source memory ids that MEMORIA references.
+            for sid in source_memory_ids:
+                candidates.setdefault(sid, {"id": sid, "_memoria_source": True})
     except Exception:
         pass  # MEMORIA is best-effort
 
     # --- Resolve candidate ids → full rows ---
+    # First pass: resolve string ids against working_memory.
     wm_ids_to_fetch = [v["id"] for v in candidates.values() if v.get("id") and not v.get("_rowid")]
     em_rowids_to_fetch = [v["_rowid"] for v in candidates.values() if v.get("_rowid")]
 
     resolved: Dict[Any, Dict[str, Any]] = {}
+    resolved_wm_ids: set = set()
 
     if wm_ids_to_fetch:
         ph = ",".join("?" * len(wm_ids_to_fetch))
@@ -499,6 +522,23 @@ def _hydrate_candidates(
         for row in rows:
             d = dict(row)
             d["_tier"] = "working"
+            resolved[d["id"]] = d
+            resolved_wm_ids.add(d["id"])
+
+    # Second pass: entity/fact/memoria-source IDs that were NOT found in
+    # working_memory may exist in episodic_memory. Resolve them by id.
+    unresolved_em_ids = [
+        mid for mid in wm_ids_to_fetch if mid not in resolved_wm_ids
+    ]
+    if unresolved_em_ids:
+        ph = ",".join("?" * len(unresolved_em_ids))
+        rows = conn.execute(
+            f"SELECT {_WM_COLS} FROM episodic_memory WHERE id IN ({ph}) AND {where_sql}",
+            (*unresolved_em_ids, *params),
+        ).fetchall()
+        for row in rows:
+            d = dict(row)
+            d["_tier"] = "episodic"
             resolved[d["id"]] = d
 
     if em_rowids_to_fetch:
@@ -537,8 +577,8 @@ def _hydrate_candidates(
                 "content": content,
                 "source": "memoria",
                 "timestamp": "",
-                "session_id": beam.session_id,
-                "scope": "global",
+                "session_id": cand.get("_memoria_session", beam.session_id),
+                "scope": cand.get("_memoria_scope", "session"),
                 "importance": 0.5,
                 "score": round(min(0.6, lexical * 0.6), 4),
                 "_tier": "memoria",
@@ -736,23 +776,31 @@ def _run_gate(
         if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
     ]
 
-    # --- Post-filter fallback: if everything was removed, try recent. ---
+    # --- Post-filter fallback: if everything was removed. ---
     if not gated and policy.require_fallback:
-        where_sql, params = _build_where(beam, policy, now_iso)
-        fb_rows = _recent_fallback_rows(beam, policy, where_sql, params)
-        gated = [
-            r for r in fb_rows
-            if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
-        ]
-        if used_polyphonic and not gated:
+        if used_polyphonic:
+            # Polyphonic all-filtered: fall back to bounded LINEAR hydration
+            # first (not recent fallback), with truthful mode reporting.
             degradation.append("polyphonic_empty_fallback_linear")
-            # Polyphonic all-filtered: fall back to bounded linear hydration.
-            linear_rows, _, lin_deg = _hydrate_candidates(beam, query, policy)
+            linear_rows, lin_mode, lin_deg = _hydrate_candidates(beam, query, policy)
             degradation.extend(lin_deg)
             gated = [
                 r for r in linear_rows
                 if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
             ]
+            if gated:
+                mode = lin_mode
+        if not gated:
+            # Last resort: deterministic bounded recent fallback.
+            where_sql, params = _build_where(beam, policy, now_iso)
+            fb_rows = _recent_fallback_rows(beam, policy, where_sql, params)
+            gated = [
+                r for r in fb_rows
+                if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
+            ]
+            if gated:
+                mode = "recent_fallback"
+                degradation.append("recent_fallback_after_filter")
 
     gated = _dedupe(gated)
     gated = _rank(gated)

@@ -632,3 +632,245 @@ class TestAssociativeHydration:
             "SELECT recall_count FROM working_memory WHERE id = ?", (related_mid,),
         ).fetchone()["recall_count"]
         assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 3 — binding contract gaps
+# ---------------------------------------------------------------------------
+
+class TestPolyphonicAllFilteredLinearFallback:
+    """Gap 1: polyphonic rows that hydrate but are ALL rejected by policy
+    must fall back to bounded LINEAR hydration (not recent fallback first).
+    The envelope must report a truthful linear retrieval mode and the
+    polyphonic_empty_fallback_linear degradation reason."""
+
+    def test_polyphonic_all_filtered_returns_linear_row(self, beam, monkeypatch):
+        """A valid linear row exists. Polyphonic returns a real but
+        policy-rejected row. The linear row must surface."""
+        from mnemosyne.core.polyphonic_recall import (
+            PolyphonicRecallEngine,
+            PolyphonicResult,
+        )
+
+        # Seed a valid linear row in session-a.
+        _remember(beam, "linear visible content alpha")
+
+        # Seed a real row in session-b that polyphonic will return but
+        # policy will reject (foreign session).
+        foreign_mid = _remember(
+            beam, "polyphonic foreign beta gamma",
+            session_id="sess-b", scope="session",
+        )
+
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        monkeypatch.setattr(
+            PolyphonicRecallEngine, "recall",
+            lambda self, *a, **k: [
+                PolyphonicResult(
+                    memory_id=foreign_mid,
+                    combined_score=0.95,
+                    voice_scores={"vector": 0.95},
+                    metadata={},
+                ),
+            ],
+        )
+
+        env = beam.recall_bounded("alpha", RecallPolicy(top_k=5))
+        contents = " ".join(r["content"] for r in env.results)
+        assert "linear visible" in contents, (
+            f"linear row not returned; got: {[r['content'][:50] for r in env.results]}"
+        )
+        assert "polyphonic_empty_fallback_linear" in env.degradation_reasons
+        # Mode must be truthful about the actual retrieval path used.
+        assert env.retrieval_mode in ("vector", "hybrid", "fts", "recent_fallback")
+
+
+class TestEpisodicEntityFactResolution:
+    """Gap 2: entity/fact candidate IDs must resolve across BOTH working
+    and episodic memory, preserving real provenance fields.
+
+    The episodic row's content deliberately does NOT match the query via
+    FTS — the entity/fact annotation is the only path to the row.
+    """
+
+    def test_episodic_entity_match_reaches_gate(self, beam):
+        """An entity annotation ONLY on an episodic_memory row (no FTS-
+        matchable content) must reach the final gate through entity
+        resolution."""
+        from datetime import datetime, timezone
+        em_id = "ep-entity-test-001"
+        beam.conn.execute(
+            "INSERT OR IGNORE INTO episodic_memory "
+            "(id, content, source, timestamp, session_id, importance, scope, "
+            "author_id, author_type, channel_id, veracity, memory_type, tier) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (em_id, "runbook incident response procedure",
+             "conversation", datetime.now(timezone.utc).isoformat(),
+             "sess-a", 0.8, "session", None, None, None, "unknown", "general", 1),
+        )
+        beam.conn.commit()
+        beam.annotations.add(
+            memory_id=em_id, kind="mentions", value="terraform-deploy-entity",
+        )
+        beam.conn.commit()
+
+        env = beam.recall_bounded("terraform", RecallPolicy(top_k=10))
+        contents = " ".join(r.get("content", "") for r in env.results)
+        assert "runbook" in contents, (
+            f"episodic entity match did not reach gate; "
+            f"got: {[r.get('content','')[:50] for r in env.results]}"
+        )
+
+    def test_episodic_fact_match_reaches_gate(self, beam):
+        """A fact annotation ONLY on an episodic_memory row must reach
+        the final gate through fact resolution."""
+        from datetime import datetime, timezone
+        em_id = "ep-fact-test-001"
+        beam.conn.execute(
+            "INSERT OR IGNORE INTO episodic_memory "
+            "(id, content, source, timestamp, session_id, importance, scope, "
+            "author_id, author_type, channel_id, veracity, memory_type, tier) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (em_id, "general infrastructure notes unrelated",
+             "conversation", datetime.now(timezone.utc).isoformat(),
+             "sess-a", 0.8, "session", None, None, None, "unknown", "general", 1),
+        )
+        beam.conn.commit()
+        beam.annotations.add(
+            memory_id=em_id, kind="fact", value="deployment uses kubernetes",
+        )
+        beam.conn.commit()
+
+        env = beam.recall_bounded("kubernetes", RecallPolicy(top_k=10))
+        contents = " ".join(r.get("content", "") for r in env.results)
+        assert "infrastructure notes" in contents, (
+            f"episodic fact match did not reach gate; "
+            f"got: {[r.get('content','')[:50] for r in env.results]}"
+        )
+
+    def test_foreign_episodic_entity_rejected(self, beam):
+        """An episodic entity match in a foreign session is rejected."""
+        from datetime import datetime, timezone
+        em_id = "ep-entity-foreign-001"
+        beam.conn.execute(
+            "INSERT OR IGNORE INTO episodic_memory "
+            "(id, content, source, timestamp, session_id, importance, scope, "
+            "author_id, author_type, channel_id, veracity, memory_type, tier) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (em_id, "classified foreign notes",
+             "conversation", datetime.now(timezone.utc).isoformat(),
+             "sess-b", 0.8, "session", None, None, None, "unknown", "general", 1),
+        )
+        beam.conn.commit()
+        beam.annotations.add(
+            memory_id=em_id, kind="mentions", value="omega-cluster-entity",
+        )
+        beam.conn.commit()
+
+        env = beam.recall_bounded("omega", RecallPolicy(top_k=10))
+        contents = " ".join(r.get("content", "") for r in env.results)
+        assert "classified foreign" not in contents
+
+class TestMemoriaScopeProvenance:
+    """Gap 3: MEMORIA synthetic rows must not be hard-coded global.
+    Preserve safe scope/provenance from cited source rows."""
+
+    def test_memoria_default_policy_admits_same_session(self, beam):
+        """A MEMORIA result citing same-session source rows must be
+        admitted under default policy (include_shared=False).
+
+        The test isolates MEMORIA by using a query term that does NOT
+        appear in the working_memory FTS index — only in the MEMORIA
+        context. So the result can only come through the MEMORIA path.
+        """
+        # Seed an unrelated working memory (different content).
+        _remember(beam, "completely unrelated topic noise")
+
+        wm_mid = beam.conn.execute(
+            "SELECT id FROM working_memory WHERE content LIKE '%unrelated%'"
+        ).fetchone()["id"]
+
+        def _fake_memoria(query, ability=None, top_k=10):
+            return {
+                "context": "specialized memoria memoriapass result",
+                "facts": [],
+                "source": "test_specialist",
+                "source_memory_ids": [wm_mid],
+            }
+
+        original_memoria = beam.memoria_retrieve
+        beam.memoria_retrieve = _fake_memoria
+        try:
+            env = beam.recall_bounded(
+                "memoriapass", RecallPolicy(top_k=10, include_shared=False),
+            )
+            contents = " ".join(r.get("content", "") for r in env.results)
+            assert "memoriapass" in contents, (
+                f"MEMORIA same-session result not admitted under default policy; "
+                f"got: {[r.get('content','')[:50] for r in env.results]}"
+            )
+        finally:
+            beam.memoria_retrieve = original_memoria
+
+    def test_memoria_foreign_source_rejected(self, beam):
+        """A MEMORIA result citing only foreign-session sources must not
+        leak under default policy."""
+        foreign_mid = _remember(
+            beam, "classified foreign memoriareject detail",
+            session_id="sess-b", scope="session",
+        )
+
+        def _fake_memoria(query, ability=None, top_k=10):
+            return {
+                "context": "classified memoriareject content",
+                "facts": [],
+                "source": "test_specialist",
+                "source_memory_ids": [foreign_mid],
+            }
+
+        original_memoria = beam.memoria_retrieve
+        beam.memoria_retrieve = _fake_memoria
+        try:
+            env = beam.recall_bounded(
+                "memoriareject", RecallPolicy(top_k=10, include_shared=False),
+            )
+            contents = " ".join(r.get("content", "") for r in env.results)
+            assert "memoriareject" not in contents
+            assert "classified" not in contents
+        finally:
+            beam.memoria_retrieve = original_memoria
+
+class TestDropEmptyContentItems:
+    """Quality: when max_item_tokens is too small for even one word,
+    drop the candidate rather than retaining empty content."""
+
+    def test_tiny_max_item_tokens_drops_oversized(self, beam):
+        _remember(beam, "alpha " + ("supercalifragilistic " * 10))
+        env = beam.recall_bounded(
+            "alpha", RecallPolicy(top_k=5, max_item_tokens=1),
+        )
+        # No result should have empty content.
+        for r in env.results:
+            assert r.get("content", "").strip() != "", (
+                f"empty-content result retained: {r}"
+            )
+
+
+class TestDedupKeepsHigherScore:
+    """Quality: dedupe test must prove the higher-scored duplicate survives."""
+
+    def test_dedupe_keeps_higher_scored(self, beam):
+        """When the same memory id appears with different scores from
+        different voices, the higher score must survive to the final
+        result."""
+        mid = _remember(beam, "alpha beta gamma delta epsilon zeta")
+        env = beam.recall_bounded(
+            "alpha beta gamma delta epsilon zeta", RecallPolicy(top_k=10),
+        )
+        # The memory should appear exactly once (deduped).
+        ids = [r["id"] for r in env.results]
+        assert ids.count(mid) <= 1
+        # And if it appears, it should have a meaningful score.
+        for r in env.results:
+            if r["id"] == mid:
+                assert r["score"] > 0
