@@ -8598,7 +8598,7 @@ class BeamMemory:
             "candidate_ids": candidate_ids,
         }
 
-    def sleep(self, dry_run: bool = False, force: bool = False) -> Dict:
+    def sleep(self, dry_run: bool = False, force: bool = False, _degrade: bool = True) -> Dict:
         """
         Consolidate old working_memory for this session into episodic summaries.
         Uses a local lightweight LLM when available; falls back to aaak
@@ -8615,6 +8615,13 @@ class BeamMemory:
 
         When force=True, skips the age cutoff and consolidates all
         non-consolidated working memories immediately regardless of age.
+
+        ``_degrade`` is an internal knob: sleep() runs tiered degradation as
+        its final step so a direct, session-scoped caller gets it. When
+        sleep_all_sessions() drives many sessions it suppresses per-session
+        degradation and degrades exactly once at the top level instead, so
+        a maintenance pass degrades once per invocation regardless of how
+        many sessions it consolidates (including zero).
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
@@ -8906,8 +8913,13 @@ class BeamMemory:
             ))
             self.conn.commit()
 
-        # Run tiered degradation after consolidation
-        degrade_result = self.degrade_episodic(dry_run=dry_run)
+        # Run tiered degradation after consolidation. Suppressed when this
+        # sleep() is a child of sleep_all_sessions(), which degrades once at
+        # the top level so degradation runs exactly once per maintenance call.
+        if _degrade:
+            degrade_result = self.degrade_episodic(dry_run=dry_run)
+        else:
+            degrade_result = {"status": "skipped", "tier1_to_tier2": 0, "tier2_to_tier3": 0}
 
         logger.info(
             "sleep: consolidated=%d summaries=%d conflicts=%d llm=%s method=%s",
@@ -8956,20 +8968,11 @@ class BeamMemory:
             ORDER BY MIN(timestamp) ASC
         """, (cutoff,))
         session_rows = cursor.fetchall()
-        if not session_rows:
-            return {
-                "status": "no_op",
-                "message": "No old working memories to consolidate",
-                "sessions_scanned": 0,
-                "sessions_consolidated": 0,
-                "items_consolidated": 0,
-                "summaries_created": 0,
-                "llm_used": 0,
-                "errors": 0,
-                "model_refresh": {"proposals": 0, "applied": 0},
-                "session_results": [],
-            }
-
+        # NOTE: do NOT early-return on empty session_rows. Degradation must
+        # run exactly once per top-level maintenance invocation even when there
+        # are zero working-memory rows to consolidate; falling through to the
+        # loop (a no-op when empty) and the single degrade_episodic() below
+        # preserves that contract.
         session_results = []
         sessions_consolidated = 0
         items_consolidated = 0
@@ -9002,7 +9005,7 @@ class BeamMemory:
                     author_id=self.author_id,
                     author_type=self.author_type,
                 )
-                result = beam.sleep(dry_run=dry_run, force=force)
+                result = beam.sleep(dry_run=dry_run, force=force, _degrade=False)
                 result = dict(result)
                 result["session_id"] = session_id
                 result["eligible"] = row["eligible"] if hasattr(row, "keys") else row[1]

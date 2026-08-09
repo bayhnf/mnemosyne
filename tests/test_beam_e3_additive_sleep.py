@@ -658,3 +658,103 @@ class TestE3AdditiveSleep:
             # And sleep on the restored DB must be a no-op.
             result = beam_dest.sleep(dry_run=False)
             assert result["status"] == "no_op"
+
+
+# ---------------------------------------------------------------------------
+# Task 1 / Wave 1 P0: degrade exactly once per top-level invocation, and
+# post-claim failure leaves a reclaimable claim.
+# ---------------------------------------------------------------------------
+
+class TestDegradeOncePerTopLevel:
+    """sleep_all_sessions() must degrade exactly once per invocation,
+    including when there are zero working-memory rows, and must not degrade
+    once per session it consolidates."""
+
+    def test_degrade_runs_once_with_zero_working_rows(self, temp_db, monkeypatch):
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="maint", db_path=temp_db)
+        result = beam.sleep_all_sessions(dry_run=False)
+        # With zero eligible rows, degradation must still run exactly once.
+        assert "degradation" in result, (
+            "sleep_all_sessions skipped degradation entirely on zero rows"
+        )
+
+    def test_degrade_runs_once_with_many_sessions(self, temp_db, monkeypatch):
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="maint", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", 1)
+        _seed_old_wm(temp_db, "s2", 1)
+        _seed_old_wm(temp_db, "s3", 1)
+
+        calls = []
+        original = BeamMemory.degrade_episodic
+
+        def counting(self, dry_run=False):
+            calls.append(1)
+            return original(self, dry_run=dry_run)
+
+        monkeypatch.setattr(BeamMemory, "degrade_episodic", counting)
+        beam.sleep_all_sessions(dry_run=False)
+        assert len(calls) == 1, (
+            f"degrade_episodic ran {len(calls)} times across 3 sessions; "
+            f"it must run exactly once per top-level invocation"
+        )
+
+
+class TestPostClaimFailureReclaimable:
+    """An exception after the sleep claim must leave a reclaimable claim and
+    no summary, so reclaim_orphans can recover it."""
+
+    def test_sleep_claim_left_reclaimable_after_episodic_failure(self, temp_db, monkeypatch):
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=2)
+        # Force consolidate_to_episodic to fail AFTER the claim is committed.
+        monkeypatch.setattr(
+            beam, "consolidate_to_episodic",
+            lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        with pytest.raises(RuntimeError):
+            beam.sleep(dry_run=False)
+
+        rows = _consolidated_rows(temp_db, "s1")
+        ep_count = sqlite3.connect(str(temp_db)).execute(
+            "SELECT COUNT(*) FROM episodic_memory"
+        ).fetchone()[0]
+        assert len(rows) == 2
+        for _row_id, consolidated_at in rows:
+            assert consolidated_at is not None, "claim lost on post-claim failure"
+        # No summary should exist; the claim is reclaimable.
+        assert ep_count == 0
+
+    def test_reclaim_recovers_orphaned_claim_after_failure(self, temp_db, monkeypatch):
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="s1", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", n=1)
+        monkeypatch.setattr(
+            beam, "consolidate_to_episodic",
+            lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        with pytest.raises(RuntimeError):
+            beam.sleep(dry_run=False)
+
+        # Backdate the claim so reclaim_orphans picks it up.
+        stale_claim = (datetime.now() - timedelta(hours=2)).isoformat()
+        conn = sqlite3.connect(str(temp_db))
+        conn.execute(
+            "UPDATE working_memory SET consolidation_claimed_at = ? WHERE id = ?",
+            (stale_claim, "e3-s1-0"),
+        )
+        conn.commit()
+        conn.close()
+
+        reclaim = beam.reclaim_orphans(stale_after_seconds=1)
+        assert reclaim["reclaimed"] == 1
+
+        # A clean sleep on a fresh beam should now consolidate the reclaimed row.
+        clean_beam = BeamMemory(session_id="s1", db_path=temp_db)
+        clean_beam.sleep(dry_run=False)
+        ep_count = sqlite3.connect(str(temp_db)).execute(
+            "SELECT COUNT(*) FROM episodic_memory"
+        ).fetchone()[0]
+        assert ep_count == 1
