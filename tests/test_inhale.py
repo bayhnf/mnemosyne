@@ -866,3 +866,120 @@ def test_stale_retry_claim_is_reclaimed(temp_db, vec_ready, monkeypatch):
     assert report.attempted == 1
     assert report.succeeded == 1
     assert report.receipts[0].index_status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 2: claim must re-check lifecycle at claim time (TOCTOU)
+# ---------------------------------------------------------------------------
+
+
+def test_delayed_worker_cannot_claim_already_finalized_receipt(
+    temp_db, vec_ready, monkeypatch
+):
+    """A delayed candidate whose receipt another worker finalized to 'ready'
+    BEFORE it reaches the claim must NOT claim, enrich, or overwrite that
+    terminal lifecycle state.
+
+    This closes the TOCTOU gap: candidate selection happens before the claim
+    transaction, so the atomic claim UPDATE must re-check status='stored'
+    and index_status is retryable in addition to lease availability. Here the
+    delayed worker holds a pre-selected event_id and reaches _try_claim after
+    another worker has already finalized the receipt to 'ready'.
+    """
+    BeamMemory(session_id="toctou", db_path=temp_db)
+    b = BeamMemory(session_id="toctou", db_path=temp_db)
+    b.conn.execute("PRAGMA busy_timeout=10000")
+
+    # Store a receipt and leave it pending (crash during indexing).
+    import mnemosyne.core.inhale as inhale
+
+    monkeypatch.setattr(
+        inhale,
+        "_finalize_receipt",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError):
+        b.remember_event(_event(event_id="evt-TOU"))
+    monkeypatch.undo()
+
+    assert (
+        b.conn.execute(
+            "SELECT index_status FROM ingest_receipts WHERE event_id='evt-TOU'"
+        ).fetchone()[0]
+        == "pending"
+    )
+
+    # Worker B runs a full retry pass that finalizes the receipt to 'ready'
+    # (claim acquired + enrichment + finalize + release).
+    b2 = BeamMemory(session_id="toctou-b", db_path=temp_db)
+    b2.conn.execute("PRAGMA busy_timeout=10000")
+    report_b = retry_pending_ingest(b2)
+    assert report_b.attempted == 1
+    assert report_b.succeeded == 1
+    assert (
+        b2.conn.execute(
+            "SELECT index_status FROM ingest_receipts WHERE event_id='evt-TOU'"
+        ).fetchone()[0]
+        == "ready"
+    )
+
+    # The delayed worker A holds the stale candidate (evt-TOU was pending when
+    # selected) and reaches _try_claim AFTER B finalized. The claim must fail
+    # because the receipt is no longer retryable, even though the lease is free.
+    now_iso = inhale._iso_from_epoch(inhale._now_epoch())
+    lease_iso = inhale._iso_from_epoch(inhale._now_epoch() + 60)
+    claimed = inhale._try_claim(
+        b.conn, "evt-TOU", "delayed-worker-a", lease_iso, now_iso
+    )
+    assert claimed is False, (
+        "delayed worker claimed an already-ready receipt via stale candidate"
+    )
+
+    # The truthful 'ready' lifecycle state is not overwritten.
+    row = b.conn.execute(
+        "SELECT status, index_status, attempts FROM ingest_receipts"
+        " WHERE event_id='evt-TOU'"
+    ).fetchone()
+    assert row[0] == "stored"
+    assert row[1] == "ready"
+    # Worker A did not enrich (claim refused), so attempts are unchanged.
+    assert row[2] == report_b.receipts[0].attempts
+
+
+def test_delayed_worker_cannot_claim_terminalized_receipt(temp_db, vec_ready, monkeypatch):
+    """Same TOCTOU guard but for a receipt finalized to 'failed_terminal'
+    (max attempts): the delayed worker must not resurrect it."""
+    BeamMemory(session_id="tt", db_path=temp_db)
+    b = BeamMemory(session_id="tt", db_path=temp_db)
+    b.conn.execute("PRAGMA busy_timeout=10000")
+
+    # Create a stored receipt, then terminalize it directly (simulating a
+    # prior retry that hit max_attempts).
+    b.remember_event(_event(event_id="evt-TERM"))
+    b.conn.execute(
+        "UPDATE ingest_receipts SET index_status='failed_terminal',"
+        " attempts=?, last_error_code='max_attempts_exceeded'"
+        " WHERE event_id='evt-TERM'",
+        (99,),
+    )
+    b.conn.commit()
+
+    # Even if we inject the event_id as a candidate (e.g. it was selected
+    # before terminalization), the claim must fail because index_status is
+    # no longer retryable.
+    import mnemosyne.core.inhale as inhale
+
+    now_iso = inhale._iso_from_epoch(inhale._now_epoch())
+    lease_iso = inhale._iso_from_epoch(inhale._now_epoch() + 60)
+    claimed = inhale._try_claim(
+        b.conn, "evt-TERM", "late-worker", lease_iso, now_iso
+    )
+    assert claimed is False, "claimed a failed_terminal receipt"
+
+    row = b.conn.execute(
+        "SELECT status, index_status, attempts FROM ingest_receipts"
+        " WHERE event_id='evt-TERM'"
+    ).fetchone()
+    assert row[0] == "stored"
+    assert row[1] == "failed_terminal"
+    assert row[2] == 99

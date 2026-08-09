@@ -394,19 +394,29 @@ def _try_claim(
     Wins only if the receipt is unclaimed or its lease has expired (stale
     claim from a crashed worker). Returns True if this worker now owns it.
     """
+    placeholders = ",".join("?" * len(RETRYABLE_INDEX_STATES))
     _begin_write(conn)
     try:
+        # Re-check the lifecycle atomically at claim time to close the TOCTOU
+        # gap: candidate selection runs before this transaction, so a delayed
+        # worker could reach the claim AFTER another worker already finalized
+        # the receipt to 'ready'/'failed_terminal'. The claim UPDATE must
+        # therefore require status='stored' AND a still-retryable index_status
+        # in addition to lease availability, so the late worker neither claims,
+        # enriches, nor overwrites the truthful terminal state.
         cur = conn.execute(
-            """UPDATE ingest_receipts
+            f"""UPDATE ingest_receipts
                SET claim_worker_id = ?,
                    claim_worker_lease = ?
                WHERE event_id = ?
+                 AND status = 'stored'
+                 AND index_status IN ({placeholders})
                  AND (
                    claim_worker_id IS NULL
                    OR claim_worker_lease IS NULL
                    OR claim_worker_lease < ?
                  )""",
-            (worker_id, lease_iso, event_id, now_iso),
+            (worker_id, lease_iso, event_id, *RETRYABLE_INDEX_STATES, now_iso),
         )
         conn.commit()
         return cur.rowcount == 1
