@@ -94,3 +94,145 @@ def test_create_backup_succeeds_with_sqlite_vec_tables(tmp_path):
         dump = f.read()
     assert "vec_items" in dump
     assert "CREATE VIRTUAL TABLE" in dump
+
+
+# ---------------------------------------------------------------------------
+# Task 1 / Wave 1 P0: backup unique filename + fail-closed restore
+# ---------------------------------------------------------------------------
+
+import gzip as _gzip
+
+
+def _make_simple_db(db_path):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, "a"), (2, "b")])
+    conn.commit()
+    conn.close()
+
+
+def test_two_rapid_backups_get_unique_filenames(tmp_path):
+    """Two backups created within the same second must not overwrite each
+    other."""
+    db_path = tmp_path / "src.db"
+    _make_simple_db(db_path)
+    bdir = tmp_path / "backups"
+
+    r1 = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+    r2 = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+    assert Path(r1["backup_path"]).name != Path(r2["backup_path"]).name, (
+        "two backups in the same second collided on filename"
+    )
+    assert Path(r1["backup_path"]).exists()
+    assert Path(r2["backup_path"]).exists()
+
+
+def test_restore_rejects_active_wal_sidecar(tmp_path):
+    """A stale -wal sidecar means uncommitted frames would be silently
+    dropped by a main-file replace; restore must refuse."""
+    db_path = tmp_path / "target.db"
+    bdir = tmp_path / "backups"
+    _make_simple_db(db_path)
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+    (db_path.parent / (db_path.name + "-wal")).write_bytes(b"\x00" * 64)
+    with pytest.raises(RuntimeError, match="sidecar"):
+        recovery.restore_backup(Path(backup["backup_path"]), db_path)
+
+
+def test_restore_rejects_active_shm_sidecar(tmp_path):
+    db_path = tmp_path / "target.db"
+    bdir = tmp_path / "backups"
+    _make_simple_db(db_path)
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+    (db_path.parent / (db_path.name + "-shm")).write_bytes(b"\x00" * 64)
+    with pytest.raises(RuntimeError, match="sidecar"):
+        recovery.restore_backup(Path(backup["backup_path"]), db_path)
+
+
+def test_restore_payload_checksum_mismatch_rejected_and_target_preserved(tmp_path):
+    """Corruption that still decompresses as gzip but changes the dump payload
+    must be caught by the payload checksum and rejected; the target is
+    preserved."""
+    db_path = tmp_path / "target.db"
+    bdir = tmp_path / "backups"
+    _make_simple_db(db_path)
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+    backup_path = Path(backup["backup_path"])
+
+    raw = _gzip.decompress(backup_path.read_bytes())
+    corrupted = raw.replace(b"VALUES", b"VALOOS")
+    if corrupted == raw:
+        corrupted = raw.replace(b"CREATE", b"CREAT")
+    backup_path.write_bytes(_gzip.compress(corrupted))
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("INSERT INTO t VALUES (99, 'preserved')")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="checksum"):
+        recovery.restore_backup(backup_path, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute("SELECT v FROM t WHERE id = 99").fetchone()
+    conn.close()
+    assert row is not None and row[0] == "preserved", (
+        "target was corrupted by a failed restore"
+    )
+
+
+def test_restore_failed_integrity_preserves_original(tmp_path):
+    """A dump that rebuilds but fails integrity_check must not replace the
+    target."""
+    db_path = tmp_path / "target.db"
+    bdir = tmp_path / "backups"
+    _make_simple_db(db_path)
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+    backup_path = Path(backup["backup_path"])
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("INSERT INTO t VALUES (99, 'keepme')")
+    conn.commit()
+    conn.close()
+
+    # Break the dump so it produces an invalid DB but still parses as SQL.
+    raw = _gzip.decompress(backup_path.read_bytes())
+    backup_path.write_bytes(_gzip.compress(raw.replace(b"CREATE TABLE", b"BREAK TABLE")))
+
+    with pytest.raises(Exception):
+        recovery.restore_backup(backup_path, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    row = conn.execute("SELECT v FROM t WHERE id = 99").fetchone()
+    conn.close()
+    assert row is not None and row[0] == "keepme"
+
+
+def test_successful_restore_replaces_target_and_preserves_original(tmp_path):
+    db_path = tmp_path / "target.db"
+    bdir = tmp_path / "backups"
+    _make_simple_db(db_path)
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+    # Mutate the live target after the backup.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("INSERT INTO t VALUES (42, 'post-backup')")
+    conn.commit()
+    conn.close()
+
+    result = recovery.restore_backup(Path(backup["backup_path"]), db_path)
+
+    assert result["integrity_check"] is True
+    conn = sqlite3.connect(str(db_path))
+    total = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+    post_backup_gone = conn.execute(
+        "SELECT COUNT(*) FROM t WHERE id = 42"
+    ).fetchone()[0]
+    conn.close()
+    assert total == 2, "target not restored to backup contents"
+    assert post_backup_gone == 0
+    preserved = Path(result["preserved_original"])
+    assert preserved.exists(), "original target must be preserved as a sidecar"

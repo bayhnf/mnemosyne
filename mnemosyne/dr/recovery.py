@@ -62,6 +62,17 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_name = f"mnemosyne_backup_{timestamp}.db.gz"
     backup_path = backup_dir / backup_name
+    # Guarantee a unique filename: two backups created within the same second
+    # would otherwise collide and silently overwrite. Append a microseconds
+    # counter and, only if that still collides, a short random suffix.
+    if backup_path.exists():
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_name = f"mnemosyne_backup_{ts}.db.gz"
+        backup_path = backup_dir / backup_name
+    if backup_path.exists():
+        import secrets
+        backup_name = f"mnemosyne_backup_{timestamp}_{secrets.token_hex(3)}.db.gz"
+        backup_path = backup_dir / backup_name
     
     # Use sqlite3 online backup API instead of shutil.copyfileobj.
     # sqlite3.backup() is lock-aware (acquires read-lock), includes
@@ -95,13 +106,17 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
         buf.write((line + "\n").encode("utf-8"))
     dst.close()
 
+    dump_bytes = buf.getvalue()
     with gzip.open(backup_path, "wb") as f_out:
-        f_out.write(buf.getvalue())
-    
-    # Calculate checksums
+        f_out.write(dump_bytes)
+
+    # Calculate checksums. ``dump_checksum`` covers the decompressed SQL dump
+    # payload so restore can detect corruption that survives gzip decompression
+    # (the older file-level checksums only covered the compressed container).
     db_checksum = hashlib.sha256(db_path.read_bytes()).hexdigest()[:16]
     backup_checksum = hashlib.sha256(backup_path.read_bytes()).hexdigest()[:16]
-    
+    dump_checksum = hashlib.sha256(dump_bytes).hexdigest()
+
     # Create metadata
     metadata = {
         "timestamp": timestamp,
@@ -109,6 +124,7 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
         "backup_size": backup_path.stat().st_size,
         "db_checksum": db_checksum,
         "backup_checksum": backup_checksum,
+        "dump_checksum": dump_checksum,
         "compressed": True
     }
     
@@ -124,50 +140,191 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     }
 
 
-def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
+def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
+    """Load sqlite-vec on a connection when the extension is available.
+
+    Mirrors core/beam.py's graceful fallback: absence of sqlite-vec just means
+    no vec0 virtual tables to introspect.
     """
-    Restore database from a compressed backup.
-    
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+    except (ImportError, sqlite3.OperationalError):
+        pass
+
+
+def _reject_active_sidecars(db_path: Path) -> None:
+    """Fail closed if WAL/SHM sidecars exist at the target.
+
+    A stale -wal/-shm alongside the main file means the on-disk state is the
+    union of the main file and uncommitted WAL frames. Atomically replacing
+    only the main file would silently drop those frames, so we refuse and let
+    an operator checkpoint/quiesce the writer first.
+    """
+    for suffix in ("-wal", "-shm"):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        if sidecar.exists():
+            raise RuntimeError(
+                f"Refusing to restore while an active sidecar exists: {sidecar}. "
+                f"Quiesce live writers and run 'PRAGMA wal_checkpoint(TRUNCATE)' "
+                f"before restoring."
+            )
+
+
+def _reject_live_writer(db_path: Path) -> None:
+    """Fail closed if a live writer holds the database.
+
+    Opening in exclusive mode fails immediately (SQLITE_BUSY) when another
+    connection is writing, which prevents replacing a file out from under a
+    running Mnemosyne process.
+    """
+    if not db_path.exists():
+        return
+    probe = sqlite3.connect(f"file:{db_path}?mode=rwc", uri=True)
+    try:
+        probe.execute("PRAGMA busy_timeout=0")
+        probe.execute("BEGIN IMMEDIATE")
+        probe.execute("ROLLBACK")
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            f"Refusing to restore: a live writer appears to hold {db_path} "
+            f"({exc}). Stop all Mnemosyne processes before restoring."
+        ) from exc
+    finally:
+        probe.close()
+
+
+def _fsync_path(path: Path) -> None:
+    """fsync a file path so the staged bytes reach durable storage."""
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
+    """Restore database from a compressed backup. Fail-closed.
+
+    The restore never overwrites the live target until the replacement has been
+    fully validated. The sequence is:
+
+      1. Read backup + metadata; verify the gzip file checksum and the
+         decompressed dump checksum (when metadata records one).
+      2. Reject active WAL/SHM sidecars or a live writer at the target so we
+         never replace a file out from under a running process or drop
+         uncommitted WAL frames.
+      3. Rebuild the dump into a *staged* temp DB in the target directory,
+         load sqlite-vec where supported, and run ``PRAGMA integrity_check``.
+      4. fsync the staged file, then atomically replace the target via
+         ``os.replace``. The original is preserved as ``.restore_preserved``
+         so a failure after replace is still recoverable.
+
+    Any error before the atomic replace leaves the original target untouched.
+
     Args:
-        backup_path: Path to the .gz backup file
-        db_path: Destination database path (default: ~/.mnemosyne/data/mnemosyne.db)
-        
+        backup_path: Path to the .gz backup file.
+        db_path: Destination database path.
+
     Returns:
-        Dict with restore status and details
+        Dict with restore status and details. Raises on any pre-replace
+        validation failure so the caller can report a structured error.
     """
     _, _, default_db = get_default_paths()
-    db_path = db_path or default_db
-    
+    db_path = Path(db_path or default_db)
+    backup_path = Path(backup_path)
+
     if not backup_path.exists():
         raise FileNotFoundError(f"Backup not found: {backup_path}")
-    
-    # Create emergency backup of current DB
-    if db_path.exists():
-        emergency_path = db_path.with_suffix('.emergency_backup.db')
-        shutil.copy2(db_path, emergency_path)
-    
-    # Decompress and restore using sqlite3 backup API
+
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # --- 1. Read + verify checksums ---------------------------------------
     with gzip.open(backup_path, "rb") as f_in:
-        sql_dump = f_in.read().decode("utf-8")
+        dump_bytes = f_in.read()
 
-    # Rebuild DB in-memory, then backup to target file
-    mem_db = sqlite3.connect(":memory:")
-    mem_db.executescript(sql_dump)
-    target_db = sqlite3.connect(str(db_path))
-    mem_db.backup(target_db)
-    mem_db.close()
-    target_db.close()
-    
-    # Verify restored database
+    backup_checksum = hashlib.sha256(backup_path.read_bytes()).hexdigest()[:16]
+    dump_checksum = hashlib.sha256(dump_bytes).hexdigest()
+
+    meta_path = backup_path.with_suffix(".gz.json")
+    metadata: Dict = {}
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                metadata = json.load(f) or {}
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+
+    expected_backup = metadata.get("backup_checksum")
+    if expected_backup and expected_backup != backup_checksum:
+        raise RuntimeError(
+            f"Backup file checksum mismatch: metadata={expected_backup} "
+            f"actual={backup_checksum}. The backup file is corrupted or was "
+            f"modified; refusing to restore."
+        )
+    expected_dump = metadata.get("dump_checksum")
+    if expected_dump and expected_dump != dump_checksum:
+        raise RuntimeError(
+            f"Backup payload checksum mismatch: metadata={expected_dump} "
+            f"actual={dump_checksum}. The decompressed dump is corrupted; "
+            f"refusing to restore."
+        )
+
+    # --- 2. Reject active sidecars / live writer --------------------------
+    _reject_active_sidecars(db_path)
+    _reject_live_writer(db_path)
+
+    # --- 3. Rebuild into a staged DB and validate -------------------------
+    staged_path = db_path.with_suffix(db_path.suffix + ".restore_staged")
+    tmp_db = sqlite3.connect(str(staged_path))
+    _load_sqlite_vec(tmp_db)
+    try:
+        tmp_db.executescript(dump_bytes.decode("utf-8"))
+        integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(
+                f"Staged restore failed integrity_check: {integrity}. "
+                f"Refusing to replace target."
+            )
+        tmp_db.commit()
+        # Best-effort WAL checkpoint so the staged file is self-contained.
+        try:
+            tmp_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
+        tmp_db.close()
+    except Exception:
+        try:
+            tmp_db.close()
+        except Exception:
+            pass
+        staged_path.unlink(missing_ok=True)
+        raise
+
+    # fsync the staged file before the atomic swap.
+    _fsync_path(staged_path)
+
+    # --- 4. Atomic replace, preserving the original -----------------------
+    preserved_path = db_path.with_name(db_path.name + ".restore_preserved")
+    preserved_existed = db_path.exists()
+    if preserved_existed:
+        # Keep the previous target so a post-replace problem is recoverable.
+        # os.replace overwrites any prior preserved file atomically.
+        shutil.copy2(db_path, preserved_path)
+
+    os.replace(staged_path, db_path)
+    _fsync_path(db_path)
+
     is_valid = verify_integrity(db_path)
-    
     return {
         "restored": True,
         "backup_used": str(backup_path),
         "database_path": str(db_path),
-        "integrity_check": is_valid
+        "integrity_check": is_valid,
+        "backup_checksum": backup_checksum,
+        "dump_checksum": dump_checksum,
+        "preserved_original": str(preserved_path) if preserved_existed else None,
     }
 
 
