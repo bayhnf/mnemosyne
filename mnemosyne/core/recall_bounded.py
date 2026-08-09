@@ -267,6 +267,8 @@ def _apply_token_budget(
     kept: List[Dict[str, Any]] = []
     for r in rows:
         r = dict(r)  # never mutate caller's dict
+        r.pop("_bounded_fts_match", None)
+        r.pop("_bounded_memoria_source", None)
         # Per-item token truncation on the content field.
         if policy.max_item_tokens is not None:
             r["content"] = _truncate_to_tokens(
@@ -600,7 +602,9 @@ def _hydrate_candidates(
 
         # Base hybrid score.
         score = max(
-            vec_sim * 0.5 + (lexical * 0.3 if fts_rank is not None else 0.0) + importance * 0.2,
+            vec_sim * 0.5
+            + (lexical * 0.3 if fts_rank is not None else 0.0)
+            + importance * 0.2,
             lexical * 0.8,
         ) * (0.7 + 0.3 * decay)
 
@@ -626,6 +630,8 @@ def _hydrate_candidates(
             row["entity_match"] = True
         if is_fact:
             row["fact_match"] = True
+        row["_bounded_fts_match"] = fts_rank is not None
+        row["_bounded_memoria_source"] = is_memoria_src
         scored.append(row)
 
     # --- Associative supplement (graph traversal, depth=1) ---
@@ -664,6 +670,86 @@ def _hydrate_candidates(
             logger.info("bounded: associative hydration failed", exc_info=True)
 
     return scored, mode, degradation
+
+
+def _enhanced_query_and_weights(query: str) -> Tuple[str, Tuple[float, float, float]]:
+    """Resolve the existing pure enhanced query/rank helpers."""
+    from mnemosyne.core import beam as _beam_mod
+
+    expanded_query = (
+        _beam_mod.expand_query(query)
+        if _beam_mod.expand_query is not None
+        else query
+    )
+    weights = _beam_mod._resolve_recall_weights(None, None, None)
+    if _beam_mod.classify_intent is not None and _beam_mod.adjust_weights is not None:
+        intent = _beam_mod.classify_intent(query)
+        if intent.category != "general":
+            weights = _beam_mod._normalize_recall_weight_values(
+                *_beam_mod.adjust_weights(
+                    base_vec=weights.vec,
+                    base_fts=weights.fts,
+                    base_importance=weights.importance,
+                    intent=intent,
+                )
+            )
+    return expanded_query, weights.as_tuple()
+
+
+def _rank_enhanced(
+    rows: List[Dict[str, Any]],
+    query: str,
+    weights: Tuple[float, float, float],
+) -> List[Dict[str, Any]]:
+    """Apply intent weights, Weibull scoring, and MMR after filtering."""
+    from mnemosyne.core import beam as _beam_mod
+
+    query_lower = query.lower()
+    query_words = _beam_mod._recall_tokens(query_lower)
+    vec_weight, fts_weight, importance_weight = weights
+    for row in rows:
+        fts_match = row.pop("_bounded_fts_match", None)
+        is_memoria_source = row.pop("_bounded_memoria_source", False)
+        if fts_match is None:
+            continue
+        lexical = _beam_mod._lexical_relevance(
+            query_words,
+            row.get("content", ""),
+            query_lower,
+        )
+        decay = _beam_mod._recency_decay(row.get("timestamp", ""))
+        score = max(
+            row.get("dense_score", 0.0) * vec_weight
+            + (lexical * fts_weight if fts_match else 0.0)
+            + (row.get("importance") or 0.5) * importance_weight,
+            lexical * 0.8,
+        ) * (0.7 + 0.3 * decay)
+        if row.get("entity_match"):
+            score = min(score * 1.3, 1.0)
+        if row.get("fact_match"):
+            score = min(score * 1.2, 1.0)
+        if is_memoria_source:
+            score = min(score * 1.1, 1.0)
+        row["score"] = round(score, 4)
+
+    if _beam_mod.weibull_boost is not None:
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            memory_type = row.get("memory_type") or "general"
+            if memory_type == "unknown":
+                memory_type = "general"
+            boost = _beam_mod.weibull_boost(
+                row.get("timestamp"),
+                now,
+                memory_type=memory_type,
+            )
+            row["score"] = round(row.get("score", 0.0) * 0.7 + boost * 0.3, 4)
+            row["weibull_boost"] = round(boost, 4)
+            row["memory_type"] = memory_type
+
+    if _beam_mod.mmr_rerank is not None and len(rows) > 1:
+        return _beam_mod.mmr_rerank(rows, lambda_param=0.7, top_k=len(rows))
+    return _rank(rows)
 
 
 def _recent_fallback_rows(
@@ -763,6 +849,7 @@ def _run_gate(
     degradation: List[str],
     *,
     used_polyphonic: bool = False,
+    enhanced_weights: Optional[Tuple[float, float, float]] = None,
 ) -> RecallEnvelope:
     """One authoritative gate for every mode.
 
@@ -803,7 +890,11 @@ def _run_gate(
                 degradation.append("recent_fallback_after_filter")
 
     gated = _dedupe(gated)
-    gated = _rank(gated)
+    gated = (
+        _rank_enhanced(gated, query, enhanced_weights)
+        if enhanced_weights is not None
+        else _rank(gated)
+    )
     kept, context, tokens = _apply_token_budget(gated, policy)
 
     return RecallEnvelope(
@@ -855,6 +946,25 @@ def _beam_recall_bounded(self, query: str, policy: Optional[RecallPolicy] = None
             )
         # Empty / failed polyphonic → bounded linear fallback.
         degradation.append("polyphonic_empty_fallback_linear")
+
+    if os.environ.get("MNEMOSYNE_ENHANCED_RECALL", "0") == "1":
+        expanded_query, score_weights = _enhanced_query_and_weights(query)
+        enhanced_rows, mode, enhanced_deg = _hydrate_candidates(
+            self,
+            expanded_query,
+            policy,
+        )
+        degradation.extend(enhanced_deg)
+        return _run_gate(
+            enhanced_rows,
+            self,
+            expanded_query,
+            policy,
+            mode=mode,
+            degradation=degradation,
+            used_polyphonic=False,
+            enhanced_weights=score_weights,
+        )
 
     # --- Linear + supplements path ---
     linear_rows, mode, lin_deg = _hydrate_candidates(self, query, policy)

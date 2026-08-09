@@ -8,6 +8,7 @@ deterministic fallback, while leaving legacy ``recall()`` untouched.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -874,3 +875,152 @@ class TestDedupKeepsHigherScore:
         for r in env.results:
             if r["id"] == mid:
                 assert r["score"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 4 — native enhanced bounded recall
+# ---------------------------------------------------------------------------
+
+class TestEnhancedBoundedRecall:
+    def test_expanded_query_candidate_enters_strict_gate(self, beam, monkeypatch):
+        from mnemosyne.core import beam as beam_module
+
+        monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
+
+        allowed_id = _remember(
+            beam, "credential expanded-only allowed", session_id="sess-a",
+        )
+        forbidden_id = _remember(
+            beam,
+            "credential expanded-only forbidden",
+            session_id="sess-b",
+            scope="global",
+        )
+
+        env = beam.recall_bounded(
+            "password",
+            RecallPolicy(top_k=10, require_fallback=False),
+        )
+
+        ids = {row["id"] for row in env.results}
+        assert allowed_id in ids
+        assert forbidden_id not in ids
+
+    def test_enhanced_rank_helpers_stay_inside_hard_gate(
+        self, beam, monkeypatch,
+    ):
+        from mnemosyne.core import beam as beam_module
+        from mnemosyne.core.token_counter import estimate_tokens
+
+        monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
+
+        allowed_ids = {
+            _remember(
+                beam,
+                f"deploy allowed result {index} with bounded padding",
+                importance=0.9 - index * 0.1,
+                memory_type="request",
+            )
+            for index in range(3)
+        }
+        forbidden_id = _remember(
+            beam,
+            "deploy forbidden global result",
+            session_id="sess-b",
+            scope="global",
+            memory_type="forbidden",
+        )
+
+        calls = {"intent": 0, "adjust": 0, "weibull": 0, "mmr_ids": []}
+
+        def classify_intent(query):
+            calls["intent"] += 1
+            return SimpleNamespace(category="procedural")
+
+        def adjust_weights(*args, **kwargs):
+            calls["adjust"] += 1
+            return (0.2, 0.7, 0.1)
+
+        def weibull_boost(timestamp, query_time=None, memory_type="general"):
+            assert memory_type != "forbidden", "filtered candidate reached rank"
+            calls["weibull"] += 1
+            return 0.5
+
+        def mmr_rerank(results, lambda_param=0.7, top_k=10):
+            calls["mmr_ids"] = [row["id"] for row in results]
+            return list(reversed(results))[:top_k]
+
+        monkeypatch.setattr(beam_module, "classify_intent", classify_intent)
+        monkeypatch.setattr(beam_module, "adjust_weights", adjust_weights)
+        monkeypatch.setattr(beam_module, "weibull_boost", weibull_boost)
+        monkeypatch.setattr(beam_module, "mmr_rerank", mmr_rerank)
+
+        policy = RecallPolicy(
+            top_k=2,
+            max_tokens=20,
+            max_item_tokens=6,
+            require_fallback=False,
+        )
+        env = beam.recall_bounded("how do I deploy", policy)
+
+        assert calls["intent"] == 1
+        assert calls["adjust"] == 1
+        assert calls["weibull"] >= len(allowed_ids)
+        assert set(calls["mmr_ids"]) == allowed_ids
+        assert forbidden_id not in calls["mmr_ids"]
+        assert len(env.results) <= policy.top_k
+        assert env.token_count <= policy.max_tokens
+        assert all(
+            estimate_tokens(row["content"]) <= policy.max_item_tokens
+            for row in env.results
+        )
+
+    def test_enhanced_bounded_is_read_only_and_skips_legacy_and_cache(
+        self, beam, monkeypatch,
+    ):
+        from mnemosyne.core import beam as beam_module
+
+        monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+        monkeypatch.delenv("MNEMOSYNE_POLYPHONIC_RECALL", raising=False)
+        monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
+
+        memory_id = _remember(beam, "enhanced counter sentinel")
+        before = beam.conn.execute(
+            "SELECT recall_count FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()["recall_count"]
+
+        expanded_queries = []
+
+        def expand_query(query):
+            expanded_queries.append(query)
+            return query
+
+        def forbidden_legacy(*args, **kwargs):
+            raise AssertionError("bounded recall invoked a legacy recall method")
+
+        class ForbiddenCache:
+            def __getattr__(self, name):
+                raise AssertionError(f"bounded recall accessed query cache: {name}")
+
+        monkeypatch.setattr(beam_module, "expand_query", expand_query)
+        monkeypatch.setattr(beam, "recall", forbidden_legacy)
+        monkeypatch.setattr(beam, "recall_enhanced", forbidden_legacy)
+        beam._query_cache = ForbiddenCache()
+
+        env = beam.recall_bounded(
+            "enhanced counter sentinel",
+            RecallPolicy(top_k=5, require_fallback=False),
+        )
+        after = beam.conn.execute(
+            "SELECT recall_count FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()["recall_count"]
+
+        assert expanded_queries == ["enhanced counter sentinel"]
+        assert memory_id in {row["id"] for row in env.results}
+        assert after == before
