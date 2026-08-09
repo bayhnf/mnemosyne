@@ -7074,6 +7074,35 @@ class BeamMemory:
 
         return final_results
 
+
+    def recall_bounded(self, query, policy=None):
+        """[Task 3] Authoritative bounded recall.
+
+        Returns a ``RecallEnvelope`` with hard result/token caps,
+        strict native isolation, and deterministic fallback. Every
+        retrieval mode (linear, enhanced, associative, polyphonic,
+        entity, fact, MEMORIA) routes through one post-hydration gate::
+
+            hydrate -> strict predicate -> lifecycle -> deduplicate
+                    -> rank -> hard top_k -> rendered-token budget
+
+        Read-only: never mutates ``recall_count`` / ``last_recalled``.
+        Legacy :meth:`recall` is unchanged.
+
+        Args:
+            query: Natural language search query.
+            policy: ``RecallPolicy`` controlling bounds and filters.
+                Defaults to ``RecallPolicy()`` when omitted.
+
+        Returns:
+            ``RecallEnvelope`` with ordered results, rendered context,
+            token count, retrieval mode, applied filters, degradation
+            reasons, and a non-sensitive trace id.
+        """
+        from mnemosyne.core.recall_bounded import _beam_recall_bounded
+
+        return _beam_recall_bounded(self, query, policy)
+
     def _enhanced_recall_cache_key(
         self,
         *,

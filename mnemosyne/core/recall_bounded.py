@@ -1,17 +1,22 @@
 """Task 3 — Authoritative bounded recall.
 
-Additive post-hydration gate that returns a :class:`RecallEnvelope` with
+Additive post-hydration gate returning a :class:`RecallEnvelope` with
 hard result/token caps, strict isolation, and deterministic fallback,
 while leaving legacy :meth:`BeamMemory.recall` untouched.
 
-Every retrieval mode (linear, enhanced, associative, polyphonic, entity,
-fact, MEMORIA) is hydrated into a flat candidate list and then passed
-through one gate::
+Every retrieval mode — linear, enhanced, associative, polyphonic,
+entity, fact, MEMORIA, and episodic supplements — hydrates into one flat
+candidate list and passes through a single gate::
 
-    hydrate → strict predicate → lifecycle check → deduplicate
+    hydrate → strict predicate → lifecycle → deduplicate
             → rank → hard top_k → rendered-token budget
 
-The bounded path is read-only: it never bumps ``recall_count``.
+The bounded path is **read-only**: it never bumps ``recall_count`` /
+``last_recalled``. It calls only the read-only local helpers
+(``_fts_search``, ``_wm_vec_search``, ``_find_memories_by_entity``,
+``_find_memories_by_fact``, ``memoria_retrieve``, ``fact_recall``,
+``_fetch_polyphonic_row``), never the side-effecting legacy
+``recall()`` / ``recall_enhanced()`` / ``_recall_polyphonic()``.
 """
 
 from __future__ import annotations
@@ -26,34 +31,38 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Sources treated as pending proposals / Dream output — always excluded
-# from bounded recall before any apply step. Proposals carry
-# ``source='sleep_model_refresh_proposal'`` with ``metadata.status='pending'``
-# (see mnemosyne/core/model_refresh.py). We exclude by source string so the
-# gate does not need to parse metadata JSON on every row.
+# Sources treated as pending proposals / Dream output — always excluded.
 _PROPOSAL_SOURCES = frozenset({"sleep_model_refresh_proposal"})
+
+
+# ---------------------------------------------------------------------------
+# Public dataclasses
+# ---------------------------------------------------------------------------
+
+
+def _is_strict_int(value: Any) -> bool:
+    """Return True only for real ints (not bool, not float)."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True)
 class RecallPolicy:
     """Authoritative filter + bound specification for bounded recall.
 
-    ``only_active`` defaults True so expired (``valid_until`` in the past)
-    and superseded (``superseded_by`` set) rows are excluded — this is the
-    ``active`` lifecycle. Pending proposals and Dream output are always
-    excluded regardless of this flag.
+    Producer corresponds to ``author_type`` (who/what produced the
+    memory: human, agent, system, legacy). Actor corresponds to
+    ``author_id`` (the identity of the producer instance).
     """
 
     top_k: int = 20
     max_tokens: Optional[int] = None
     max_item_tokens: Optional[int] = None
-    # Identity allowlists. None = unconstrained for that axis (but still
-    # subject to session isolation unless include_shared/include_legacy_shared).
-    producer_ids: Optional[Sequence[str]] = None
-    actor_ids: Optional[Sequence[str]] = None
-    project_ids: Optional[Sequence[str]] = None
-    session_ids: Optional[Sequence[str]] = None
-    producer_types: Optional[Sequence[str]] = None
+    # Identity allowlists. None = unconstrained for that axis.
+    producer_ids: Optional[Sequence[str]] = None  # → author_type
+    actor_ids: Optional[Sequence[str]] = None  # → author_id
+    project_ids: Optional[Sequence[str]] = None  # → channel_id
+    session_ids: Optional[Sequence[str]] = None  # → session_id
+    producer_types: Optional[Sequence[str]] = None  # → author_type (alias)
     include_shared: bool = False
     include_legacy_shared: bool = False
     memory_types: Optional[Sequence[str]] = None
@@ -65,14 +74,22 @@ class RecallPolicy:
     require_fallback: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.top_k, int) or self.top_k <= 0:
+        if not _is_strict_int(self.top_k) or self.top_k <= 0:
             raise ValueError(f"top_k must be a positive int, got {self.top_k!r}")
-        if self.max_tokens is not None and self.max_tokens <= 0:
-            raise ValueError(f"max_tokens must be positive, got {self.max_tokens!r}")
-        if self.max_item_tokens is not None and self.max_item_tokens <= 0:
+        if self.max_tokens is not None and (not _is_strict_int(self.max_tokens) or self.max_tokens <= 0):
+            raise ValueError(f"max_tokens must be a positive int, got {self.max_tokens!r}")
+        if self.max_item_tokens is not None and (not _is_strict_int(self.max_item_tokens) or self.max_item_tokens <= 0):
             raise ValueError(
-                f"max_item_tokens must be positive, got {self.max_item_tokens!r}"
+                f"max_item_tokens must be a positive int, got {self.max_item_tokens!r}"
             )
+        if not isinstance(self.include_shared, bool):
+            raise ValueError(f"include_shared must be bool, got {type(self.include_shared)}")
+        if not isinstance(self.include_legacy_shared, bool):
+            raise ValueError(f"include_legacy_shared must be bool, got {type(self.include_legacy_shared)}")
+        if not isinstance(self.only_active, bool):
+            raise ValueError(f"only_active must be bool, got {type(self.only_active)}")
+        if not isinstance(self.require_fallback, bool):
+            raise ValueError(f"require_fallback must be bool, got {type(self.require_fallback)}")
 
 
 @dataclass
@@ -89,8 +106,6 @@ class RecallEnvelope:
 
     def __post_init__(self) -> None:
         if not self.trace_id:
-            # Stable, non-sensitive id: hash of timestamp + uuid. Never
-            # embeds query content or user data.
             material = f"{datetime.now(timezone.utc).isoformat()}|{uuid.uuid4().hex}"
             self.trace_id = "rb_" + hashlib.sha256(material.encode()).hexdigest()[:16]
 
@@ -110,16 +125,32 @@ def _estimate_tokens(text: str) -> int:
     return estimate_tokens(text)
 
 
-def _render_row(row: Dict[str, Any], max_item_tokens: Optional[int]) -> str:
-    """Render one candidate as a single context line, truncating to the
-    per-item token cap when set."""
-    content = (row.get("content") or "").strip()
-    if max_item_tokens is not None:
-        words = content.split()
-        if len(words) > max_item_tokens:
-            content = " ".join(words[:max_item_tokens])
-    ts = (row.get("timestamp") or "")[:10] or "?"
-    return f"- {content} ({ts})"
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate ``text`` to at most ``max_tokens`` estimated tokens.
+
+    Uses binary search on the word-prefix to find the largest prefix whose
+    estimated token count fits, since token estimation is not linearly
+    proportional to word count (tiktoken merges subwords).
+    """
+    if max_tokens <= 0 or not text:
+        return ""
+    if _estimate_tokens(text) <= max_tokens:
+        return text
+    words = text.split()
+    if not words:
+        return ""
+    # Binary search for the largest word-prefix that fits.
+    lo, hi = 0, len(words)
+    best = ""
+    while lo < hi:
+        mid = (lo + hi) // 2
+        candidate = " ".join(words[: mid + 1])
+        if _estimate_tokens(candidate) <= max_tokens:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid
+    return best
 
 
 def _row_is_proposal(row: Dict[str, Any]) -> bool:
@@ -133,11 +164,7 @@ def _passes_policy(
     calling_session_id: str,
     now_iso: str,
 ) -> bool:
-    """Strict predicate: identity allowlists, lifecycle, shared scope.
-
-    This is the authoritative native policy — it does not rely on any
-    environment scoping side effect.
-    """
+    """Strict predicate: identity allowlists, lifecycle, shared scope."""
 
     # --- Always-on: proposals / Dream output ---
     if _row_is_proposal(row):
@@ -155,20 +182,15 @@ def _passes_policy(
     row_scope = row.get("scope") or "session"
     row_session = row.get("session_id")
     if row_scope == "global":
-        # global rows: gated by include_shared / include_legacy_shared.
         if not policy.include_shared and not policy.include_legacy_shared:
             return False
         if policy.include_legacy_shared and not policy.include_shared:
-            # legacy-only: author_type NULL or 'legacy' (do not infer).
             at = row.get("author_type")
             if at is not None and at != "legacy":
                 return False
     else:
-        # session-scoped: must match the calling session or an allowlist.
         allowed_sessions = (
-            None
-            if policy.session_ids is None
-            else set(policy.session_ids)
+            None if policy.session_ids is None else set(policy.session_ids)
         )
         if allowed_sessions is None:
             if row_session is not None and row_session != calling_session_id:
@@ -178,14 +200,15 @@ def _passes_policy(
                 return False
 
     # --- Identity allowlists ---
-    if policy.actor_ids is not None:
-        if row.get("author_id") not in set(policy.actor_ids):
-            return False
+    # producer → author_type; actor → author_id.
     if policy.producer_ids is not None:
-        if row.get("author_id") not in set(policy.producer_ids):
+        if (row.get("author_type") or "") not in set(policy.producer_ids):
             return False
     if policy.producer_types is not None:
-        if row.get("author_type") not in set(policy.producer_types):
+        if (row.get("author_type") or "") not in set(policy.producer_types):
+            return False
+    if policy.actor_ids is not None:
+        if row.get("author_id") not in set(policy.actor_ids):
             return False
     if policy.project_ids is not None:
         if row.get("channel_id") not in set(policy.project_ids):
@@ -202,7 +225,7 @@ def _passes_policy(
         if row.get("source") != policy.source:
             return False
     ts = row.get("timestamp") or ""
-    if policy.from_date and ts < policy.from_date:
+    if policy.from_date and ts < f"{policy.from_date}T00:00:00":
         return False
     if policy.to_date and ts > f"{policy.to_date}T23:59:59":
         return False
@@ -210,16 +233,17 @@ def _passes_policy(
 
 
 def _dedupe(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Drop duplicate ids, keeping the first (highest-ranked) occurrence."""
-    seen = set()
-    out = []
+    """Drop duplicate ids, keeping the **highest-scored** occurrence."""
+    best: Dict[Any, Dict[str, Any]] = {}
+    order: List[Any] = []
     for r in rows:
         rid = r.get("id")
-        if rid in seen:
-            continue
-        seen.add(rid)
-        out.append(r)
-    return out
+        if rid not in best:
+            best[rid] = r
+            order.append(rid)
+        elif r.get("score", 0.0) > best[rid].get("score", 0.0):
+            best[rid] = r
+    return [best[rid] for rid in order]
 
 
 def _rank(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -231,30 +255,45 @@ def _apply_token_budget(
     rows: List[Dict[str, Any]],
     policy: RecallPolicy,
 ) -> Tuple[List[Dict[str, Any]], str, int]:
-    """Apply hard top_k then rendered-token budget. Returns
-    (kept_rows, rendered_context, token_count).
+    """Apply hard top_k then rendered-token budget.
 
-    When ``max_item_tokens`` is set, each kept row's ``content`` is
-    truncated in-place so downstream consumers see the bounded form,
-    not just the rendered context."""
+    Both ``max_tokens`` and ``max_item_tokens`` are **estimated-token**
+    hard limits (via :func:`estimate_tokens`), not whitespace-word counts.
+    An oversized first candidate that exceeds ``max_tokens`` is skipped —
+    never returned above budget.
+    """
     rows = rows[: policy.top_k]
     lines: List[str] = []
     kept: List[Dict[str, Any]] = []
     for r in rows:
+        r = dict(r)  # never mutate caller's dict
+        # Per-item token truncation on the content field.
         if policy.max_item_tokens is not None:
-            words = (r.get("content") or "").split()
-            if len(words) > policy.max_item_tokens:
-                r = dict(r)
-                r["content"] = " ".join(words[: policy.max_item_tokens])
-        line = _render_row(r, policy.max_item_tokens)
+            r["content"] = _truncate_to_tokens(
+                r.get("content") or "", policy.max_item_tokens
+            )
+        line = _render_row(r)
         if policy.max_tokens is not None:
-            projected = _estimate_tokens("\n".join(lines + [line]))
-            if projected > policy.max_tokens and lines:
-                break
+            line_tokens = _estimate_tokens(line)
+            projected = _estimate_tokens("\n".join(lines + [line])) if lines else line_tokens
+            if projected > policy.max_tokens:
+                continue  # skip this row; hard budget
         lines.append(line)
         kept.append(r)
     context = "\n".join(lines)
-    return kept, context, _estimate_tokens(context)
+    tokens = _estimate_tokens(context)
+    # Final safety clamp: never return above budget.
+    if policy.max_tokens is not None and tokens > policy.max_tokens:
+        context = _truncate_to_tokens(context, policy.max_tokens)
+        tokens = _estimate_tokens(context)
+    return kept, context, tokens
+
+
+def _render_row(row: Dict[str, Any]) -> str:
+    """Render one candidate as a single context line."""
+    content = (row.get("content") or "").strip()
+    ts = (row.get("timestamp") or "")[:10] or "?"
+    return f"- {content} ({ts})"
 
 
 # ---------------------------------------------------------------------------
@@ -262,31 +301,15 @@ def _apply_token_budget(
 # ---------------------------------------------------------------------------
 
 
-def _hydrate_candidates(
-    beam,
-    query: str,
-    policy: RecallPolicy,
-) -> Tuple[List[Dict[str, Any]], str, List[str]]:
-    """Hydrate candidates from the available retrieval paths without
-    side effects. Returns (rows, retrieval_mode, degradation_reasons).
-
-    Degradation is deterministic: vector → FTS → bounded recent fallback.
-    """
-    from mnemosyne.core import beam as _beam_mod
-
-    degradation: List[str] = []
-    conn = beam.conn
-    now_iso = _now_iso()
-    query_lower = query.lower()
-    query_words = _beam_mod._recall_tokens(query_lower)
-
-    # Build identity/session SQL fragments from the policy (native).
+def _build_where(
+    beam, policy: RecallPolicy, now_iso: str
+) -> Tuple[str, List[Any]]:
+    """Build native identity/session/lifecycle SQL from the policy."""
     where_parts: List[str] = [
         "(valid_until IS NULL OR valid_until > ?)",
         "superseded_by IS NULL",
     ]
     params: List[Any] = [now_iso]
-    # session scope: native isolation unless include_shared opens globals.
     if policy.include_shared or policy.include_legacy_shared:
         where_parts.append("(1=1)")
     else:
@@ -300,6 +323,10 @@ def _hydrate_candidates(
         ph = ",".join("?" * len(policy.actor_ids))
         where_parts.append(f"author_id IN ({ph})")
         params.extend(policy.actor_ids)
+    if policy.producer_ids is not None:
+        ph = ",".join("?" * len(policy.producer_ids))
+        where_parts.append(f"author_type IN ({ph})")
+        params.extend(policy.producer_ids)
     if policy.producer_types is not None:
         ph = ",".join("?" * len(policy.producer_types))
         where_parts.append(f"author_type IN ({ph})")
@@ -325,18 +352,37 @@ def _hydrate_candidates(
     if policy.to_date:
         where_parts.append("timestamp <= ?")
         params.append(f"{policy.to_date}T23:59:59")
-    # Exclude proposals at SQL level too (defence in depth).
     where_parts.append("source NOT IN ('sleep_model_refresh_proposal')")
-    where_sql = " AND ".join(where_parts)
+    return " AND ".join(where_parts), params
 
-    wm_cols = (
-        "id, content, source, timestamp, session_id, importance, "
-        "recall_count, last_recalled, valid_until, superseded_by, scope, "
-        "author_id, author_type, channel_id, veracity, memory_type"
-    )
 
-    candidates: Dict[str, Dict[str, Any]] = {}
-    mode = "recent_fallback"
+_WM_COLS = (
+    "id, content, source, timestamp, session_id, importance, "
+    "recall_count, last_recalled, valid_until, superseded_by, scope, "
+    "author_id, author_type, channel_id, veracity, memory_type"
+)
+
+
+def _hydrate_candidates(
+    beam,
+    query: str,
+    policy: RecallPolicy,
+) -> Tuple[List[Dict[str, Any]], str, List[str]]:
+    """Hydrate candidates from all read-only retrieval paths.
+
+    Covers: vector, FTS, entity, fact, MEMORIA, episodic supplements.
+    Degradation is deterministic: vector → FTS → bounded recent fallback.
+    """
+    from mnemosyne.core import beam as _beam_mod
+
+    degradation: List[str] = []
+    conn = beam.conn
+    now_iso = _now_iso()
+    query_lower = query.lower()
+    query_words = _beam_mod._recall_tokens(query_lower)
+    where_sql, params = _build_where(beam, policy, now_iso)
+
+    candidates: Dict[Any, Dict[str, Any]] = {}
     had_vector = False
     had_fts = False
 
@@ -351,7 +397,6 @@ def _hydrate_candidates(
             query_embedding = None
 
     if query_embedding is not None:
-        # Working memory vector search.
         try:
             wm_vec = _beam_mod._wm_vec_search(
                 conn, query_embedding, k=max(policy.top_k * 3, 50),
@@ -363,7 +408,6 @@ def _hydrate_candidates(
                 candidates.setdefault(vr["id"], {"id": vr["id"], "_vec_sim": vr["sim"]})
         except Exception:
             logger.info("bounded: wm vec search failed", exc_info=True)
-        # Episodic vector search.
         try:
             if _beam_mod._vec_available(conn):
                 vec_rows = _beam_mod._vec_search(
@@ -374,15 +418,14 @@ def _hydrate_candidates(
                     conn, query_embedding, k=max(policy.top_k * 3, 20),
                 )
             if vec_rows:
-                max_distance = max(vr["distance"] for vr in vec_rows)
+                max_distance = max(vr["distance"] for vr in vec_rows) or 1.0
                 for vr in vec_rows:
                     had_vector = True
-                    sim = (
-                        max(0.0, 1.0 - (vr["distance"] / max_distance))
-                        if max_distance > 0
-                        else 1.0
+                    sim = max(0.0, 1.0 - (vr["distance"] / max_distance))
+                    candidates.setdefault(
+                        ("__rowid__", vr["rowid"]),
+                        {"id": None, "_rowid": vr["rowid"], "_vec_sim": sim},
                     )
-                    candidates.setdefault(vr["rowid"], {"id": None, "_rowid": vr["rowid"], "_vec_sim": sim})
         except Exception:
             logger.info("bounded: episodic vec search failed", exc_info=True)
 
@@ -400,7 +443,46 @@ def _hydrate_candidates(
         em_fts = []
     for fr in em_fts:
         had_fts = True
-        candidates.setdefault(("__rowid__", fr["rowid"]), {"id": None, "_rowid": fr["rowid"], "_fts_rank": fr["rank"]})
+        candidates.setdefault(
+            ("__rowid__", fr["rowid"]),
+            {"id": None, "_rowid": fr["rowid"], "_fts_rank": fr["rank"]},
+        )
+
+    # --- Entity supplement ---
+    try:
+        entity_ids = _beam_mod._find_memories_by_entity(beam, query)
+        for eid in entity_ids:
+            candidates.setdefault(eid, {"id": eid, "_entity_match": True})
+    except Exception:
+        logger.info("bounded: entity lookup failed", exc_info=True)
+
+    # --- Fact supplement ---
+    try:
+        fact_ids = _beam_mod._find_memories_by_fact(beam, query)
+        for fid in fact_ids:
+            candidates.setdefault(fid, {"id": fid, "_fact_match": True})
+    except Exception:
+        logger.info("bounded: fact lookup failed", exc_info=True)
+
+    # --- MEMORIA supplement ---
+    try:
+        memoria = beam.memoria_retrieve(query, top_k=max(policy.top_k, 3))
+        if memoria and memoria.get("source") != "fallback":
+            ctx = memoria.get("context", "")
+            if ctx:
+                # MEMORIA contributes a synthetic candidate that enters the gate.
+                mid = f"memoria_{memoria.get('source', 'unknown')}"
+                candidates.setdefault(mid, {
+                    "id": mid,
+                    "_memoria": True,
+                    "_content_override": f"[MEMORIA {memoria.get('source', '')}] {ctx}",
+                })
+                # Also pull source memory ids that MEMORIA references.
+                for sid in memoria.get("source_memory_ids", []) or []:
+                    if sid:
+                        candidates.setdefault(sid, {"id": sid, "_memoria_source": True})
+    except Exception:
+        pass  # MEMORIA is best-effort
 
     # --- Resolve candidate ids → full rows ---
     wm_ids_to_fetch = [v["id"] for v in candidates.values() if v.get("id") and not v.get("_rowid")]
@@ -411,7 +493,7 @@ def _hydrate_candidates(
     if wm_ids_to_fetch:
         ph = ",".join("?" * len(wm_ids_to_fetch))
         rows = conn.execute(
-            f"SELECT {wm_cols} FROM working_memory WHERE id IN ({ph}) AND {where_sql}",
+            f"SELECT {_WM_COLS} FROM working_memory WHERE id IN ({ph}) AND {where_sql}",
             (*wm_ids_to_fetch, *params),
         ).fetchall()
         for row in rows:
@@ -422,7 +504,7 @@ def _hydrate_candidates(
     if em_rowids_to_fetch:
         ph = ",".join("?" * len(em_rowids_to_fetch))
         rows = conn.execute(
-            f"SELECT rowid, {wm_cols} FROM episodic_memory WHERE rowid IN ({ph}) AND {where_sql}",
+            f"SELECT rowid, {_WM_COLS} FROM episodic_memory WHERE rowid IN ({ph}) AND {where_sql}",
             (*em_rowids_to_fetch, *params),
         ).fetchall()
         for row in rows:
@@ -446,130 +528,94 @@ def _hydrate_candidates(
     min_relevance = _beam_mod._minimum_recall_relevance(query_words)
 
     for key, cand in candidates.items():
+        # MEMORIA synthetic rows have no DB row; materialize from override.
+        if cand.get("_memoria"):
+            content = cand.get("_content_override", "")
+            lexical = _beam_mod._lexical_relevance(query_words, content, query_lower)
+            row = {
+                "id": cand["id"],
+                "content": content,
+                "source": "memoria",
+                "timestamp": "",
+                "session_id": beam.session_id,
+                "scope": "global",
+                "importance": 0.5,
+                "score": round(min(0.6, lexical * 0.6), 4),
+                "_tier": "memoria",
+            }
+            scored.append(row)
+            continue
+
         row = resolved.get(key)
         if row is None:
             continue
         vec_sim = cand.get("_vec_sim", 0.0)
         fts_rank = cand.get("_fts_rank")
+        is_entity = cand.get("_entity_match", False)
+        is_fact = cand.get("_fact_match", False)
+        is_memoria_src = cand.get("_memoria_source", False)
         lexical = _beam_mod._lexical_relevance(query_words, row.get("content", ""), query_lower)
         decay = _beam_mod._recency_decay(row.get("timestamp", ""))
         importance = row.get("importance") or 0.5
+
+        # Base hybrid score.
         score = max(
             vec_sim * 0.5 + (lexical * 0.3 if fts_rank is not None else 0.0) + importance * 0.2,
             lexical * 0.8,
         ) * (0.7 + 0.3 * decay)
-        if fts_rank is None and vec_sim == 0.0 and lexical < min_relevance:
-            continue
+
+        # Entity/fact/MEMORIA-source boosts (mirror legacy recall bonuses).
+        if is_entity:
+            score = min(score * 1.3, 1.0)
+        if is_fact:
+            score = min(score * 1.2, 1.0)
+        if is_memoria_src:
+            score = min(score * 1.1, 1.0)
+
+        # Relevance gate for non-vec, non-FTS rows.
+        if fts_rank is None and vec_sim == 0.0 and not is_entity and not is_fact and not is_memoria_src:
+            if lexical < min_relevance:
+                continue
+
         row["score"] = round(score, 4)
         row["dense_score"] = round(vec_sim, 4)
-        row["fts_score"] = round((1.0 - min(1.0, abs(fts_rank))) if fts_rank is not None else 0.0, 4)
+        row["fts_score"] = round(
+            (1.0 - min(1.0, abs(fts_rank))) if fts_rank is not None else 0.0, 4
+        )
+        if is_entity:
+            row["entity_match"] = True
+        if is_fact:
+            row["fact_match"] = True
         scored.append(row)
-
-    # --- Bounded recent fallback: if nothing matched, pull recent active rows ---
-    if not scored and policy.require_fallback:
-        fallback_rows = conn.execute(
-            f"SELECT {wm_cols} FROM working_memory WHERE {where_sql} "
-            f"ORDER BY timestamp DESC LIMIT {min(int(policy.top_k * 3), 200)}",
-            tuple(params),
-        ).fetchall()
-        for row in fallback_rows:
-            d = dict(row)
-            d["_tier"] = "working"
-            lexical = _beam_mod._lexical_relevance(query_words, d.get("content", ""), query_lower)
-            decay = _beam_mod._recency_decay(d.get("timestamp", ""))
-            score = lexical * 0.6 * (0.7 + 0.3 * decay)
-            d["score"] = round(score, 4)
-            d["dense_score"] = 0.0
-            d["fts_score"] = 0.0
-            scored.append(d)
 
     return scored, mode, degradation
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+def _recent_fallback_rows(
+    beam, policy: RecallPolicy, where_sql: str, params: List[Any],
+) -> List[Dict[str, Any]]:
+    """Bounded recent fallback: pull recent active rows from working_memory."""
 
+    conn = beam.conn
 
-def recall_bounded(beam, query: str, policy: Optional[RecallPolicy] = None) -> RecallEnvelope:
-    """Run an authoritative bounded recall against ``beam``.
-
-    Read-only: never mutates ``recall_count`` / ``last_recalled``.
-    """
-    if policy is None:
-        policy = RecallPolicy()
-    now_iso = _now_iso()
-
-    # --- Polyphonic path (gated by env) ---
-    if os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1":
-        poly_rows, poly_mode, poly_degradation = _hydrate_polyphonic(beam, query, policy)
-        if poly_rows:
-            # Run polyphonic candidates through the same gate.
-            gated = [
-                r for r in poly_rows
-                if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
-            ]
-            gated = _dedupe(gated)
-            gated = _rank(gated)
-            kept, context, tokens = _apply_token_budget(gated, policy)
-            return RecallEnvelope(
-                results=kept,
-                rendered_context=context,
-                token_count=tokens,
-                retrieval_mode="hybrid" if poly_mode == "polyphonic" else poly_mode,
-                applied_filters=_applied_filters(policy, beam.session_id),
-                degradation_reasons=poly_degradation,
-            )
-        # Empty / failed polyphonic → bounded linear fallback.
-        linear_rows, mode, degradation = _hydrate_candidates(beam, query, policy)
-        degradation.append("polyphonic_empty_fallback_linear")
-    else:
-        linear_rows, mode, degradation = _hydrate_candidates(beam, query, policy)
-
-    # --- One gate for every mode ---
-    gated = [
-        r for r in linear_rows
-        if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
-    ]
-    gated = _dedupe(gated)
-    gated = _rank(gated)
-    kept, context, tokens = _apply_token_budget(gated, policy)
-
-    return RecallEnvelope(
-        results=kept,
-        rendered_context=context,
-        token_count=tokens,
-        retrieval_mode=mode,
-        applied_filters=_applied_filters(policy, beam.session_id),
-        degradation_reasons=degradation,
-    )
-
-
-def _applied_filters(policy: RecallPolicy, session_id: str) -> Dict[str, Any]:
-    """Non-sensitive diagnostics summary of what the policy enforced."""
-    return {
-        "top_k": policy.top_k,
-        "max_tokens": policy.max_tokens,
-        "max_item_tokens": policy.max_item_tokens,
-        "include_shared": policy.include_shared,
-        "include_legacy_shared": policy.include_legacy_shared,
-        "only_active": policy.only_active,
-        "has_actor_filter": policy.actor_ids is not None,
-        "has_project_filter": policy.project_ids is not None,
-        "has_session_filter": policy.session_ids is not None,
-        "has_producer_type_filter": policy.producer_types is not None,
-        "has_memory_type_filter": policy.memory_types is not None,
-        "has_veracity_filter": policy.veracity is not None,
-        "calling_session": True,  # boolean, not the id itself
-    }
+    fallback_rows = conn.execute(
+        f"SELECT {_WM_COLS} FROM working_memory WHERE {where_sql} "
+        f"ORDER BY timestamp DESC LIMIT {min(int(policy.top_k * 3), 200)}",
+        tuple(params),
+    ).fetchall()
+    out = []
+    for row in fallback_rows:
+        d = dict(row)
+        d["_tier"] = "working"
+        d["score"] = round(d.get("importance", 0.5) * 0.3, 4)
+        d["dense_score"] = 0.0
+        d["fts_score"] = 0.0
+        out.append(d)
+    return out
 
 
 def _hydrate_polyphonic(beam, query: str, policy: RecallPolicy):
-    """Hydrate candidates from the polyphonic engine, read-only.
-
-    Returns (rows, mode, degradation_reasons). On engine failure returns
-    ([], 'recent_fallback', ['polyphonic_engine_failed']).
-    """
+    """Hydrate candidates from the polyphonic engine, read-only."""
     degradation: List[str] = []
     try:
         from mnemosyne.core import beam as _beam_mod
@@ -583,7 +629,9 @@ def _hydrate_polyphonic(beam, query: str, policy: RecallPolicy):
                     query_embedding = vecs[0]
             except Exception:
                 query_embedding = None
-        poly_results = engine.recall(query=query, query_embedding=query_embedding, top_k=policy.top_k * 2)
+        poly_results = engine.recall(
+            query=query, query_embedding=query_embedding, top_k=policy.top_k * 2,
+        )
     except Exception as exc:
         logger.info("bounded: polyphonic engine failed: %s", exc)
         return [], "recent_fallback", ["polyphonic_engine_failed"]
@@ -605,3 +653,131 @@ def _hydrate_polyphonic(beam, query: str, policy: RecallPolicy):
         row_dict["voice_scores"] = dict(r.voice_scores)
         out.append(row_dict)
     return out, "hybrid", degradation
+
+
+def _applied_filters(policy: RecallPolicy) -> Dict[str, Any]:
+    """Non-sensitive diagnostics summary of what the policy enforced."""
+    return {
+        "top_k": policy.top_k,
+        "max_tokens": policy.max_tokens,
+        "max_item_tokens": policy.max_item_tokens,
+        "include_shared": policy.include_shared,
+        "include_legacy_shared": policy.include_legacy_shared,
+        "only_active": policy.only_active,
+        "has_actor_filter": policy.actor_ids is not None,
+        "has_producer_filter": policy.producer_ids is not None,
+        "has_project_filter": policy.project_ids is not None,
+        "has_session_filter": policy.session_ids is not None,
+        "has_producer_type_filter": policy.producer_types is not None,
+        "has_memory_type_filter": policy.memory_types is not None,
+        "has_veracity_filter": policy.veracity is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def _run_gate(
+    rows: List[Dict[str, Any]],
+    beam,
+    query: str,
+    policy: RecallPolicy,
+    mode: str,
+    degradation: List[str],
+    *,
+    used_polyphonic: bool = False,
+) -> RecallEnvelope:
+    """One authoritative gate for every mode.
+
+    If all rows are removed by the strict predicate and fallback is
+    required, pull deterministic bounded recent rows before applying the
+    gate's final stages.
+    """
+    now_iso = _now_iso()
+    gated = [
+        r for r in rows
+        if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
+    ]
+
+    # --- Post-filter fallback: if everything was removed, try recent. ---
+    if not gated and policy.require_fallback:
+        where_sql, params = _build_where(beam, policy, now_iso)
+        fb_rows = _recent_fallback_rows(beam, policy, where_sql, params)
+        gated = [
+            r for r in fb_rows
+            if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
+        ]
+        if used_polyphonic and not gated:
+            degradation.append("polyphonic_empty_fallback_linear")
+            # Polyphonic all-filtered: fall back to bounded linear hydration.
+            linear_rows, _, lin_deg = _hydrate_candidates(beam, query, policy)
+            degradation.extend(lin_deg)
+            gated = [
+                r for r in linear_rows
+                if _passes_policy(r, policy, calling_session_id=beam.session_id, now_iso=now_iso)
+            ]
+
+    gated = _dedupe(gated)
+    gated = _rank(gated)
+    kept, context, tokens = _apply_token_budget(gated, policy)
+
+    return RecallEnvelope(
+        results=kept,
+        rendered_context=context,
+        token_count=tokens,
+        retrieval_mode=mode,
+        applied_filters=_applied_filters(policy),
+        degradation_reasons=degradation,
+    )
+
+
+def recall_bounded(beam, query: str, policy: Optional[RecallPolicy] = None) -> RecallEnvelope:
+    """Module-level adapter — delegates to ``BeamMemory.recall_bounded``.
+
+    Kept for backward compatibility with callers that imported the free
+    function. The canonical public API is
+    :meth:`BeamMemory.recall_bounded`.
+    """
+    if policy is None:
+        policy = RecallPolicy()
+    return beam.recall_bounded(query, policy)
+
+
+# ---------------------------------------------------------------------------
+# BeamMemory method (installed via beam.py import)
+# ---------------------------------------------------------------------------
+
+
+def _beam_recall_bounded(self, query: str, policy: Optional[RecallPolicy] = None) -> RecallEnvelope:
+    """Canonical native bounded recall on :class:`BeamMemory`.
+
+    Read-only: never mutates ``recall_count`` / ``last_recalled``.
+    """
+    if policy is None:
+        policy = RecallPolicy()
+
+    degradation: List[str] = []
+
+    # --- Polyphonic path (gated by env) ---
+    if os.environ.get("MNEMOSYNE_POLYPHONIC_RECALL", "0") == "1":
+        poly_rows, poly_mode, poly_deg = _hydrate_polyphonic(self, query, policy)
+        degradation.extend(poly_deg)
+        if poly_rows:
+            return _run_gate(
+                poly_rows, self, query, policy,
+                mode="hybrid", degradation=degradation,
+                used_polyphonic=True,
+            )
+        # Empty / failed polyphonic → bounded linear fallback.
+        degradation.append("polyphonic_empty_fallback_linear")
+
+    # --- Linear + supplements path ---
+    linear_rows, mode, lin_deg = _hydrate_candidates(self, query, policy)
+    degradation.extend(lin_deg)
+    return _run_gate(
+        linear_rows, self, query, policy,
+        mode=mode, degradation=degradation,
+        used_polyphonic=False,
+    )

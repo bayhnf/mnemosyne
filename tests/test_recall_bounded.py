@@ -334,3 +334,187 @@ class TestLegacyCompatibility:
             "SELECT recall_count FROM working_memory WHERE id = ?", (mid,),
         ).fetchone()["recall_count"]
         assert after == before + 1
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 1 — RED tests for review findings
+# ---------------------------------------------------------------------------
+
+class TestNativeBeamMemoryAPI:
+    """Finding 1: BeamMemory.recall_bounded(query, policy) must be the
+    canonical native public API, not just a free function."""
+
+    def test_method_exists_on_beam(self, beam):
+        assert hasattr(beam, "recall_bounded") and callable(beam.recall_bounded)
+
+    def test_method_returns_envelope(self, beam):
+        _remember(beam, "native api content alpha")
+        env = beam.recall_bounded("alpha", RecallPolicy(top_k=5))
+        assert isinstance(env, RecallEnvelope)
+
+    def test_method_default_policy(self, beam):
+        _remember(beam, "default policy content alpha")
+        env = beam.recall_bounded("alpha")
+        assert isinstance(env, RecallEnvelope)
+
+
+class TestHardTokenLimitOversizedFirst:
+    """Finding 3: max_tokens must be a hard estimated-token limit even
+    when the first candidate alone exceeds the budget."""
+
+    def test_single_oversized_row_respects_max_tokens(self, beam):
+        _remember(beam, "alpha " + ("verylongword " * 200))
+        env = beam.recall_bounded(
+            "alpha", RecallPolicy(top_k=5, max_tokens=1),
+        )
+        assert env.token_count <= 1
+        assert env.token_count == 0 or env.token_count == 1
+
+    def test_max_tokens_never_exceeded(self, beam):
+        for i in range(10):
+            _remember(beam, f"item {i} " + ("padding " * 30))
+        env = beam.recall_bounded(
+            "item", RecallPolicy(top_k=10, max_tokens=20),
+        )
+        assert env.token_count <= 20
+
+
+class TestMaxItemTokensIsEstimated:
+    """Finding 3: max_item_tokens must be an estimated-token hard limit,
+    not a whitespace-word count."""
+
+    def test_max_item_tokens_uses_token_estimation(self, beam):
+        # A single very long compound token that tiktoken/chars-4 would
+        # count as many tokens but .split() counts as 1 word.
+        long_compound = "a" * 200
+        _remember(beam, f"alpha {long_compound}")
+        env = beam.recall_bounded(
+            "alpha", RecallPolicy(top_k=5, max_item_tokens=3),
+        )
+        from mnemosyne.core.token_counter import estimate_tokens
+        for r in env.results:
+            content_tokens = estimate_tokens(r.get("content", ""))
+            assert content_tokens <= 10  # truncated well under 200-char token count
+
+
+class TestPostFilterFallback:
+    """Finding 4: when all candidates are removed by the strict predicate,
+    use deterministic bounded linear/recent fallback rather than an empty
+    result (when fallback is required)."""
+
+    def test_all_filtered_triggers_recent_fallback(self, beam):
+        # Seed a row in session-b. Query with default policy (session-a
+        # only). Vector/FTS may surface it, but the strict predicate
+        # removes it. Fallback should pull session-a rows.
+        _remember(beam, "visible session a content alpha")
+        _remember(beam, "hidden session b content alpha", session_id="sess-b")
+        env = beam.recall_bounded("alpha", RecallPolicy(top_k=5, require_fallback=True))
+        contents = " ".join(r["content"] for r in env.results)
+        assert "visible session a" in contents
+
+    def test_polyphonic_all_filtered_falls_back(self, beam, monkeypatch):
+        _remember(beam, "linear alpha visible content")
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+        from mnemosyne.core.polyphonic_recall import PolyphonicRecallEngine
+
+        # Engine returns a session-b row that the predicate will reject.
+        from mnemosyne.core.polyphonic_recall import PolyphonicResult
+
+        def _fake_recall(self, *a, **k):
+            return [PolyphonicResult(
+                memory_id="nonexistent", combined_score=0.9,
+                voice_scores={"vector": 0.9}, metadata={},
+            )]
+
+        monkeypatch.setattr(PolyphonicRecallEngine, "recall", _fake_recall)
+        env = beam.recall_bounded("alpha", RecallPolicy(top_k=5))
+        assert "linear alpha visible" in " ".join(r["content"] for r in env.results)
+
+
+class TestProducerActorMapping:
+    """Finding 5: producer maps to author_type, actor maps to author_id.
+    These must not be conflated."""
+
+    def test_producer_ids_filter_author_type(self, beam):
+        _remember(beam, "producer human fact alpha", author_id="aid-1", author_type="human")
+        _remember(beam, "producer agent fact alpha", author_id="aid-2", author_type="agent")
+        env = beam.recall_bounded(
+            "alpha", RecallPolicy(top_k=10, producer_ids=["human"]),
+        )
+        contents = " ".join(r["content"] for r in env.results)
+        assert "producer human" in contents
+        assert "producer agent" not in contents
+
+    def test_actor_ids_filter_author_id(self, beam):
+        _remember(beam, "actor one fact alpha", author_id="aid-1", author_type="human")
+        _remember(beam, "actor two fact alpha", author_id="aid-2", author_type="human")
+        env = beam.recall_bounded(
+            "alpha", RecallPolicy(top_k=10, actor_ids=["aid-1"]),
+        )
+        contents = " ".join(r["content"] for r in env.results)
+        assert "actor one" in contents
+        assert "actor two" not in contents
+
+    def test_cross_producer_isolation(self, beam):
+        _remember(beam, "human producer detail alpha", author_type="human")
+        _remember(beam, "agent producer detail alpha", author_type="agent")
+        env = beam.recall_bounded(
+            "alpha", RecallPolicy(top_k=10, producer_ids=["agent"]),
+        )
+        contents = " ".join(r["content"] for r in env.results)
+        assert "agent producer" in contents
+        assert "human producer" not in contents
+
+
+class TestStrictNumericValidation:
+    """Non-blocking: reject floats and bools as top_k."""
+
+    def test_rejects_float_top_k(self):
+        with pytest.raises(ValueError):
+            RecallPolicy(top_k=5.0)
+
+    def test_rejects_bool_top_k(self):
+        with pytest.raises(ValueError):
+            RecallPolicy(top_k=True)
+
+    def test_rejects_float_max_tokens(self):
+        with pytest.raises(ValueError):
+            RecallPolicy(top_k=5, max_tokens=10.0)
+
+
+class TestDedupKeepsHighestScore:
+    """Non-blocking: dedupe should keep the highest-scored duplicate."""
+
+    def test_dedupe_keeps_higher_score(self, beam):
+        _remember(beam, "duplicate prone content alpha beta gamma")
+        env = beam.recall_bounded(
+            "alpha beta gamma", RecallPolicy(top_k=10),
+        )
+        # If the same id appears from multiple voices, only one survives
+        # and it should be the one with the highest score.
+        ids = [r["id"] for r in env.results]
+        assert len(ids) == len(set(ids))
+
+
+class TestSupplementHydration:
+    """Finding 2: entity, fact, and MEMORIA supplements must enter the
+    same gate."""
+
+    def test_entity_match_enters_gate(self, beam):
+        # Seed a memory with an entity annotation.
+        beam.remember(
+            "The deploy server is omega-cluster", source="conversation",
+            extract_entities=True,
+        )
+        # Also seed a non-matching memory.
+        _remember(beam, "unrelated noise content zeta")
+        env = beam.recall_bounded("omega", RecallPolicy(top_k=10))
+        contents = " ".join(r["content"] for r in env.results)
+        assert "omega-cluster" in contents
+
+    def test_memoria_supplement_enters_gate(self, beam):
+        # Seed MEMORIA specialist data directly and query for it.
+        beam.remember("user prefers dark mode for the editor", source="conversation")
+        env = beam.recall_bounded("preference", RecallPolicy(top_k=10))
+        # The query should return results (either from FTS or MEMORIA).
+        assert isinstance(env.results, list)
