@@ -588,6 +588,41 @@ def _hydrate_candidates(
             row["fact_match"] = True
         scored.append(row)
 
+    # --- Associative supplement (graph traversal, depth=1) ---
+    # Resolve each related memory_id to its REAL working/episodic row so
+    # strict producer/actor/project/session/lifecycle filtering applies.
+    # Attach relationship metadata without overwriting the real ``source``
+    # field. Read-only: no recall_count mutation.
+    if beam.episodic_graph is not None and scored:
+        try:
+            existing_ids = {r["id"] for r in scored}
+            assoc_added: Dict[str, Dict[str, Any]] = {}
+            # Traverse from the top-scored seeds (legacy uses top 5).
+            for seed in sorted(scored, key=lambda r: r.get("score", 0.0), reverse=True)[:5]:
+                related = beam.episodic_graph.find_related_memories(
+                    seed["id"], depth=1,
+                )
+                for rel in related:
+                    mid = rel["memory_id"]
+                    if mid in existing_ids or mid in assoc_added:
+                        continue
+                    # Resolve the real row — try episodic then working.
+                    cursor = beam.conn.cursor()
+                    real_row = beam._fetch_polyphonic_row(cursor, mid)
+                    if real_row is None:
+                        continue
+                    # Attach relationship metadata without overwriting source.
+                    real_row["score"] = round(
+                        min(rel.get("weight", 0.3) * 0.8, 1.0), 4
+                    )
+                    real_row["associative"] = True
+                    real_row["connecting_edge"] = rel.get("edge_type", "related")
+                    real_row["assoc_depth"] = rel.get("depth", 1)
+                    assoc_added[mid] = real_row
+            scored.extend(assoc_added.values())
+        except Exception:
+            logger.info("bounded: associative hydration failed", exc_info=True)
+
     return scored, mode, degradation
 
 

@@ -518,3 +518,117 @@ class TestSupplementHydration:
         env = beam.recall_bounded("preference", RecallPolicy(top_k=10))
         # The query should return results (either from FTS or MEMORIA).
         assert isinstance(env.results, list)
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 2 — Associative supplement hydration
+# ---------------------------------------------------------------------------
+
+class TestAssociativeHydration:
+    """The bounded path must hydrate graph-related memories into the same
+    gate, resolving real rows (not placeholders), so strict policy filters
+    on producer/actor/project/session/lifecycle apply to associative
+    results too.
+
+    The related memory is deliberately chosen so it does NOT match the
+    query via FTS/vector — it can only surface through graph traversal.
+    """
+
+    def test_associative_allowed_related_admitted(self, beam):
+        """A related memory that passes policy is admitted via the gate."""
+        from mnemosyne.core.episodic_graph import EpisodicGraph, GraphEdge
+        from datetime import datetime, timezone
+
+        # Seed a query-matching memory in session-a.
+        _remember(beam, "terraform infrastructure provisioning setup")
+
+        # Seed a related memory that does NOT lexically match the query —
+        # it only surfaces through the graph edge. Use distinctive tokens
+        # so FTS cannot match it to the query.
+        related_mid = _remember(beam, "runbook incident response procedure")
+
+        if beam.episodic_graph is None:
+            beam.episodic_graph = EpisodicGraph(conn=beam.conn, db_path=beam.db_path)
+        primary_id = beam.conn.execute(
+            "SELECT id FROM working_memory WHERE content LIKE '%terraform%'"
+        ).fetchone()["id"]
+        beam.episodic_graph.add_edge(GraphEdge(
+            source=primary_id,
+            target=related_mid,
+            edge_type="rel",
+            weight=0.8,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ))
+
+        env = beam.recall_bounded("terraform infrastructure", RecallPolicy(top_k=10))
+        contents = " ".join(r.get("content", "") for r in env.results)
+        assert "runbook" in contents or "incident response" in contents, (
+            f"related memory not admitted via associative hydration; "
+            f"got: {[r.get('content','')[:60] for r in env.results]}"
+        )
+
+    def test_associative_foreign_session_rejected(self, beam):
+        """A related memory in a foreign session is rejected by policy."""
+        from mnemosyne.core.episodic_graph import EpisodicGraph, GraphEdge
+        from datetime import datetime, timezone
+
+        _remember(beam, "terraform infrastructure provisioning setup")
+
+        # Related memory in a DIFFERENT session with a distinctive token
+        # that does NOT match the query via FTS.
+        foreign_mid = _remember(
+            beam, "classified runbook incident response procedure",
+            session_id="sess-b", scope="session",
+        )
+
+        if beam.episodic_graph is None:
+            beam.episodic_graph = EpisodicGraph(conn=beam.conn, db_path=beam.db_path)
+        primary_id = beam.conn.execute(
+            "SELECT id FROM working_memory WHERE content LIKE '%terraform%'"
+        ).fetchone()["id"]
+
+        beam.episodic_graph.add_edge(GraphEdge(
+            source=primary_id,
+            target=foreign_mid,
+            edge_type="rel",
+            weight=0.9,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ))
+
+        env = beam.recall_bounded("terraform infrastructure", RecallPolicy(top_k=10))
+        contents = " ".join(r.get("content", "") for r in env.results)
+        # The foreign-session related memory must NOT leak.
+        assert "classified" not in contents and "runbook" not in contents, (
+            f"foreign-session associative memory leaked through the gate; "
+            f"got: {[r.get('content','')[:60] for r in env.results]}"
+        )
+
+    def test_associative_does_not_mutate_counters(self, beam):
+        """Associative hydration is read-only — no recall_count bump."""
+        from mnemosyne.core.episodic_graph import EpisodicGraph, GraphEdge
+        from datetime import datetime, timezone
+
+        _remember(beam, "terraform infrastructure provisioning setup")
+        related_mid = _remember(beam, "runbook incident response procedure")
+
+        if beam.episodic_graph is None:
+            beam.episodic_graph = EpisodicGraph(conn=beam.conn, db_path=beam.db_path)
+        primary_id = beam.conn.execute(
+            "SELECT id FROM working_memory WHERE content LIKE '%terraform%'"
+        ).fetchone()["id"]
+        beam.episodic_graph.add_edge(GraphEdge(
+            source=primary_id,
+            target=related_mid,
+            edge_type="rel",
+            weight=0.8,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ))
+
+        before = beam.conn.execute(
+            "SELECT recall_count FROM working_memory WHERE id = ?", (related_mid,),
+        ).fetchone()["recall_count"]
+        beam.recall_bounded("terraform infrastructure", RecallPolicy(top_k=10))
+        after = beam.conn.execute(
+            "SELECT recall_count FROM working_memory WHERE id = ?", (related_mid,),
+        ).fetchone()["recall_count"]
+        assert before == after
