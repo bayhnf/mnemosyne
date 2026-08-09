@@ -466,3 +466,104 @@ def test_concurrent_duplicate_race_produces_exactly_one_memory(temp_db, vec_read
     assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM ingest_receipts").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 2 takeover: conflict must not corrupt original dedup (audit point #1)
+# ---------------------------------------------------------------------------
+
+
+def test_conflict_must_not_overwrite_original_payload_hash(beam, vec_ready):
+    """A reused event_id with a different payload is a conflict, but the
+    original receipt's payload_hash MUST be preserved so a later identical
+    replay of the ORIGINAL payload still deduplicates (returns duplicate),
+    not a fresh conflict."""
+    original = _event(content="latency dropped to 250ms", event_id="evt-X")
+    first = beam.remember_event(original)
+    assert first.status == "stored"
+    original_hash = first.payload_hash
+
+    conflicting = _event(content="latency dropped to 500ms", event_id="evt-X")
+    conflict = beam.remember_event(conflicting)
+    assert conflict.status == "conflict"
+
+    # The stored payload_hash must still be the ORIGINAL, not the conflicting
+    # payload's hash. If the conflict overwrote it, the original could no
+    # longer deduplicate.
+    persisted = _receipt_rows(beam.conn)[0]
+    assert persisted["payload_hash"] == original_hash, (
+        "conflict path overwrote the original payload_hash; a later identical "
+        "replay of the original payload would stop deduplicating"
+    )
+
+    # Replay the ORIGINAL payload: must be a duplicate, NOT a conflict.
+    replay = beam.remember_event(original)
+    assert replay.status == "duplicate", (
+        "original payload no longer deduplicates after a conflict corrupted "
+        "the stored payload_hash"
+    )
+    assert replay.payload_hash == original_hash
+
+
+def test_conflict_does_not_create_duplicate_memory_or_sync_event(
+    beam, vec_ready
+):
+    """A conflict must mutate nothing except flipping the receipt to conflict;
+    no new working_memory row, no new sync event."""
+    beam.remember_event(_event(content="original content", event_id="evt-C"))
+    assert len(_working_rows(beam.conn)) == 1
+    assert _sync_event_count(beam.conn) == 1
+
+    beam.remember_event(_event(content="different content", event_id="evt-C"))
+    assert len(_working_rows(beam.conn)) == 1
+    assert _sync_event_count(beam.conn) == 1
+
+
+def test_idempotency_across_two_independent_connections(temp_db, vec_ready):
+    """Audit point #4: same event id + identical payload under two independent
+    BeamMemory connections (separate thread-local conns) yields exactly one
+    stored memory and one duplicate, never two stored rows."""
+    BeamMemory(session_id="s1", db_path=temp_db)
+    b1 = BeamMemory(session_id="s1", db_path=temp_db)
+    b2 = BeamMemory(session_id="s2", db_path=temp_db)
+    b1.conn.execute("PRAGMA busy_timeout=10000")
+    b2.conn.execute("PRAGMA busy_timeout=10000")
+
+    ev = _event(event_id="evt-2conn")
+    r1 = b1.remember_event(ev)
+    r2 = b2.remember_event(ev)
+
+    statuses = sorted([r1.status, r2.status])
+    assert statuses == ["duplicate", "stored"], statuses
+
+    conn = beam_module._get_connection(temp_db)
+    assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM ingest_receipts").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 1
+
+
+def test_conflict_then_original_replay_across_two_connections(temp_db, vec_ready):
+    """The conflict-dedup invariant must hold across independent connections:
+    after a conflict on conn A, replaying the original on conn B still
+    deduplicates (does not become a fresh conflict or stored)."""
+    BeamMemory(session_id="s1", db_path=temp_db)
+    b1 = BeamMemory(session_id="s1", db_path=temp_db)
+    b2 = BeamMemory(session_id="s2", db_path=temp_db)
+    b1.conn.execute("PRAGMA busy_timeout=10000")
+    b2.conn.execute("PRAGMA busy_timeout=10000")
+
+    original = _event(content="original payload", event_id="evt-Y")
+    conflict_ev = _event(content="conflicting payload", event_id="evt-Y")
+
+    assert b1.remember_event(original).status == "stored"
+    assert b2.remember_event(conflict_ev).status == "conflict"
+
+    # Original replay on a third independent connection must still dedupe.
+    b3 = BeamMemory(session_id="s3", db_path=temp_db)
+    b3.conn.execute("PRAGMA busy_timeout=10000")
+    replay = b3.remember_event(original)
+    assert replay.status in ("duplicate", "conflict")
+    # It must NOT be 'stored' (no duplicate memory) and the original hash
+    # must be intact for dedup.
+    conn = beam_module._get_connection(temp_db)
+    assert conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1

@@ -130,26 +130,39 @@ def remember_event(beam, event: IngestEvent) -> IngestReceipt:
         ).fetchone()
         if row is not None:
             if row["payload_hash"] == payload_hash:
+                # Identical payload replay: the original is already stored,
+                # so this attempt is a duplicate regardless of whether an
+                # intervening different-payload attempt later flipped the
+                # row to 'conflict'. The dedup authority is payload_hash,
+                # which the conflict path never overwrites.
                 conn.rollback()
-                return _receipt_from_row(
-                    row,
-                    status="duplicate" if row["status"] == "stored" else row["status"],
-                )
+                return _receipt_from_row(row, status="duplicate")
             # Event id reused with a different payload: terminal, no mutation.
+            # CRITICAL: do NOT overwrite payload_hash, memory_ids,
+            # metadata_json, or created_at -- those are the original
+            # receipt's identity and must stay intact so a later identical
+            # replay of the ORIGINAL payload still deduplicates. Only the
+            # conflict bookkeeping (status/index/error counters) flips.
+            conflicting_hash = payload_hash
             conn.execute(
                 """UPDATE ingest_receipts
                    SET status = 'conflict',
                        index_status = 'failed_terminal',
-                       payload_hash = ?,
                        attempts = attempts + 1,
                        last_error_code = 'event_id_conflict',
                        last_error_at = ?,
-                       updated_at = ?,
-                       metadata_json = ?
+                       updated_at = ?
                    WHERE event_id = ?""",
-                (payload_hash, now, now, receipt_meta, event.event_id),
+                (now, now, event.event_id),
             )
             conn.commit()
+            logger.warning(
+                "ingest conflict event_id=%r: stored payload_hash=%s, "
+                "conflicting payload_hash=%s (original preserved)",
+                event.event_id,
+                row["payload_hash"],
+                conflicting_hash,
+            )
             return _receipt_from_row(
                 conn.execute(
                     "SELECT * FROM ingest_receipts WHERE event_id = ?",
