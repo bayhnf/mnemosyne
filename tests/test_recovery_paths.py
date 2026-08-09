@@ -9,6 +9,8 @@ wrong database.
 """
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -236,3 +238,275 @@ def test_successful_restore_replaces_target_and_preserves_original(tmp_path):
     assert post_backup_gone == 0
     preserved = Path(result["preserved_original"])
     assert preserved.exists(), "original target must be preserved as a sidecar"
+
+
+# ---------------------------------------------------------------------------
+# Task 1 fix round 1: fail-closed metadata, post-replace integrity, held
+# exclusive writer lock, atomic filename allocation, unique staged files,
+# parent-dir fsync, staged cleanup on failure.
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+
+def _make_db_simple(db_path):
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, "a"), (2, "b")])
+    conn.commit()
+    conn.close()
+
+
+class TestRestoreMetadataFailClosed:
+    def test_missing_metadata_sidecar_rejected_and_target_preserved(self, tmp_path):
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        backup_path = Path(backup["backup_path"])
+        backup_path.with_suffix(".gz.json").unlink()
+
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+        conn = sqlite3.connect(str(target))
+        conn.execute("INSERT INTO t VALUES (99, 'keep')")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(RuntimeError, match="metadata"):
+            recovery.restore_backup(backup_path, target)
+
+        conn = sqlite3.connect(str(target))
+        row = conn.execute("SELECT v FROM t WHERE id = 99").fetchone()
+        conn.close()
+        assert row and row[0] == "keep"
+
+    def test_malformed_metadata_rejected(self, tmp_path):
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        backup_path = Path(backup["backup_path"])
+        backup_path.with_suffix(".gz.json").write_text("{not valid json")
+
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+        with pytest.raises(RuntimeError, match="metadata"):
+            recovery.restore_backup(backup_path, target)
+
+    def test_metadata_without_backup_checksum_rejected(self, tmp_path):
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        backup_path = Path(backup["backup_path"])
+        meta_file = backup_path.with_suffix(".gz.json")
+        meta = json.loads(meta_file.read_text())
+        meta.pop("backup_checksum")
+        meta_file.write_text(json.dumps(meta))
+
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+        with pytest.raises(RuntimeError, match="checksum"):
+            recovery.restore_backup(backup_path, target)
+
+
+class TestRestorePostReplaceIntegrityFailure:
+    def test_failed_post_replace_check_restores_original_and_raises(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+        conn = sqlite3.connect(str(target))
+        conn.execute("INSERT INTO t VALUES (77, 'preserved-me')")
+        conn.commit()
+        conn.close()
+
+        # Force the post-replace integrity check to fail.
+        monkeypatch.setattr(recovery, "verify_integrity", lambda p: False)
+
+        with pytest.raises(RuntimeError, match="integrity"):
+            recovery.restore_backup(Path(backup["backup_path"]), target)
+
+        conn = sqlite3.connect(str(target))
+        row = conn.execute("SELECT v FROM t WHERE id = 77").fetchone()
+        ok = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        conn.close()
+        assert row and row[0] == "preserved-me"
+        assert ok == "ok", "original was not restored after post-replace failure"
+
+
+class TestExclusiveWriterLockHeld:
+    def test_competing_writer_cannot_enter_staging_window(
+        self, tmp_path, monkeypatch
+    ):
+        """A second connection must be unable to BEGIN IMMEDIATE while a
+        restore holds the writer lock across staging and os.replace."""
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+
+        events = {"locked": False, "competitor_entered": False}
+        ready = _threading.Event()
+        original_replace = os.replace
+
+        def slow_replace(staged, dest):
+            if str(dest) == str(target):
+                events["locked"] = True
+                ready.set()
+                import time
+                time.sleep(0.3)
+            return original_replace(staged, dest)
+
+        monkeypatch.setattr("mnemosyne.dr.recovery.os.replace", slow_replace)
+
+        def compete():
+            ready.wait(timeout=2)
+            try:
+                c = sqlite3.connect(str(target), timeout=0.1)
+                c.execute("BEGIN IMMEDIATE")
+                events["competitor_entered"] = True
+                c.execute("ROLLBACK")
+                c.close()
+            except sqlite3.OperationalError:
+                pass
+
+        thread = _threading.Thread(target=compete)
+        thread.start()
+        recovery.restore_backup(Path(backup["backup_path"]), target)
+        thread.join(timeout=3)
+
+        assert events["locked"] is True
+        assert events["competitor_entered"] is False, (
+            "a competing writer entered the staging window despite the lock"
+        )
+
+
+class TestBackupAndStagingRaces:
+    def test_backup_filename_allocation_is_exclusive_under_frozen_clock(
+        self, tmp_path, monkeypatch
+    ):
+        """With the timestamp frozen, four concurrent backups must still get
+        distinct files via exclusive (O_CREAT|O_EXCL) allocation."""
+        db_path = tmp_path / "src.db"
+        _make_db_simple(db_path)
+        bdir = tmp_path / "bk"
+
+        from datetime import datetime as _dt
+
+        frozen = _dt(2026, 1, 1, 0, 0, 0)
+        fake_datetime = type(
+            "D",
+            (),
+            {
+                "now": staticmethod(lambda: frozen),
+                "max": _dt.max,
+                "strftime": _dt.strftime,
+                "fromisoformat": _dt.fromisoformat,
+            },
+        )
+        monkeypatch.setattr(recovery, "datetime", fake_datetime)
+
+        results = []
+        errors = []
+
+        def make():
+            try:
+                results.append(
+                    recovery.create_backup(db_path=db_path, backup_dir=bdir)
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [_threading.Thread(target=make) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        names = [Path(r["backup_path"]).name for r in results]
+        assert len(names) == len(set(names)), f"filenames collided: {names}"
+        for name in names:
+            assert (bdir / name).stat().st_size > 0
+        assert not errors
+
+    def test_staged_filename_unique_per_invocation_same_target(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        target = tmp_path / "same.db"
+        _make_db_simple(target)
+
+        staged_names = []
+        original_connect = sqlite3.connect
+
+        def spy_connect(connectable, *args, **kwargs):
+            conn = original_connect(connectable, *args, **kwargs)
+            if isinstance(connectable, str) and "restore_staged" in connectable:
+                staged_names.append(Path(connectable).name)
+            return conn
+
+        monkeypatch.setattr("mnemosyne.dr.recovery.sqlite3.connect", spy_connect)
+
+        recovery.restore_backup(Path(backup["backup_path"]), target)
+        recovery.restore_backup(Path(backup["backup_path"]), target)
+
+        assert len(staged_names) == 2
+        assert staged_names[0] != staged_names[1], (
+            f"staged filenames collided on same target: {staged_names}"
+        )
+
+    def test_parent_dir_fsynced_after_replace(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+
+        fsynced_dirs = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if (flags & os.O_DIRECTORY) and str(target.parent) == str(path):
+                fsynced_dirs.append(str(path))
+            return fd
+
+        monkeypatch.setattr("mnemosyne.dr.recovery.os.open", spy_open)
+
+        recovery.restore_backup(Path(backup["backup_path"]), target)
+
+        assert fsynced_dirs, "parent directory was not fsynced after replace"
+
+    def test_staged_file_cleaned_up_on_failure(self, tmp_path):
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+        backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        backup_path = Path(backup["backup_path"])
+        target = tmp_path / "target.db"
+        _make_db_simple(target)
+
+        raw = _gzip.decompress(backup_path.read_bytes())
+        backup_path.write_bytes(
+            _gzip.compress(raw.replace(b"CREATE TABLE", b"BREAK TABLE"))
+        )
+
+        with pytest.raises(Exception):
+            recovery.restore_backup(backup_path, target)
+
+        leftovers = list(target.parent.glob("*restore_staged*"))
+        assert leftovers == [], f"staged file not cleaned up: {leftovers}"
