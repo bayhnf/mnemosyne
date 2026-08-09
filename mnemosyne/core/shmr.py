@@ -995,10 +995,26 @@ def propose_harmony(
             any_cluster_proposed = True
             plans.extend(rows_to_insert)
 
-    # Finding 2: one run-level transaction. Every INSERT for the whole run
-    # happens inside a single SAVEPOINT; a failure on any row rolls back ALL
-    # rows for the run. Earlier clusters cannot leak through a per-cluster
-    # commit.
+    # Finding 2 + Round 2: one run-level transaction. Every INSERT for the
+    # whole run happens inside a single SAVEPOINT. On ANY failure (including
+    # a RELEASE failure) the savepoint is still live, so ROLLBACK TO always
+    # works and no rows survive.
+    #
+    # Root cause fixed here: the old code RELEASEd the savepoint (which for
+    # the outermost SQLite savepoint IS the commit), then called
+    # beam.conn.commit() inside the same try. If that redundant commit raised,
+    # the except path tried ROLLBACK TO SAVEPOINT shmr_run — which no longer
+    # existed after RELEASE — swallowed the "no such savepoint" error, and
+    # returned status="rolled_back" with the rows still live in the
+    # connection state (persisted by the next commit on that connection).
+    #
+    # Fix: RELEASE on the outermost savepoint is the atomic durability point;
+    # no separate commit() is needed or safe afterward. If any statement
+    # raises before RELEASE, the savepoint is still live and ROLLBACK TO
+    # undoes all INSERTs for this run. If RELEASE itself raises, the
+    # savepoint is still live for the same reason. We never swallow the
+    # rollback's own failure: if ROLLBACK TO also fails, we surface that as a
+    # distinct failure reason rather than silently masking it.
     if plans:
         try:
             beam.conn.execute("SAVEPOINT shmr_run")
@@ -1025,28 +1041,29 @@ def propose_harmony(
                     ),
                 )
             beam.conn.execute("RELEASE SAVEPOINT shmr_run")
-            beam.conn.commit()
             total_persisted = len(plans)
         except Exception as exc:
-            # Expected malformed-LLM / persistence failures are logged at
-            # warning (not error) and surfaced as an explicit reason code so
-            # callers can distinguish rollback from success without scanning
-            # logs for error-level noise.
             logger.warning(
                 "SHMR run %s rolled back: %s", run_id, exc, exc_info=False
             )
+            rollback_reason = str(exc)
             try:
                 beam.conn.execute("ROLLBACK TO SAVEPOINT shmr_run")
                 beam.conn.execute("RELEASE SAVEPOINT shmr_run")
-            except Exception:
-                pass
+            except Exception as rb_exc:
+                # Do NOT swallow a rollback failure. Surface it as a distinct
+                # reason so the caller knows the transaction state may be
+                # dirty, rather than silently claiming rolled_back.
+                rollback_reason = (
+                    f"{exc} (rollback also failed: {rb_exc})"
+                )
             return {
                 "clusters_found": len(all_clusters),
                 "proposals_persisted": 0,
                 "proposals_rejected": total_rejected,
                 "duration_ms": int((time.perf_counter() - t0) * 1000),
                 "status": "rolled_back",
-                "failure_reason": str(exc),
+                "failure_reason": rollback_reason,
             }
 
     return {

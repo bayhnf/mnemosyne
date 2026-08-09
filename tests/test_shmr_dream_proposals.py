@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import pytest
+
 
 from mnemosyne.core.beam import BeamMemory
 from mnemosyne.core import shmr
@@ -86,6 +88,19 @@ class _RecordingLLM:
 # ---------------------------------------------------------------------------
 # Schema: runs against a fresh standard Mnemosyne schema
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _pin_offline_embeddings(monkeypatch):
+    """Apply the forced-offline embedding pin to every Task 4 test.
+
+    Ensures no test in this module reaches fastembed or the embedding API,
+    regardless of whether the host has fastembed installed with an uncached
+    model. The pin is applied via monkeypatch so it auto-reverts after each
+    test. ``TestNoNetworkEmbeddings`` additionally asserts the embed backend
+    was called zero times.
+    """
+    _force_offline_embeddings(monkeypatch)
 
 
 class TestFreshSchema:
@@ -549,6 +564,89 @@ class TestPublicSurfaceIsProposalOnly:
 class TestRunLevelAtomicity:
     """Finding 2: a failure on a later cluster must roll back ALL clusters."""
 
+    def test_final_commit_failure_leaves_no_persisted_rows(
+        self, tmp_path, monkeypatch
+    ):
+        """Round 2 RED->GREEN: inject a final-commit failure after successful
+        proposal inserts. The old code's redundant post-RELEASE commit would
+        fail here, its ROLLBACK TO SAVEPOINT would find no live savepoint
+        (swallowed error), and rows would persist on the next commit while
+        the result claimed rolled_back.
+
+        The fix removes the redundant commit entirely (RELEASE is the commit).
+        Under the fixed code this test's commit-guard never fires on the
+        proposal path, the proposal succeeds normally, and the rows are
+        legitimately persisted — the contract is that status/counters are
+        always truthful (never rolled_back with live rows).
+
+        We assert the invariant directly: if status is rolled_back, zero rows
+        must be visible AND non-persistable by a later commit. This fails on
+        the old code (rolled_back + 1 row visible) and passes on the new code.
+        """
+        beam = BeamMemory(session_id="fcf", db_path=tmp_path / "fcf.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "fcf-1", "subject": "vera", "predicate": "uses",
+                 "object": "python data analysis pipelines"},
+                {"fact_id": "fcf-2", "subject": "vera", "predicate": "uses",
+                 "object": "python data analysis scripts"},
+            ],
+        )
+
+        llm = _RecordingLLM(
+            [json.dumps([{"subject": "vera", "predicate": "prefers",
+                          "object": "python", "confidence": 0.8,
+                          "action": "create", "target_source_id": None,
+                          "rationale": "r"}])]
+        )
+
+        # Sabotage commit() to fail when proposal rows exist in the txn.
+        original_commit = beam.conn.commit
+        shmr_conn = beam.conn
+
+        def commit_guard():
+            has_rows = False
+            try:
+                has_rows = shmr_conn.execute(
+                    "SELECT 1 FROM shmr_proposals LIMIT 1"
+                ).fetchone() is not None
+            except Exception:
+                pass
+            if has_rows:
+                raise sqlite3.OperationalError(
+                    "simulated final-commit failure after inserts"
+                )
+            original_commit()
+
+        monkeypatch.setattr(beam.conn, "commit", commit_guard)
+
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3
+        )
+
+        # GREEN contract: status/counters must be truthful. If rolled_back,
+        # zero rows visible and zero persistable. If proposed, rows are
+        # legitimately there. The invariant: NEVER rolled_back with live rows.
+        if result["status"] == "rolled_back":
+            assert result["proposals_persisted"] == 0, result
+            rows = beam.conn.execute(
+                "SELECT * FROM shmr_proposals"
+            ).fetchall()
+            assert len(rows) == 0, (
+                f"status=rolled_back but {len(rows)} row(s) are visible — "
+                "semantic partial success"
+            )
+            monkeypatch.undo()
+            beam.conn.commit()
+            rows_after = beam.conn.execute(
+                "SELECT * FROM shmr_proposals"
+            ).fetchall()
+            assert len(rows_after) == 0, (
+                f"status=rolled_back but {len(rows_after)} row(s) persisted "
+                "by a later commit"
+            )
+
     def test_multi_cluster_failure_rolls_back_earlier_cluster_rows(
         self, tmp_path, monkeypatch
     ):
@@ -632,6 +730,132 @@ class TestRunLevelAtomicity:
         after = _facts_snapshot(beam)
         for table in ("facts", "working_memory", "episodic_memory"):
             assert before[table] == after[table]
+
+
+    def test_release_failure_leaves_no_rows(self, tmp_path, monkeypatch):
+        """Round 2: if RELEASE SAVEPOINT shmr_run fails, the savepoint is
+        still live so ROLLBACK TO must undo all INSERTs. Real SQLite
+        semantics, not mock counts.
+
+        The durability point is RELEASE (the outermost savepoint's RELEASE
+        commits in SQLite). If it fails, the transaction is still open inside
+        the savepoint and rollback works. This proves the atomic boundary.
+        """
+        beam = BeamMemory(session_id="rf", db_path=tmp_path / "releasefail.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "rf-1", "subject": "ruth", "predicate": "uses",
+                 "object": "python data analysis pipelines"},
+                {"fact_id": "rf-2", "subject": "ruth", "predicate": "uses",
+                 "object": "python data analysis scripts"},
+            ],
+        )
+        before = _facts_snapshot(beam)
+
+        llm = _RecordingLLM(
+            [json.dumps([{"subject": "ruth", "predicate": "prefers",
+                          "object": "python", "confidence": 0.8,
+                          "action": "create", "target_source_id": None,
+                          "rationale": "r"}])]
+        )
+
+        original_execute = beam.conn.execute
+        release_seen = {"n": 0}
+
+        def execute_guard(sql, *params):
+            if isinstance(sql, str) and "RELEASE SAVEPOINT shmr_run" in sql:
+                release_seen["n"] += 1
+                raise sqlite3.OperationalError("simulated RELEASE failure")
+            return original_execute(sql, *params)
+
+        monkeypatch.setattr(beam.conn, "execute", execute_guard)
+
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3
+        )
+
+        assert release_seen["n"] >= 1, "RELEASE was never attempted"
+        assert result["status"] == "rolled_back", result
+        assert result["proposals_persisted"] == 0, result
+
+        # Zero rows visible (savepoint was live, rollback worked).
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        assert len(rows) == 0, (
+            f"{len(rows)} row(s) visible after RELEASE-failure rollback"
+        )
+
+        # Zero rows persist after a later commit.
+        monkeypatch.undo()
+        beam.conn.commit()
+        rows_after = beam.conn.execute(
+            "SELECT * FROM shmr_proposals"
+        ).fetchall()
+        assert len(rows_after) == 0, (
+            f"{len(rows_after)} row(s) persisted by a later commit"
+        )
+
+        after = _facts_snapshot(beam)
+        for table in ("facts", "working_memory", "episodic_memory"):
+            assert before[table] == after[table]
+
+    def test_no_commit_called_after_release(self, tmp_path, monkeypatch):
+        """Round 2 structural: the persistence path must not call commit()
+        after RELEASE SAVEPOINT shmr_run. The old code's redundant
+        post-RELEASE commit was the root cause of the partial-persist bug:
+        if it raised, ROLLBACK TO SAVEPOINT found no live savepoint and rows
+        leaked. The fix eliminates that call entirely.
+
+        This test proves the structural fix by ordering execute/commit calls.
+        """
+        beam = BeamMemory(session_id="nc", db_path=tmp_path / "nocommit.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "nc-1", "subject": "tom", "predicate": "uses",
+                 "object": "python data analysis pipelines"},
+                {"fact_id": "nc-2", "subject": "tom", "predicate": "uses",
+                 "object": "python data analysis scripts"},
+            ],
+        )
+
+        llm = _RecordingLLM(
+            [json.dumps([{"subject": "tom", "predicate": "prefers",
+                          "object": "python", "confidence": 0.8,
+                          "action": "create", "target_source_id": None,
+                          "rationale": "r"}])]
+        )
+
+        original_execute = beam.conn.execute
+        original_commit = beam.conn.commit
+        call_log = []
+        released = {"v": False}
+
+        def log_execute(sql, *params):
+            if isinstance(sql, str):
+                if "RELEASE SAVEPOINT shmr_run" in sql:
+                    released["v"] = True
+                call_log.append(("execute", sql.strip()[:40]))
+            return original_execute(sql, *params)
+
+        def log_commit():
+            call_log.append(("commit", "commit()"))
+            if released["v"]:
+                raise AssertionError(
+                    "commit() called after RELEASE SAVEPOINT shmr_run — "
+                    "this is the redundant post-release commit whose failure "
+                    "caused the partial-persist bug"
+                )
+            original_commit()
+
+        monkeypatch.setattr(beam.conn, "execute", log_execute)
+        monkeypatch.setattr(beam.conn, "commit", log_commit)
+
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3
+        )
+        assert result["status"] == "proposed", result
+        assert result["proposals_persisted"] == 1, result
 
 
 # ---------------------------------------------------------------------------
