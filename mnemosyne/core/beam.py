@@ -1232,6 +1232,28 @@ def init_beam(db_path: Path = None):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_wm_event_date ON working_memory(event_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_event_date ON episodic_memory(event_date)")
 
+    # --- Native Inhale: durable ingest receipts (additive) ---
+    # event_id is the stable external idempotency key. `status` is the API
+    # outcome (stored/conflict/rejected); `index_status` is the truthful
+    # indexing state and must never be 'ready' until the vector write
+    # succeeded (see mnemosyne/core/inhale.py).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_receipts (
+            event_id TEXT PRIMARY KEY,
+            payload_hash TEXT NOT NULL,
+            memory_ids TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL CHECK(status IN ('stored','duplicate','conflict','rejected')),
+            index_status TEXT NOT NULL CHECK(index_status IN ('pending','ready','degraded','failed_retryable','failed_terminal')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            last_error_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            metadata_json TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_retry ON ingest_receipts(status, index_status, created_at)")
+
 
 class _BeamConnection(sqlite3.Connection):
     """sqlite3.Connection subclass that supports deferring commits.
@@ -3606,6 +3628,28 @@ class BeamMemory:
         finally:
             # Enrichment can refill enhanced recall after the early post-commit eviction.
             self._invalidate_query_cache_after_remember_commit()
+
+    def remember_event(self, event):
+        """Durable receipt-backed ingest of one event (see mnemosyne.core.inhale).
+
+        Additive API: ``remember()`` is unchanged. Replaying a stored event
+        id with the same payload returns the existing receipt as ``duplicate``;
+        a reused id with a different payload is ``conflict`` (no mutation);
+        validation/security failures are ``rejected``.
+        """
+        from mnemosyne.core.inhale import remember_event as _remember_event
+        return _remember_event(self, event)
+
+    def remember_turn(self, turn):
+        """Durable receipt-backed ingest of one turn (see mnemosyne.core.inhale)."""
+        from mnemosyne.core.inhale import remember_turn as _remember_turn
+        return _remember_turn(self, turn)
+
+    def retry_pending_ingest(self, limit: int = 100):
+        """Re-run indexing/enrichment for non-ready receipts without
+        duplicating raw memory rows (see mnemosyne.core.inhale)."""
+        from mnemosyne.core.inhale import retry_pending_ingest as _retry_pending_ingest
+        return _retry_pending_ingest(self, limit)
 
     def remember_batch(self, items: List[Dict],
                        *,
