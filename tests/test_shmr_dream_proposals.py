@@ -382,3 +382,517 @@ class TestTransactionRollback:
         after = _facts_snapshot(beam)
         for table in ("facts", "working_memory", "episodic_memory"):
             assert before[table] == after[table]
+
+
+# ===========================================================================
+# Fix round 1 — DeepSeek review binding findings
+# ===========================================================================
+#
+# Each block below targets one binding finding. Tests are written before
+# production edits and must fail (RED) for the documented old behavior.
+
+
+def _force_offline_embeddings(monkeypatch):
+    """Pin SHMR's embedding path to the deterministic lexical fallback.
+
+    Finding 3: the test suite must remain offline even when fastembed is
+    installed but its model is uncached (which would otherwise trigger a
+    network download inside _embeddings.embed). We (a) force shmr's
+    _embedding_fn seam to return None so _gather_candidates selects the
+    lexical fallback without invoking any embed backend, and (b) plant a
+    counting guard on mnemosyne.core.embeddings.embed so the test can prove
+    the network path was never reached.
+    """
+    from mnemosyne.core import embeddings as _emb
+
+    calls = {"n": 0}
+
+    def _counting_guard(_texts):
+        calls["n"] += 1
+        raise AssertionError(
+            "SHMR test reached the network embedding path; tests must stay "
+            "offline via the deterministic lexical fallback."
+        )
+
+    monkeypatch.setattr(shmr, "_embedding_fn", lambda: None, raising=True)
+    monkeypatch.setattr(_emb, "embed", _counting_guard, raising=True)
+    return calls
+
+
+def _seed_episodic(beam, rows):
+    """Insert episodic_memory rows with provenance columns."""
+    ids = []
+    for r in rows:
+        beam.conn.execute(
+            "INSERT INTO episodic_memory "
+            "(id, content, importance, session_id, author_id, author_type, channel_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                r["id"],
+                r["content"],
+                r.get("importance", 0.8),
+                r.get("session_id", beam.session_id),
+                r.get("author_id"),
+                r.get("author_type"),
+                r.get("channel_id"),
+            ),
+        )
+        ids.append(r["id"])
+    beam.conn.commit()
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: proposal-only must hold across the public SHMR surface
+# ---------------------------------------------------------------------------
+
+
+class TestPublicSurfaceIsProposalOnly:
+    """Finding 1: the public harmonize() entry point must not mutate sources.
+
+    The legacy harmonize() calls _apply_beliefs(), UPDATEs facts, writes
+    harmonic_beliefs, and queries the nonexistent facts.status column. It is
+    part of the supported public surface (documented in docs/shmr.md). After
+    the fix it must either delegate to the proposal-only path or be removed
+    from the public surface; in either case calling it must leave source rows
+    byte-identical and must not raise on a fresh schema.
+    """
+
+    def test_harmonize_does_not_mutate_facts_rows(self, tmp_path, monkeypatch):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="pub1", db_path=tmp_path / "pub1.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "h-1", "subject": "gina", "predicate": "likes",
+                 "object": "rust programming language a lot"},
+                {"fact_id": "h-2", "subject": "gina", "predicate": "likes",
+                 "object": "the rust language for systems"},
+            ],
+        )
+        before = _facts_snapshot(beam)
+
+        # Inject a deterministic LLM that would, under the old code, trigger
+        # update + dampen actions against source fact_ids.
+        monkeypatch.setattr(
+            shmr, "_call_llm",
+            lambda prompt, system="": json.dumps(
+                [
+                    {
+                        "subject": "gina", "predicate": "prefers", "object": "rust",
+                        "confidence": 0.9, "action": "update",
+                        "target_fact_id": "h-1", "rationale": "x",
+                    },
+                    {
+                        "subject": "gina", "predicate": "noise", "object": "x",
+                        "confidence": 0.2, "action": "dampen",
+                        "target_fact_id": "h-2", "rationale": "y",
+                    },
+                ]
+            ),
+        )
+
+        # Must not raise (legacy code hit OperationalError on facts.status).
+        result = shmr.harmonize(beam, similarity_threshold=0.3)
+
+        after = _facts_snapshot(beam)
+        for table in ("facts", "working_memory", "episodic_memory"):
+            assert before[table] == after[table], (
+                f"public harmonize() mutated source table {table!r}"
+            )
+        # And it must not claim it harmonized (applied) anything.
+        assert result.get("status") != "harmonized", (
+            "public harmonize() reported status='harmonized', which implies it "
+            "applied beliefs to sources"
+        )
+
+    def test_public_shmr_has_no_source_mutating_entrypoint(self, tmp_path, monkeypatch):
+        """No public shmr.* callable may UPDATE/DELETE facts,
+        working_memory, or episodic_memory."""
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="pub2", db_path=tmp_path / "pub2.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "p-1", "subject": "hank", "predicate": "uses",
+                 "object": "python for data analysis pipelines"},
+                {"fact_id": "p-2", "subject": "hank", "predicate": "uses",
+                 "object": "python in data analysis scripts"},
+            ],
+        )
+        before = _facts_snapshot(beam)
+
+        # Exercise every public-ish entry that takes a beam.
+        monkeypatch.setattr(shmr, "_call_llm", lambda prompt, system="": "[]")
+        for fn_name in ("harmonize", "propose_harmony"):
+            fn = getattr(shmr, fn_name, None)
+            if fn is None:
+                continue
+            kwargs = {"similarity_threshold": 0.3}
+            if fn_name == "propose_harmony":
+                kwargs["llm_call"] = lambda prompt, system="": "[]"
+            try:
+                fn(beam, **kwargs)
+            except TypeError:
+                pass
+
+        after = _facts_snapshot(beam)
+        for table in ("facts", "working_memory", "episodic_memory"):
+            assert before[table] == after[table]
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: propose_harmony must be atomic for the whole run
+# ---------------------------------------------------------------------------
+
+
+class TestRunLevelAtomicity:
+    """Finding 2: a failure on a later cluster must roll back ALL clusters."""
+
+    def test_multi_cluster_failure_rolls_back_earlier_cluster_rows(
+        self, tmp_path, monkeypatch
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="atom", db_path=tmp_path / "atom.db")
+        # Two disjoint clusters: python facts and rust facts.
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "py-a", "subject": "ivy", "predicate": "uses",
+                 "object": "python data analysis"},
+                {"fact_id": "py-b", "subject": "ivy", "predicate": "uses",
+                 "object": "python analysis scripts"},
+                {"fact_id": "rs-a", "subject": "jack", "predicate": "likes",
+                 "object": "rust systems language"},
+                {"fact_id": "rs-b", "subject": "jack", "predicate": "likes",
+                 "object": "rust for systems"},
+            ],
+        )
+        before = _facts_snapshot(beam)
+
+        # LLM returns a valid proposal for each cluster (two calls).
+        llm = _RecordingLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "ivy", "predicate": "prefers", "object": "python",
+                            "confidence": 0.8, "action": "create",
+                            "target_source_id": None, "rationale": "p1",
+                        }
+                    ]
+                ),
+                json.dumps(
+                    [
+                        {
+                            "subject": "jack", "predicate": "prefers", "object": "rust",
+                            "confidence": 0.8, "action": "create",
+                            "target_source_id": None, "rationale": "p2",
+                        }
+                    ]
+                ),
+            ]
+        )
+
+        # Sabotage the proposal INSERT but only on the SECOND cluster's rows.
+        # We detect "second cluster" by watching for the jack/rust content.
+        original_execute = beam.conn.execute
+        insert_seen = {"n": 0}
+
+        def flaky_execute(sql, *params):
+            if isinstance(sql, str) and "INSERT INTO shmr_proposals" in sql:
+                insert_seen["n"] += 1
+                # First cluster (python) inserts succeed; second cluster (rust)
+                # is the 2nd INSERT and must raise, AFTER the 1st succeeded.
+                if insert_seen["n"] == 2:
+                    raise sqlite3.OperationalError("simulated late failure")
+            return original_execute(sql, *params)
+
+        monkeypatch.setattr(beam.conn, "execute", flaky_execute)
+
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3, min_cluster_size=2
+        )
+
+        # At least one INSERT must have succeeded before the failure, proving
+        # the test actually exercises cross-cluster atomicity.
+        assert insert_seen["n"] >= 2, (
+            "test setup error: expected >=2 INSERT attempts (one per cluster); "
+            f"got {insert_seen['n']}"
+        )
+        # The whole run must roll back: zero proposals persisted.
+        assert result["status"] == "rolled_back", result
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        assert len(rows) == 0, (
+            f"run-level rollback failed: {len(rows)} proposal(s) survived"
+        )
+        # Truthful counters: nothing claimed persisted.
+        assert result["proposals_persisted"] == 0
+        # Sources untouched.
+        after = _facts_snapshot(beam)
+        for table in ("facts", "working_memory", "episodic_memory"):
+            assert before[table] == after[table]
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: tests deterministically prevent external embedding access
+# ---------------------------------------------------------------------------
+
+
+class TestNoNetworkEmbeddings:
+    """Finding 3: prove the lexical fallback is used and the network path
+    is never reached, even if fastembed is installed with an uncached model."""
+
+    def test_propose_harmony_uses_lexical_fallback_never_network(
+        self, tmp_path, monkeypatch
+    ):
+        embed_calls = _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="off", db_path=tmp_path / "off.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "o-1", "subject": "kate", "predicate": "uses",
+                 "object": "python for analysis"},
+                {"fact_id": "o-2", "subject": "kate", "predicate": "uses",
+                 "object": "python in analysis"},
+            ],
+        )
+        llm = _RecordingLLM(["[]"])
+        # Must not raise the AssertionError planted in _force_offline_embeddings.
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3
+        )
+        assert result["status"] in ("no_convergence", "proposed")
+        assert result["clusters_found"] >= 1
+        # And prove the embedding backend was never consulted.
+        assert embed_calls["n"] == 0, (
+            f"SHMR called the embedding backend {embed_calls['n']} time(s); "
+            "the lexical fallback must run instead to stay offline."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Finding 4: malformed LLM confidence is rejected, not raised
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedConfidenceRejected:
+    """Finding 4: non-numeric / NaN / Infinity / out-of-range confidence must
+    be counted as rejected untrusted output, not raise or leave partial state."""
+
+    def test_non_string_confidence_is_rejected_not_raised(self, tmp_path, monkeypatch):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="conf", db_path=tmp_path / "conf.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "c-1", "subject": "liam", "predicate": "uses",
+                 "object": "python for data analysis pipelines"},
+                {"fact_id": "c-2", "subject": "liam", "predicate": "uses",
+                 "object": "python data analysis scripts"},
+            ],
+        )
+        llm = _RecordingLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "liam", "predicate": "prefers", "object": "python",
+                            "confidence": "not a number", "action": "create",
+                            "target_source_id": None, "rationale": "bad conf",
+                        }
+                    ]
+                )
+            ]
+        )
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3
+        )
+        assert result["status"] == "no_convergence"
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        assert len(rows) == 0
+        assert result["proposals_rejected"] >= 1, (
+            "malformed-confidence proposal must be counted as rejected"
+        )
+
+    def test_nan_and_infinity_confidence_rejected(self, tmp_path, monkeypatch):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="nan", db_path=tmp_path / "nan.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "n-1", "subject": "mia", "predicate": "uses",
+                 "object": "python data analysis pipelines"},
+                {"fact_id": "n-2", "subject": "mia", "predicate": "uses",
+                 "object": "python data analysis scripts"},
+            ],
+        )
+        llm = _RecordingLLM(
+            [
+                # NaN and Infinity are valid JSON5 but Python's json module
+                # accepts them as float('nan')/float('inf'). They must be
+                # rejected, not clamped.
+                '[{"subject":"mia","predicate":"p","object":"o",'
+                '"confidence":NaN,"action":"create","target_source_id":null},'
+                '{"subject":"mia","predicate":"p","object":"o",'
+                '"confidence":Infinity,"action":"create","target_source_id":null}]'
+            ]
+        )
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3
+        )
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        assert len(rows) == 0
+        assert result["proposals_rejected"] >= 2
+
+
+# ---------------------------------------------------------------------------
+# Finding 5: do not silently mix provenance inside a cluster
+# ---------------------------------------------------------------------------
+
+
+class TestProvenancePartition:
+    """Finding 5: candidates with different session / author_type (producer) /
+    author_id (actor) / channel_id (project) must not be silently merged."""
+
+    def test_mixed_author_types_are_not_merged_into_one_cluster(
+        self, tmp_path, monkeypatch
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="prov", db_path=tmp_path / "prov.db")
+        # Two episodic memories with identical text but different producers
+        # (author_type). Under the old code they would cluster together and
+        # the persisted scope would silently pick cluster[0] as authority.
+        _seed_episodic(
+            beam,
+            [
+                {
+                    "id": "e-human", "content": "nora uses python for data analysis",
+                    "author_type": "human", "author_id": "nora", "channel_id": "proj-x",
+                },
+                {
+                    "id": "e-agent", "content": "nora uses python for data analysis",
+                    "author_type": "agent", "author_id": "agent-7", "channel_id": "proj-x",
+                },
+            ],
+        )
+        llm = _RecordingLLM(
+            [json.dumps([{"subject": "nora", "predicate": "uses", "object": "python",
+                          "confidence": 0.8, "action": "create",
+                          "target_source_id": None, "rationale": "r"}])]
+        )
+        shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3, min_cluster_size=2
+        )
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        # Either no cluster formed (partitioned) or each persisted proposal
+        # records a single, consistent scope — never a mixed one.
+        for r in rows:
+            scope = json.loads(dict(r)["scope_json"])
+            author_types = {scope.get("author_type")}
+            assert len(author_types) == 1, (
+                f"mixed provenance in one proposal scope: {scope}"
+            )
+        # And specifically: we must NOT have merged the human + agent memory
+        # into a single cluster that cites both ids with one authority scope.
+        for r in rows:
+            cited = set(json.loads(dict(r)["cited_source_ids"]))
+            assert not ({"e-human", "e-agent"} <= cited), (
+                "human and agent provenance were silently merged into one proposal"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Finding 6: cited_source_ids must be truthful per-proposal citations
+# ---------------------------------------------------------------------------
+
+
+class TestTruthfulCitations:
+    """Finding 6: cited_source_ids must record the ids the LLM actually cited
+    for THAT proposal (validated as a subset of the cluster), not the entire
+    cluster's ids under a single authority."""
+
+    def test_cited_ids_are_the_actual_per_proposal_citations(
+        self, tmp_path, monkeypatch
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="cite", db_path=tmp_path / "cite.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "ci-1", "subject": "oscar", "predicate": "uses",
+                 "object": "python data analysis pipelines"},
+                {"fact_id": "ci-2", "subject": "oscar", "predicate": "uses",
+                 "object": "python data analysis scripts"},
+                {"fact_id": "ci-3", "subject": "oscar", "predicate": "uses",
+                 "object": "python data analysis notebooks"},
+            ],
+        )
+        # LLM cites only ci-1 and ci-2 for its single proposal, NOT ci-3.
+        llm = _RecordingLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "oscar", "predicate": "prefers",
+                            "object": "python", "confidence": 0.85,
+                            "action": "create", "target_source_id": None,
+                            "rationale": "r",
+                            "cited_source_ids": ["ci-1", "ci-2"],
+                        }
+                    ]
+                )
+            ]
+        )
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3, min_cluster_size=2
+        )
+        assert result["proposals_persisted"] >= 1
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        assert len(rows) == 1
+        cited = set(json.loads(dict(rows[0])["cited_source_ids"]))
+        # Must be exactly what the model cited, validated against the cluster,
+        # not the whole cluster's id set.
+        assert cited == {"ci-1", "ci-2"}, (
+            f"expected cited_source_ids == {{ci-1, ci-2}}, got {cited}"
+        )
+        assert "ci-3" not in cited
+
+    def test_citation_of_id_not_in_cluster_is_rejected(
+        self, tmp_path, monkeypatch
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="cite2", db_path=tmp_path / "cite2.db")
+        _seed_facts(
+            beam,
+            [
+                {"fact_id": "ck-1", "subject": "penny", "predicate": "uses",
+                 "object": "python data analysis pipelines"},
+                {"fact_id": "ck-2", "subject": "penny", "predicate": "uses",
+                 "object": "python data analysis scripts"},
+            ],
+        )
+        # Model cites an id that is NOT in the cluster.
+        llm = _RecordingLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "penny", "predicate": "prefers",
+                            "object": "python", "confidence": 0.85,
+                            "action": "create", "target_source_id": None,
+                            "rationale": "r",
+                            "cited_source_ids": ["ck-1", "FABRICATED"],
+                        }
+                    ]
+                )
+            ]
+        )
+        result = shmr.propose_harmony(
+            beam, llm_call=llm, similarity_threshold=0.3
+        )
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        assert len(rows) == 0, (
+            "proposal with an out-of-cluster cited id must be rejected"
+        )
+        assert result["proposals_rejected"] >= 1

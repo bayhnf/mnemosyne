@@ -346,236 +346,62 @@ def _extract_json_from_llm_output(text: str) -> List[Dict]:
     return results
 
 
-def _apply_beliefs(conn, beliefs: List[Dict], cluster: List[Dict], cluster_id: str):
-    """Write harmonized beliefs to the database and update source facts."""
-    import hashlib
-    cursor = conn.cursor()
-    now = __import__("datetime").datetime.now().isoformat()
+def _apply_beliefs(conn, beliefs, cluster, cluster_id):
+    """Deprecated no-op (Task 4 hardening).
 
-    for belief in beliefs:
-        action = belief.get("action", "create")
-        subject = belief.get("subject", "entity")
-        predicate = belief.get("predicate", "related_to")
-        obj = belief.get("object", "")
-        confidence = max(0.1, min(1.0, belief.get("confidence", 0.5)))
-
-        belief_id = hashlib.sha256(
-            f"{cluster_id}:{subject}:{predicate}:{obj[:50]}".encode()
-        ).hexdigest()[:24]
-
-        if action == "dampen":
-            target_id = belief.get("target_fact_id")
-            if target_id:
-                cursor.execute(
-                    "UPDATE facts SET confidence = MAX(0.1, confidence - 0.15) WHERE fact_id = ?",
-                    (target_id,)
-                )
-
-        elif action == "update":
-            target_id = belief.get("target_fact_id")
-            if target_id:
-                cursor.execute(
-                    "UPDATE facts SET object = ?, confidence = ? WHERE fact_id = ?",
-                    (obj, confidence, target_id)
-                )
-
-        # Always store the belief (create/update both produce a belief)
-        try:
-            cursor.execute("""
-                INSERT OR REPLACE INTO harmonic_beliefs
-                (belief_id, subject, predicate, object, confidence,
-                 provenance, cluster_id, iteration, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                belief_id, subject, predicate, obj, confidence,
-                json.dumps([c.get("fact_id", "") for c in cluster if c.get("fact_id")]),
-                cluster_id, 0, now
-            ))
-        except Exception:
-            continue
-
-    conn.commit()
+    The legacy implementation UPDATEd ``facts`` and wrote
+    ``harmonic_beliefs``. SHMR is now proposal-only: nothing in this
+    module mutates source rows. This function is retained as an import-
+    stable symbol but does nothing and writes nothing, so any stray
+    reference cannot reintroduce source mutation.
+    """
+    logger.debug(
+        "_apply_beliefs is a deprecated no-op; SHMR is proposal-only. "
+        "Use propose_harmony() for Dream-candidate persistence."
+    )
+    return None
 
 
 def harmonize(beam, batch_size: int = None, max_iterations: int = None,
               similarity_threshold: float = None) -> Dict:
-    """Run one harmonic cycle over recent memories.
+    """Proposal-only SHMR cycle (Task 4 hardening).
 
-    NOT wired into anything. There is no caller in the shipped code: sleep()
-    does not invoke it, there is no MCP tool, and there is no CLI subcommand.
-    Call it directly if you want it:
+    Historically this was the source-mutating entry point: it UPDATEd
+    facts, wrote harmonic_beliefs, and queried a ``facts.status`` column
+    that does not exist in the standard Mnemosyne schema. As of Task 4 it
+    is a thin wrapper around :func:`propose_harmony` and is strictly
+    read-only on sources. It persists only to ``shmr_proposals`` and never
+    applies, dampens, or deletes source rows.
 
-        from mnemosyne.core.shmr import harmonize
-        harmonize(beam)
-
-    Requires embeddings unconditionally (candidate collection calls embed
-    without a guard) and an LLM to produce any beliefs at all. Without a
-    reachable LLM it returns normally with beliefs_generated=0 and
-    status="no_convergence", which is indistinguishable from the model
-    failing to converge. Check your LLM configuration before reading
-    anything into that result.
+    The signature is preserved for compatibility. ``max_iterations`` is
+    accepted but ignored (propose_harmony is single-pass); it is retained
+    only so existing call sites do not break.
 
     Args:
-        beam: BeamMemory instance
-        batch_size: Max memories to process (default: MNEMOSYNE_SHMR_BATCH_SIZE)
-        max_iterations: Refinement iterations per cluster (default: 3)
-        similarity_threshold: Cosine threshold for clustering (default: 0.70)
+        beam: BeamMemory instance.
+        batch_size, similarity_threshold: forwarded to propose_harmony.
+        max_iterations: ignored (kept for signature compatibility).
 
     Returns:
-        Dict with stats: clusters_found, beliefs_generated, contradictions_resolved,
-        harmony_score_avg, duration_ms
+        Dict from propose_harmony, with legacy keys (beliefs_generated,
+        contradictions_resolved, harmony_score_avg) mirrored from the
+        proposal-only counters so old consumers do not KeyError.
     """
-    if batch_size is None:
-        batch_size = SHMR_BATCH_SIZE
-    if max_iterations is None:
-        max_iterations = SHMR_MAX_ITERATIONS
-    if similarity_threshold is None:
-        similarity_threshold = SHMR_SIMILARITY_THRESHOLD
-
-    t0 = time.perf_counter()
-    _init_schema(beam.conn)
-    cursor = beam.conn.cursor()
-
-    # --- Step 1: Pull echo candidates ---
-    # Prioritize: recent facts + high-confidence episodic memories
-    candidates = []
-
-    # Facts (status = active or NULL)
-    fact_rows = cursor.execute("""
-        SELECT fact_id, subject, predicate, object, confidence, timestamp
-        FROM facts
-        WHERE status = 'active' OR status IS NULL
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (batch_size,)).fetchall()
-
-    for row in fact_rows:
-        candidates.append({
-            "fact_id": row["fact_id"],
-            "subject": row["subject"],
-            "predicate": row["predicate"],
-            "object": row["object"],
-            "confidence": row["confidence"],
-            "timestamp": row["timestamp"],
-            "source": "fact",
-            "embedding": _embed(row["object"]),
-        })
-
-    # Also pull recent episodic memories
-    ep_rows = cursor.execute("""
-        SELECT id, content, importance, created_at
-        FROM episodic_memory
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (batch_size // 2,)).fetchall()
-
-    for row in ep_rows:
-        content = row["content"]
-        if content and len(content) > 10:
-            candidates.append({
-                "fact_id": f"ep_{row['id']}",
-                "subject": "memory",
-                "predicate": "contains",
-                "object": content[:300],
-                "confidence": row["importance"],
-                "timestamp": row["created_at"],
-                "source": "episodic",
-                "embedding": _embed(content[:300]),
-            })
-
-    if len(candidates) < SHMR_MIN_CLUSTER_SIZE:
-        return {
-            "clusters_found": 0,
-            "beliefs_generated": 0,
-            "contradictions_resolved": 0,
-            "harmony_score_avg": 0.0,
-            "duration_ms": int((time.perf_counter() - t0) * 1000),
-            "status": "insufficient_candidates",
-        }
-
-    # --- Step 2: Cluster by semantic similarity ---
-    clusters = _cluster_by_similarity(candidates, similarity_threshold)
-    # Filter small clusters
-    clusters = [c for c in clusters if len(c) >= SHMR_MIN_CLUSTER_SIZE]
-
-    total_beliefs = 0
-    total_contradictions = 0
-    harmony_scores = []
-
-    # --- Step 3: Harmonize each cluster ---
-    for cluster_idx, cluster in enumerate(clusters):
-        cluster_id = f"shmr_{int(time.time())}_{cluster_idx}"
-
-        for iteration in range(max_iterations):
-            context = _format_cluster_for_llm(cluster)
-            full_prompt = context + "\n\n" + HARMONY_PROMPT
-
-            try:
-                llm_output = _call_llm(full_prompt)
-                if not llm_output:
-                    continue
-
-                beliefs = _extract_json_from_llm_output(llm_output)
-                if not beliefs:
-                    continue
-
-                # Score the result
-                score = _compute_harmony_score(beliefs, cluster)
-                harmony_scores.append(score)
-
-                if score >= SHMR_HARMONY_THRESHOLD:
-                    _apply_beliefs(beam.conn, beliefs, cluster, cluster_id)
-                    total_beliefs += len([b for b in beliefs
-                                          if b.get("action") in ("create", "update")])
-                    total_contradictions += len([b for b in beliefs
-                                                 if b.get("action") == "dampen"])
-                    break  # Converged for this cluster
-                else:
-                    # Repopulate cluster with beliefs for next iteration
-                    for b in beliefs:
-                        cluster.append({
-                            "subject": b.get("subject", ""),
-                            "predicate": b.get("predicate", ""),
-                            "object": b.get("object", ""),
-                            "confidence": b.get("confidence", 0.5),
-                            "source": "belief_candidate",
-                            "embedding": _embed(b.get("object", "")),
-                        })
-
-            except Exception as e:
-                logger.warning(f"SHMR cluster {cluster_id} iteration {iteration}: {e}")
-                continue
-
-    duration_ms = int((time.perf_counter() - t0) * 1000)
-    avg_score = float(np.mean(harmony_scores)) if harmony_scores else 0.0
-
-    # --- Step 4: Log the resonance ---
-    try:
-        cursor.execute("""
-            INSERT INTO memory_resonance_log
-            (session_id, cluster_count, beliefs_generated,
-             contradictions_resolved, harmony_score_avg, duration_ms)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            beam.session_id,
-            len(clusters),
-            total_beliefs,
-            total_contradictions,
-            round(avg_score, 4),
-            duration_ms,
-        ))
-        beam.conn.commit()
-    except Exception:
-        pass
-
-    return {
-        "clusters_found": len(clusters),
-        "beliefs_generated": total_beliefs,
-        "contradictions_resolved": total_contradictions,
-        "harmony_score_avg": round(avg_score, 4),
-        "duration_ms": duration_ms,
-        "status": "harmonized" if total_beliefs > 0 else "no_convergence",
-    }
+    result = propose_harmony(
+        beam,
+        llm_call=_call_llm,
+        batch_size=batch_size,
+        similarity_threshold=similarity_threshold,
+    )
+    # Mirror legacy keys for any consumer that still reads them.
+    result.setdefault(
+        "beliefs_generated", result.get("proposals_persisted", 0)
+    )
+    result.setdefault(
+        "contradictions_resolved", result.get("proposals_rejected", 0)
+    )
+    result.setdefault("harmony_score_avg", 0.0)
+    return result
 
 
 def recall_beliefs(beam, query: str, top_k: int = 10) -> List[Dict]:
@@ -770,6 +596,79 @@ Rules:
 """
 
 
+_DEFAULT_EMBED_FN = None
+
+
+def _embedding_fn():
+    """Return the active embedding callable, or None to use the lexical fallback.
+
+    Production resolves to ``mnemosyne.core.embeddings.embed`` when a backend
+    is configured. Tests monkeypatch this (or ``_DEFAULT_EMBED_FN``) to force
+    the deterministic offline path and prove SHMR never reaches the network
+    even when fastembed is installed with an uncached model (Finding 3).
+    """
+    if _DEFAULT_EMBED_FN is not None:
+        return _DEFAULT_EMBED_FN
+    if _embeddings._is_disabled():
+        return None
+    return _embeddings.embed
+
+
+def _coerce_confidence(value, default: Optional[float] = None) -> Optional[float]:
+    """Coerce an LLM-supplied confidence value to a finite float in [0,1].
+
+    Returns None when the value is non-numeric, non-finite, or a bool. The
+    caller treats None as untrusted/malformed output and counts the proposal
+    as rejected rather than persisting it or raising (Finding 4). bool is
+    rejected before float(): it subclasses int, so float(True) would silently
+    read a JSON ``true`` as full confidence. NaN must never survive: it
+    compares False against every threshold so downstream gates pass it.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if f != f:  # NaN
+        return None
+    import math
+    if not math.isfinite(f):
+        return None
+    return max(0.0, min(1.0, f))
+
+
+def _scope_key(row: Dict) -> tuple:
+    """Deterministic provenance key for partitioning candidates (Finding 5).
+
+    Two candidates with different session, producer (author_type), actor
+    (author_id), or project (channel_id) must NOT be merged into one cluster.
+    Returns a tuple of the explicit scope fields so clustering can partition
+    by scope before running similarity. We do not infer missing fields: a
+    None field is its own bucket so a candidate never silently inherits
+    another candidate's producer/actor/project.
+    """
+    return (
+        row.get("session_id"),
+        row.get("author_type"),
+        row.get("author_id"),
+        row.get("channel_id"),
+    )
+
+
+def _scope_from_row(row: Dict) -> Dict:
+    """Build a complete, deterministic scope record from a single source row.
+
+    Every key that has a non-empty value is recorded; nothing is inferred
+    from cluster[0] as authority (Finding 5)."""
+    scope = {}
+    for key in ("session_id", "author_id", "author_type", "channel_id"):
+        val = row.get(key)
+        if val not in (None, ""):
+            scope[key] = val
+    return scope
+
+
 def _row_scope(row: Dict, session_id: str) -> Dict:
     """Pull explicit scope off a source row for the Dream manifest.
 
@@ -850,19 +749,23 @@ def _gather_candidates(beam, batch_size: int) -> List[Dict]:
             }
         )
 
-    # Embed when reachable; otherwise fall back to a deterministic
-    # subject-bucket vector so clustering still works without a model.
-    have_embeddings = False
-    try:
-        texts = [c["object"] for c in candidates]
-        embs = _embeddings.embed(texts)
-        if embs is not None and hasattr(embs, "shape") and embs.shape[0] == len(candidates):
-            for i, c in enumerate(candidates):
-                c["embedding"] = embs[i].astype(np.float32).flatten()
-            have_embeddings = True
-    except Exception:
-        have_embeddings = False
-    if not have_embeddings:
+    # Embed when a backend is reachable; otherwise fall back to the
+    # deterministic lexical vector so clustering still works without a model.
+    # The embed function is swappable (_embedding_fn) so tests can force the
+    # offline path and prove no network access occurs (Finding 3).
+    embed_fn = _embedding_fn()
+    dense_used = False
+    if embed_fn is not None:
+        try:
+            texts = [c["object"] for c in candidates]
+            embs = embed_fn(texts)
+            if embs is not None and hasattr(embs, "shape") and embs.shape[0] == len(candidates):
+                for i, c in enumerate(candidates):
+                    c["embedding"] = embs[i].astype(np.float32).flatten()
+                dense_used = True
+        except Exception:
+            dense_used = False
+    if not dense_used:
         for c in candidates:
             c["embedding"] = _lexical_vector(c["object"], c["subject"])
     return candidates
@@ -918,6 +821,20 @@ def _format_cluster_block(cluster: List[Dict]) -> str:
     return "\n".join(lines)
 
 
+def _partition_by_scope(candidates: List[Dict]) -> Dict[tuple, List[Dict]]:
+    """Group candidates by their explicit provenance key (Finding 5).
+
+    Returns a dict mapping scope-key -> candidates with that exact scope.
+    Clustering then runs WITHIN each partition so two memories with the same
+    text but different producer/actor/project are never silently merged.
+    """
+    partitions: Dict[tuple, List[Dict]] = {}
+    for c in candidates:
+        key = _scope_key(c)
+        partitions.setdefault(key, []).append(c)
+    return partitions
+
+
 def propose_harmony(
     beam,
     *,
@@ -937,15 +854,21 @@ def propose_harmony(
     Returns:
         Dict with clusters_found, proposals_persisted, proposals_rejected,
         status in {"proposed", "no_convergence", "insufficient_candidates",
-        "rolled_back"}.
+        "rolled_back"}, and on rollback a ``failure_reason`` string.
 
     Safety contract:
         - Never mutates facts / working_memory / episodic_memory / canonical.
-        - Every persisted proposal cites exact source ids from the cluster and
-          records explicit scope (session_id + available author/channel).
-        - Rejects LLM target_source_id values that are not cluster source ids.
-        - Proposal persistence is wrapped in a savepoint; on failure it rolls
-          back and returns status="rolled_back" without raising.
+        - Every persisted proposal records the exact source ids its LLM entry
+          cited (validated as a subset of the cluster) plus an explicit,
+          complete scope built from the candidate rows -- never cluster[0]
+          as a silent authority.
+        - Candidates are partitioned by provenance (session + producer/actor/
+          project) before clustering, so mixed scope is never merged.
+        - Rejects LLM target_source_id values and cited ids that are not
+          cluster source ids.
+        - The ENTIRE run is wrapped in one transaction; a failure on any
+          cluster rolls back ALL proposal writes for the run and returns
+          status="rolled_back" without raising.
     """
     t0 = time.perf_counter()
     batch_size = batch_size or SHMR_BATCH_SIZE
@@ -968,20 +891,30 @@ def propose_harmony(
             "status": "insufficient_candidates",
         }
 
-    clusters = [
-        c for c in _cluster_by_similarity(candidates, similarity_threshold)
-        if len(c) >= min_cluster_size
-    ]
+    # Finding 5: partition by provenance BEFORE clustering so mixed scope is
+    # never silently merged into one cluster.
+    all_clusters: List[List[Dict]] = []
+    for part in _partition_by_scope(candidates).values():
+        all_clusters.extend(
+            c for c in _cluster_by_similarity(part, similarity_threshold)
+            if len(c) >= min_cluster_size
+        )
 
     run_id = f"shmr_{int(time.time()*1000)}"
     total_persisted = 0
     total_rejected = 0
     any_cluster_proposed = False
-
-    for cluster_idx, cluster in enumerate(clusters):
+    # Materialize per-cluster insert plans BEFORE opening the transaction, so
+    # the transaction body only does INSERTs and a failure rolls the whole run
+    # back atomically (Finding 2).
+    plans: List[Dict] = []
+    for cluster_idx, cluster in enumerate(all_clusters):
         cluster_id = f"{run_id}_c{cluster_idx}"
         cluster_source_ids = {c.get("source_id") for c in cluster if c.get("source_id")}
-        scope = _row_scope(cluster[0], beam.session_id)
+        # Finding 5: scope is built from the cluster's rows, but every row in
+        # a scope-partitioned cluster shares the same scope key, so this is
+        # complete and deterministic rather than cluster[0]-as-authority.
+        scope = _scope_from_row(cluster[0])
 
         prompt = PROPOSAL_PROMPT_TEMPLATE.format(
             session=beam.session_id,
@@ -993,44 +926,83 @@ def propose_harmony(
             raw = ""
         beliefs = _extract_json_from_llm_output(raw) if raw else []
 
-        accepted: List[Dict] = []
+        rows_to_insert: List[Dict] = []
         for b in beliefs:
             if not isinstance(b, dict):
                 continue
             action = str(b.get("action") or "create").strip().lower()
+            if action not in ("create", "update", "dampen"):
+                total_rejected += 1
+                continue
             target = b.get("target_source_id") or b.get("target_fact_id")
             target = str(target).strip() if target else None
             if action in ("update", "dampen"):
                 if target is None or target not in cluster_source_ids:
-                    # Out-of-cluster / hallucinated target: reject, never persist.
                     total_rejected += 1
                     continue
             else:
-                # create: target must be null/absent; coerce any value away.
                 target = None
-            accepted.append(
+
+            # Finding 4: malformed confidence is rejected, not raised.
+            confidence = _coerce_confidence(b.get("confidence", 0.5))
+            if confidence is None:
+                total_rejected += 1
+                continue
+
+            # Finding 6: validate per-proposal cited ids against the cluster.
+            # If the model cites an id that is NOT in this cluster, that is
+            # untrusted output: reject the proposal and count it. We do not
+            # silently filter the bad id out (that would be inferring a
+            # citation the model did not make). When the model provides no
+            # explicit citation, we record full-cluster provenance, documented
+            # as the broad-but-truthful default.
+            raw_cited = b.get("cited_source_ids")
+            if raw_cited is None:
+                raw_cited = b.get("evidence_ids")
+            if raw_cited is None:
+                cited = sorted(cid for cid in cluster_source_ids if cid)
+            else:
+                cited_list = raw_cited if isinstance(raw_cited, list) else [raw_cited]
+                cited_set = {str(x).strip() for x in cited_list if str(x).strip()}
+                if not cited_set:
+                    cited = sorted(cid for cid in cluster_source_ids if cid)
+                elif not cited_set <= cluster_source_ids:
+                    # At least one cited id is out-of-cluster: reject, do not
+                    # silently drop the bad citation.
+                    total_rejected += 1
+                    continue
+                else:
+                    cited = sorted(cited_set)
+
+            rows_to_insert.append(
                 {
+                    "run_id": run_id,
+                    "cluster_id": cluster_id,
+                    "session_id": beam.session_id,
+                    "scope_json": json.dumps(scope, sort_keys=True),
+                    "cited_source_ids": json.dumps(cited),
                     "subject": b.get("subject"),
                     "predicate": b.get("predicate"),
                     "object": b.get("object"),
-                    "confidence": max(0.0, min(1.0, float(b.get("confidence", 0.5) or 0.5))),
+                    "confidence": confidence,
                     "action": action,
                     "target_source_id": target,
                     "rationale": b.get("rationale"),
                 }
             )
 
-        if not accepted:
-            continue
-        any_cluster_proposed = True
+        if rows_to_insert:
+            any_cluster_proposed = True
+            plans.extend(rows_to_insert)
 
-        cited = sorted(cid for cid in cluster_source_ids if cid)
-        scope_json = json.dumps(scope, sort_keys=True)
-        cited_json = json.dumps(cited)
-
+    # Finding 2: one run-level transaction. Every INSERT for the whole run
+    # happens inside a single SAVEPOINT; a failure on any row rolls back ALL
+    # rows for the run. Earlier clusters cannot leak through a per-cluster
+    # commit.
+    if plans:
         try:
-            beam.conn.execute("SAVEPOINT shmr_prop")
-            for b in accepted:
+            beam.conn.execute("SAVEPOINT shmr_run")
+            for row in plans:
                 beam.conn.execute(
                     "INSERT INTO shmr_proposals "
                     "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
@@ -1038,41 +1010,47 @@ def propose_harmony(
                     "target_source_id, rationale) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        run_id,
-                        cluster_id,
-                        beam.session_id,
-                        scope_json,
-                        cited_json,
-                        b["subject"],
-                        b["predicate"],
-                        b["object"],
-                        b["confidence"],
-                        b["action"],
-                        b["target_source_id"],
-                        b["rationale"],
+                        row["run_id"],
+                        row["cluster_id"],
+                        row["session_id"],
+                        row["scope_json"],
+                        row["cited_source_ids"],
+                        row["subject"],
+                        row["predicate"],
+                        row["object"],
+                        row["confidence"],
+                        row["action"],
+                        row["target_source_id"],
+                        row["rationale"],
                     ),
                 )
-            beam.conn.execute("RELEASE SAVEPOINT shmr_prop")
+            beam.conn.execute("RELEASE SAVEPOINT shmr_run")
             beam.conn.commit()
-            total_persisted += len(accepted)
+            total_persisted = len(plans)
         except Exception as exc:
-            logger.warning("SHMR proposal persistence failed for %s: %s", cluster_id, exc)
+            # Expected malformed-LLM / persistence failures are logged at
+            # warning (not error) and surfaced as an explicit reason code so
+            # callers can distinguish rollback from success without scanning
+            # logs for error-level noise.
+            logger.warning(
+                "SHMR run %s rolled back: %s", run_id, exc, exc_info=False
+            )
             try:
-                beam.conn.execute("ROLLBACK TO SAVEPOINT shmr_prop")
-                beam.conn.execute("RELEASE SAVEPOINT shmr_prop")
+                beam.conn.execute("ROLLBACK TO SAVEPOINT shmr_run")
+                beam.conn.execute("RELEASE SAVEPOINT shmr_run")
             except Exception:
                 pass
-            # Sources were never touched; proposals rolled back.
             return {
-                "clusters_found": len(clusters),
-                "proposals_persisted": total_persisted,
+                "clusters_found": len(all_clusters),
+                "proposals_persisted": 0,
                 "proposals_rejected": total_rejected,
                 "duration_ms": int((time.perf_counter() - t0) * 1000),
                 "status": "rolled_back",
+                "failure_reason": str(exc),
             }
 
     return {
-        "clusters_found": len(clusters),
+        "clusters_found": len(all_clusters),
         "proposals_persisted": total_persisted,
         "proposals_rejected": total_rejected,
         "duration_ms": int((time.perf_counter() - t0) * 1000),
