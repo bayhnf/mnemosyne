@@ -673,10 +673,42 @@ class TestDegradeOncePerTopLevel:
     def test_degrade_runs_once_with_zero_working_rows(self, temp_db, monkeypatch):
         monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
         beam = BeamMemory(session_id="maint", db_path=temp_db)
+
+        calls = []
+        original = BeamMemory.degrade_episodic
+
+        def counting(self, dry_run=False):
+            calls.append(1)
+            return original(self, dry_run=dry_run)
+
+        monkeypatch.setattr(BeamMemory, "degrade_episodic", counting)
         result = beam.sleep_all_sessions(dry_run=False)
         # With zero eligible rows, degradation must still run exactly once.
         assert "degradation" in result, (
             "sleep_all_sessions skipped degradation entirely on zero rows"
+        )
+        assert len(calls) == 1, (
+            f"degrade_episodic ran {len(calls)} times with zero rows; "
+            f"it must run exactly once per top-level invocation"
+        )
+
+    def test_degrade_runs_once_with_one_session(self, temp_db, monkeypatch):
+        monkeypatch.setattr("mnemosyne.core.local_llm.llm_available", lambda: False)
+        beam = BeamMemory(session_id="maint", db_path=temp_db)
+        _seed_old_wm(temp_db, "s1", 1)
+
+        calls = []
+        original = BeamMemory.degrade_episodic
+
+        def counting(self, dry_run=False):
+            calls.append(1)
+            return original(self, dry_run=dry_run)
+
+        monkeypatch.setattr(BeamMemory, "degrade_episodic", counting)
+        beam.sleep_all_sessions(dry_run=False)
+        assert len(calls) == 1, (
+            f"degrade_episodic ran {len(calls)} times for one session; "
+            f"it must run exactly once per top-level invocation"
         )
 
     def test_degrade_runs_once_with_many_sessions(self, temp_db, monkeypatch):

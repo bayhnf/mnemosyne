@@ -698,13 +698,18 @@ def clean_noise(
                 original_content = row["content"] or ""
                 original_metadata = row["metadata_json"] or "{}"
 
+                # Stage the mutation and audit write, then bump counters ONLY
+                # after the savepoint releases successfully. Previously the
+                # counters were incremented before the audit INSERT; an audit
+                # failure rolled back the row mutation (savepoint) but left a
+                # success count that did not match the committed state.
+                committed_action = None
                 if effective_action == "delete":
                     cursor.execute(
                         f"DELETE FROM {c.table_name} WHERE id = ?",
                         (c.memory_id,),
                     )
-                    result.deleted += 1
-                    log_action = "deleted"
+                    committed_action = "deleted"
                 elif effective_action == "archive":
                     # Archive = set importance to 0 and add metadata flag.
                     # This decays the row out of active retrieval without
@@ -727,8 +732,7 @@ def clean_noise(
                         f"UPDATE {c.table_name} SET importance = 0, metadata_json = ? WHERE id = ?",
                         (json.dumps(meta), c.memory_id),
                     )
-                    result.archived += 1
-                    log_action = "archived"
+                    committed_action = "archived"
                 elif effective_action == "flag":
                     # Flag = mark in metadata for operator review. No content change.
                     meta = json.loads(original_metadata) if original_metadata else {}
@@ -738,11 +742,9 @@ def clean_noise(
                         f"UPDATE {c.table_name} SET metadata_json = ? WHERE id = ?",
                         (json.dumps(meta), c.memory_id),
                     )
-                    result.flagged += 1
-                    log_action = "flagged"
+                    committed_action = "flagged"
                 else:
-                    result.kept += 1
-                    log_action = "kept"
+                    committed_action = "kept"
 
                 # Write audit log entry
                 cursor.execute(
@@ -754,7 +756,7 @@ def clean_noise(
                     (
                         c.memory_id,
                         c.table_name,
-                        log_action,
+                        committed_action,
                         json.dumps(c.noise_reasons),
                         c.noise_score,
                         json.dumps(c.secret_flags),
@@ -764,8 +766,17 @@ def clean_noise(
                         None,  # session_id not tracked at log level
                     ),
                 )
-                result.log_entries += 1
                 cursor.execute("RELEASE hygiene_candidate")
+                # Counters are only truthful once the savepoint has released.
+                if committed_action == "deleted":
+                    result.deleted += 1
+                elif committed_action == "archived":
+                    result.archived += 1
+                elif committed_action == "flagged":
+                    result.flagged += 1
+                else:
+                    result.kept += 1
+                result.log_entries += 1
 
             except Exception as e:
                 try:

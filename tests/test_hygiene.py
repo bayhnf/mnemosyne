@@ -1240,3 +1240,70 @@ class TestHygieneRestoreIdempotent:
         assert "_archived" not in meta
         assert "_original_importance" not in meta
         assert meta.get("original") == "data"
+
+
+# ---------------------------------------------------------------------------
+# Task 1 fix round 1: transactional hygiene counters
+# ---------------------------------------------------------------------------
+
+
+class TestHygieneTransactionalCounters:
+    """result.deleted/archived/flagged must reflect committed savepoint state,
+    not pre-rollback optimism."""
+
+    def test_failed_audit_rollback_keeps_counters_truthful(self, tmp_path):
+        db_path = tmp_path / "txcount.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE working_memory ("
+            "id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT, "
+            "session_id TEXT, importance REAL, metadata_json TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE hygiene_audit_log ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT, table_name TEXT, "
+            "action TEXT, reason TEXT, noise_score REAL, secret_flags TEXT, "
+            "original_content_preview TEXT, original_metadata TEXT, "
+            "timestamp TEXT, session_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('good','g','s','t','s',0.7,'{}')"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('bad','b','s','t','s',0.7,'{}')"
+        )
+        conn.commit()
+        conn.close()
+
+        candidates = [
+            NoiseCandidate(
+                memory_id="good", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                noise_reasons=["x"], suggested_action="delete",
+            ),
+            NoiseCandidate(
+                memory_id="bad", table_name="working_memory",
+                content_preview="", noise_score=0.8,
+                # object() is not JSON-serializable: the audit INSERT for this
+                # candidate fails after its DELETE has staged.
+                noise_reasons=[object()],
+                suggested_action="delete",
+            ),
+        ]
+        result = clean_noise(db_path, candidates, action="delete", confirm=True, dry_run=False)
+
+        conn = sqlite3.connect(str(db_path))
+        good = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'good'"
+        ).fetchone()[0]
+        bad = conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE id = 'bad'"
+        ).fetchone()[0]
+        conn.close()
+
+        assert good == 0, "good candidate should be deleted"
+        assert bad == 1, "bad candidate must survive (savepoint rollback)"
+        assert result.deleted == 1, (
+            f"deleted count {result.deleted} does not match committed state (1)"
+        )
+        assert any("bad" in e for e in result.errors)
