@@ -25,6 +25,7 @@ import scripts.linuxprocessing_campaign as lpc
 # Local aliases for readability in assertions.
 PASS = lpc.PASS
 FAIL = lpc.FAIL
+GATE_MARKER = lpc.GATE
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +821,187 @@ class TestG6CheckpointsAndScan:
             monkeypatch,
             "--ack-codex-desktop",
             "--ack-hermes-smoke",
+        )
+        report = _read_report(report_path)
+        _assert_content_free(json.dumps(report))
+        _assert_allowlist(report)
+
+
+# ===========================================================================
+# Commit 7: G7 soak and orchestrator
+# ===========================================================================
+
+
+class TestG7Soak:
+    def test_g7_short_soak_passes_with_budgets_and_monotonic_receipts(
+        self, tmp_path, monkeypatch
+    ):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g7",
+            trial,
+            monkeypatch,
+            "--soak-seconds",
+            "0",
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        assert checks["soak"]["verdict"] == PASS
+        assert checks["monotonic_receipts"]["verdict"] == PASS
+        assert checks["bounded_recall"]["verdict"] == PASS
+        assert checks["budgets"]["verdict"] == PASS
+        assert checks["final_integrity"]["verdict"] == PASS
+        # Default duration reported is the real 72h, even when the actual
+        # soak ran for the smaller test value.
+        assert checks["soak"]["default_duration_seconds"] == 72 * 60 * 60
+
+    def test_g7_real_default_duration_is_72h(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage("g7", trial, monkeypatch, "--soak-seconds", "0")
+        report = _read_report(report_path)
+        # The default (real) soak duration is 72 hours, surfaced in the report.
+        assert report["checks"]["soak"]["default_duration_seconds"] == 259200
+        assert report["checks"]["soak"]["actual_duration_seconds"] == 0
+
+    def test_g7_monotonic_receipts_strictly_increasing(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage("g7", trial, monkeypatch, "--soak-seconds", "0")
+        report = _read_report(report_path)
+        stamps = report["checks"]["monotonic_receipts"]["timestamps"]
+        assert stamps == sorted(stamps)
+        assert len(stamps) == len(set(stamps))
+
+    def test_g7_budgets_within_bounds(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage("g7", trial, monkeypatch, "--soak-seconds", "0")
+        report = _read_report(report_path)
+        budgets = report["checks"]["budgets"]
+        # FD and RSS must be positive and bounded; log lines non-negative.
+        assert budgets["open_fds"] >= 0
+        assert budgets["rss_kb"] >= 0
+        assert budgets["log_lines"] >= 0
+
+    def test_g7_content_free(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage("g7", trial, monkeypatch, "--soak-seconds", "0")
+        report = _read_report(report_path)
+        _assert_content_free(json.dumps(report))
+        _assert_allowlist(report)
+
+    def test_g7_fails_without_trial_root(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"  # not created
+        report_path = trial / "r.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "lpc.py",
+                "--trial-root",
+                str(trial),
+                "--report",
+                str(report_path),
+                "--stage",
+                "g7",
+            ],
+        )
+        assert lpc.main() == 1
+
+
+class TestAllOrchestrator:
+    """The `all` orchestrator runs every stage in order, stops at the first
+    non-pass, and executes the full G8 rollback rehearsal after G7."""
+
+    def test_all_stops_at_first_non_pass(self, tmp_path, monkeypatch):
+        # Without the G6 acks, `all` should stop at G6 (GATE -> exit 2).
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        code, report_path = _run_stage(
+            "all",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+            "--approved-sha",
+            "deadbeef" * 8,
+            # Small test-only G4 values so the orchestrator does not run the
+            # real CLI default (10000 events / 16 writers) before reaching G6.
+            "--g4-events",
+            "4",
+            "--g4-writers",
+            "1",
+            "--soak-seconds",
+            "0",
+            # Deliberately omit the G6 acks so the orchestrator stops there.
+        )
+        assert code == 2
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.GATE
+        checks = report["checks"]
+        # g0..g5 ran and passed; g6 is where it stopped.
+        for stage in ("g0", "g1", "g2", "g3", "g4", "g5"):
+            assert checks[stage]["verdict"] == PASS, f"{stage} did not pass"
+        assert checks["g6"]["verdict"] == GATE_MARKER
+
+    def test_all_passes_end_to_end_and_runs_g8_rehearsal(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        code, report_path = _run_stage(
+            "all",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+            "--approved-sha",
+            "deadbeef" * 8,
+            "--ack-codex-desktop",
+            "--ack-hermes-smoke",
+            "--g4-events",
+            "4",
+            "--g4-writers",
+            "1",
+            "--soak-seconds",
+            "0",
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        for stage in ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7"):
+            assert checks[stage]["verdict"] == PASS, f"{stage} did not pass"
+        # The orchestrator must execute the G8 rollback rehearsal after G7,
+        # not merely report the earlier standalone G8 as passed.
+        assert "g8_rehearsal" in checks
+        assert checks["g8_rehearsal"]["verdict"] == PASS
+
+    def test_all_content_free(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        _, report_path = _run_stage(
+            "all",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+            "--approved-sha",
+            "deadbeef" * 8,
+            "--ack-codex-desktop",
+            "--ack-hermes-smoke",
+            "--g4-events",
+            "3",
+            "--g4-writers",
+            "1",
+            "--soak-seconds",
+            "0",
         )
         report = _read_report(report_path)
         _assert_content_free(json.dumps(report))
