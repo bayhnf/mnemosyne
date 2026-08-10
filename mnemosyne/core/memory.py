@@ -681,6 +681,59 @@ class Mnemosyne:
             limit=limit,
         )
 
+    # ─── Native Inhale / Exhale / Dream delegation ─────────────────
+    # Thin wrappers over the Beam-first core (mnemosyne.core.inhale /
+    # recall_bounded / dream). No second lifecycle or persistence logic;
+    # the beam is the single source of truth. remember()/recall() above
+    # remain the unchanged legacy path.
+
+    def remember_event(self, event) -> Any:
+        """Durable receipt-backed ingest of one event (delegates to beam)."""
+        return self.beam.remember_event(event)
+
+    def remember_turn(self, turn) -> Any:
+        """Durable receipt-backed ingest of one turn (delegates to beam)."""
+        return self.beam.remember_turn(turn)
+
+    def retry_pending_ingest(self, limit: int = 100) -> Any:
+        """Re-run indexing for non-ready receipts without duplicating memory."""
+        return self.beam.retry_pending_ingest(limit=limit)
+
+    def ingest_status(self, event_id: Optional[str] = None, limit: int = 100) -> list:
+        """Return content-free ingest receipts (delegates to beam)."""
+        return self.beam.ingest_status(event_id=event_id, limit=limit)
+
+    def recall_bounded(self, query: str, policy: Any = None) -> Any:
+        """Bounded recall with hard result/token caps (delegates to beam)."""
+        return self.beam.recall_bounded(query, policy)
+
+    def dream_plan(self, scope: Dict[str, Any], limits: Any = None,
+                   request_id: Any = None) -> Any:
+        """Plan a Dream run (delegates to mnemosyne.core.dream)."""
+        from mnemosyne.core.dream import dream_plan
+        return dream_plan(self.beam, scope, limits=limits, request_id=request_id)
+
+    def dream_submit_receipt(self, run_id: str, receipt: Any) -> Any:
+        """Submit a reviewer/verifier receipt (delegates to dream)."""
+        from mnemosyne.core.dream import dream_submit_receipt
+        return dream_submit_receipt(self.beam, run_id, receipt)
+
+    def dream_apply(self, run_id: str) -> Any:
+        from mnemosyne.core.dream import dream_apply
+        return dream_apply(self.beam, run_id)
+
+    def dream_resume(self, run_id: str) -> Any:
+        from mnemosyne.core.dream import dream_resume
+        return dream_resume(self.beam, run_id)
+
+    def dream_undo(self, run_id: str) -> Any:
+        from mnemosyne.core.dream import dream_undo
+        return dream_undo(self.beam, run_id)
+
+    def dream_status(self, run_id: str) -> Any:
+        from mnemosyne.core.dream import dream_status
+        return dream_status(self.beam, run_id)
+
     def scratchpad_write(self, content: str) -> str:
         """Write to scratchpad."""
         return self.beam.scratchpad_write(content)
@@ -1171,6 +1224,68 @@ def reclaim_orphans(dry_run: bool = False, stale_after_seconds: int = 3600,
         stale_after_seconds=stale_after_seconds,
         limit=limit,
     )
+
+
+# ---------------------------------------------------------------------------
+# Module-level native Inhale / Exhale / Dream convenience functions.
+# Thin delegation to the global instance's beam; no second lifecycle logic.
+# ---------------------------------------------------------------------------
+
+
+def remember_event(event, bank: str = None):
+    """Durable receipt-backed ingest of one event using the global instance."""
+    return _get_default(bank).remember_event(event)
+
+
+def remember_turn(turn, bank: str = None):
+    """Durable receipt-backed ingest of one turn using the global instance."""
+    return _get_default(bank).remember_turn(turn)
+
+
+def retry_pending_ingest(limit: int = 100, bank: str = None):
+    """Re-run indexing for non-ready receipts using the global instance."""
+    return _get_default(bank).retry_pending_ingest(limit=limit)
+
+
+def ingest_status(event_id: Optional[str] = None, limit: int = 100, bank: str = None) -> list:
+    """Return content-free ingest receipts using the global instance."""
+    return _get_default(bank).ingest_status(event_id=event_id, limit=limit)
+
+
+def recall_bounded(query: str, policy: Any = None, bank: str = None):
+    """Bounded recall with hard result/token caps using the global instance."""
+    return _get_default(bank).recall_bounded(query, policy)
+
+
+def dream_plan(scope: Dict[str, Any], limits: Any = None,
+               request_id: Any = None, bank: str = None):
+    """Plan a Dream run using the global instance."""
+    return _get_default(bank).dream_plan(scope, limits=limits, request_id=request_id)
+
+
+def dream_submit_receipt(run_id: str, receipt: Any, bank: str = None):
+    """Submit a reviewer/verifier receipt using the global instance."""
+    return _get_default(bank).dream_submit_receipt(run_id, receipt)
+
+
+def dream_apply(run_id: str, bank: str = None):
+    """Apply a ready Dream run using the global instance."""
+    return _get_default(bank).dream_apply(run_id)
+
+
+def dream_resume(run_id: str, bank: str = None):
+    """Resume an interrupted Dream run using the global instance."""
+    return _get_default(bank).dream_resume(run_id)
+
+
+def dream_undo(run_id: str, bank: str = None):
+    """Undo an applied Dream run using the global instance."""
+    return _get_default(bank).dream_undo(run_id)
+
+
+def dream_status(run_id: str, bank: str = None):
+    """Return the current durable state of a Dream run."""
+    return _get_default(bank).dream_status(run_id)
 
 
 def scratchpad_write(content: str, bank: str = None) -> str:

@@ -382,6 +382,34 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
     return report
 
 
+def ingest_status(beam, event_id: Optional[str] = None, limit: int = 100) -> List[IngestReceipt]:
+    """Return content-free receipt data for stored ingest events.
+
+    One stable idempotency surface for status, diagnostics, and doctor: reads
+    only the ingest_receipts table and returns IngestReceipt rows with
+    NO content field (trust boundary: never surface raw event content through a
+    status/audit path). event_id returns at most that one receipt; limit
+    bounds the scan (positive int, validated at the trust boundary).
+
+    Receipts are returned newest-first by created_at so callers see the most
+    recent ingest state without an unbounded scan.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    conn = beam.conn
+    if event_id is not None:
+        row = conn.execute(
+            "SELECT * FROM ingest_receipts WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return [_receipt_from_row(row)] if row is not None else []
+    rows = conn.execute(
+        "SELECT * FROM ingest_receipts ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [_receipt_from_row(r) for r in rows]
+
+
+
 def _try_claim(
     conn: sqlite3.Connection,
     event_id: str,

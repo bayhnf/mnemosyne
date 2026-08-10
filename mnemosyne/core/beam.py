@@ -3681,6 +3681,15 @@ class BeamMemory:
         from mnemosyne.core.inhale import retry_pending_ingest as _retry_pending_ingest
         return _retry_pending_ingest(self, limit)
 
+    def ingest_status(self, event_id=None, limit: int = 100):
+        """Return content-free ingest receipts (see mnemosyne.core.inhale).
+
+        Additive status query: ``event_id`` returns at most one receipt;
+        ``limit`` (default 100) bounds a newest-first scan. Validates the
+        trust-boundary limit and never returns event content."""
+        from mnemosyne.core.inhale import ingest_status as _ingest_status
+        return _ingest_status(self, event_id=event_id, limit=limit)
+
     def remember_batch(self, items: List[Dict],
                        *,
                        veracity: Optional[str] = None,

@@ -169,53 +169,6 @@ def cmd_store(args):
     print(f"Stored: {memory_id}")
 
 
-def cmd_recall(args):
-    """Search memories."""
-    if not args:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
-
-    explain = False
-    json_output = False
-    positionals = []
-    for arg in args:
-        if arg == "--explain":
-            explain = True
-        elif arg == "--json":
-            json_output = True
-        else:
-            positionals.append(arg)
-
-    if not positionals:
-        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
-    query = positionals[0]
-    top_k = _parse_int(positionals[1], "top_k") if len(positionals) > 1 else 5
-
-    mem = _get_memory()
-    payload = mem.recall(query, top_k=top_k, explain=explain)
-    if explain:
-        results = payload.get("results", [])
-    else:
-        results = payload
-
-    if json_output:
-        if explain:
-            print(json.dumps(payload, ensure_ascii=False, default=str))
-        else:
-            print(json.dumps({"query": query, "top_k": top_k, "results": results}, ensure_ascii=False, default=str))
-        return
-
-    print(f"\nResults for: {query}\n")
-    for r in results:
-        content = r.get("content", "")
-        score = r.get("score", 0)
-        print(f"  ID: {r.get('id', '?')}")
-        print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
-        print(f"  Score: {score:.3f}")
-        if r.get("entity_match"):
-            print("  [entity match]")
-        print()
-
-
 def cmd_update(args):
     """Update an existing memory."""
     if len(args) < 2:
@@ -1657,6 +1610,644 @@ def cmd_migrate(args):
     print(f"  indices added: {report['indices_added']}")
 
 
+# ---------------------------------------------------------------------------
+# Native Inhale / Exhale / Dream / orphan-reclaim CLI (Task 6A)
+#
+# Thin command wrappers over the SDK; no business logic here. All validation
+# happens at this boundary so bad input exits 2 with a user-facing message
+# (no traceback). Structured output uses the established --json convention.
+# Receipts/envelopes/runs are dataclasses serialized via dataclasses.asdict.
+# ---------------------------------------------------------------------------
+
+
+def _content_hash_sha256(text: str) -> str:
+    """SHA-256 of event content (trust-boundary idempotency key)."""
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _serialize_dataclass(obj) -> str:
+    """Serialize a dataclass or list of dataclasses to canonical JSON.
+
+    Uses default=str so any non-JSON-native field (datetime) is rendered
+    rather than raising. Never includes raw memory content: receipts carry
+    only content-free metadata."""
+    from dataclasses import asdict, is_dataclass
+    if is_dataclass(obj):
+        return json.dumps(asdict(obj), ensure_ascii=False, default=str)
+    if isinstance(obj, list):
+        return json.dumps(
+            [asdict(o) if is_dataclass(o) else o for o in obj],
+            ensure_ascii=False,
+            default=str,
+        )
+    return json.dumps(obj, ensure_ascii=False, default=str)
+
+
+_INGEST_USAGE = (
+    "Usage: mnemosyne ingest --event-id ID --producer P --actor-id A "
+    "--project-id P --session-id S --turn-id T --role R --content C "
+    "--occurred-at TS [--metadata JSON]"
+)
+
+
+def cmd_ingest(args):
+    """Durably ingest one event with a receipt-backed idempotency key."""
+    import hashlib as _hashlib
+
+    flags = {
+        "--event-id": None,
+        "--producer": None,
+        "--actor-id": None,
+        "--project-id": None,
+        "--session-id": None,
+        "--turn-id": None,
+        "--role": None,
+        "--content": None,
+        "--occurred-at": None,
+        "--metadata": None,
+    }
+    json_output = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--json":
+            json_output = True
+            i += 1
+            continue
+        if arg in flags:
+            if i + 1 >= len(args):
+                _fail(f"{arg} requires a value")
+            flags[arg] = args[i + 1]
+            i += 2
+        else:
+            _usage(f"{_INGEST_USAGE}\nUnknown ingest option: {arg}")
+
+    required = (
+        "--event-id", "--producer", "--actor-id", "--project-id",
+        "--session-id", "--turn-id", "--role", "--content", "--occurred-at",
+    )
+    missing = [f for f in required if not flags[f]]
+    if missing:
+        _fail(f"Missing required: {', '.join(missing)}")
+
+    metadata = None
+    if flags["--metadata"] is not None:
+        try:
+            metadata = json.loads(flags["--metadata"])
+        except json.JSONDecodeError as exc:
+            _fail(f"--metadata must be valid JSON: {exc}")
+        if not isinstance(metadata, dict):
+            _fail("--metadata must be a JSON object")
+
+    from mnemosyne.core.inhale import IngestEvent
+
+    content = flags["--content"]
+    event = IngestEvent(
+        event_id=flags["--event-id"],
+        producer=flags["--producer"],
+        actor_id=flags["--actor-id"],
+        project_id=flags["--project-id"],
+        session_id=flags["--session-id"],
+        turn_id=flags["--turn-id"],
+        role=flags["--role"],
+        content=content,
+        content_hash=_hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        occurred_at=flags["--occurred-at"],
+        metadata=metadata,
+    )
+
+    mem = _get_memory()
+    receipt = mem.remember_event(event)
+    payload = _serialize_dataclass(receipt)
+    if json_output:
+        print(payload)
+    else:
+        print(f"Ingested: event_id={receipt.event_id} status={receipt.status} "
+              f"index_status={receipt.index_status} attempts={receipt.attempts}")
+        if receipt.status == "duplicate":
+            print("  (identical event already stored; no new memory written)")
+        elif receipt.status == "conflict":
+            print("  CONFLICT: event_id reused with a different payload; "
+                  "original receipt untouched")
+        elif receipt.status == "rejected":
+            print(f"  REJECTED: {receipt.last_error_code}")
+    if receipt.status == "rejected":
+        raise SystemExit(1)
+
+
+def cmd_ingest_status(args):
+    """Show content-free ingest receipt status."""
+    event_id = None
+    limit = 100
+    json_output = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--event-id":
+            event_id, i = _require_value(args, i, "--event-id", lambda v, _n: v)
+        elif arg == "--limit":
+            limit, i = _require_value(args, i, "--limit", _parse_int)
+            if limit < 1:
+                _fail("--limit must be a positive integer")
+        elif arg == "--json":
+            json_output = True
+            i += 1
+        else:
+            _fail(f"Unknown ingest-status option: {arg}")
+
+    mem = _get_memory()
+    try:
+        rows = mem.ingest_status(event_id=event_id, limit=limit)
+    except ValueError as exc:
+        _fail(str(exc))
+
+    if json_output:
+        print(_serialize_dataclass(rows))
+        return
+    if not rows:
+        print("No ingest receipts found.")
+        return
+    print(f"Ingest receipts ({len(rows)}):")
+    for r in rows:
+        print(f"  {r.event_id}  status={r.status} index={r.index_status} "
+              f"attempts={r.attempts}")
+        if r.last_error_code:
+            print(f"    last_error: {r.last_error_code} at {r.last_error_at}")
+
+
+def cmd_ingest_retry(args):
+    """Re-run indexing for non-ready ingest receipts."""
+    limit = 100
+    json_output = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--limit":
+            limit, i = _require_value(args, i, "--limit", _parse_int)
+            if limit < 1:
+                _fail("--limit must be a positive integer")
+        elif arg == "--json":
+            json_output = True
+            i += 1
+        else:
+            _fail(f"Unknown ingest-retry option: {arg}")
+
+    mem = _get_memory()
+    report = mem.retry_pending_ingest(limit=limit)
+    payload = _serialize_dataclass(report)
+    if json_output:
+        print(payload)
+    else:
+        print(f"Retry complete: attempted={report.attempted} "
+              f"succeeded={report.succeeded} degraded={report.degraded} "
+              f"failed_retryable={report.failed_retryable} "
+              f"failed_terminal={report.failed_terminal}")
+
+
+_RECALL_BOUNDED_FLAGS = (
+    "--top-k", "--max-tokens", "--max-item-tokens",
+    "--producer", "--actor", "--project", "--session",
+    "--include-shared", "--include-legacy-shared",
+)
+
+
+def cmd_recall(args):
+    """Search memories.
+
+    Without bounded options: legacy plain-list path (unchanged). With any
+    bounded option (--max-tokens / --top-k on the bounded path / --producer /
+    --actor / --project / --session / --include-shared /
+    --include-legacy-shared): returns a RecallEnvelope via recall_bounded.
+    """
+    if not args:
+        _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json] "
+               "[--max-tokens N --producer P --actor A --project P --session S "
+               "--include-shared --include-legacy-shared]")
+
+    bounded_flags = _RECALL_BOUNDED_FLAGS
+    has_bounded = any(a in bounded_flags for a in args)
+
+    if not has_bounded:
+        # Legacy path — unchanged contract.
+        explain = False
+        json_output = False
+        positionals = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--explain":
+                explain = True
+                i += 1
+            elif arg == "--json":
+                json_output = True
+                i += 1
+            else:
+                positionals.append(arg)
+                i += 1
+        if not positionals:
+            _usage("Usage: mnemosyne recall <query> [top_k] [--explain] [--json]")
+        query = positionals[0]
+        top_k = _parse_int(positionals[1], "top_k") if len(positionals) > 1 else 5
+
+        mem = _get_memory()
+        payload = mem.recall(query, top_k=top_k, explain=explain)
+        if explain:
+            results = payload.get("results", [])
+        else:
+            results = payload
+        if json_output:
+            if explain:
+                print(json.dumps(payload, ensure_ascii=False, default=str))
+            else:
+                print(json.dumps({"query": query, "top_k": top_k, "results": results},
+                                 ensure_ascii=False, default=str))
+            return
+        print(f"\nResults for: {query}\n")
+        for r in results:
+            content = r.get("content", "")
+            score = r.get("score", 0)
+            print(f"  ID: {r.get('id', '?')}")
+            print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
+            print(f"  Score: {score:.3f}")
+            if r.get("entity_match"):
+                print("  [entity match]")
+            print()
+        return
+
+    # Bounded path.
+    query_parts = []
+    json_output = False
+    explain = False
+    top_k = None
+    max_tokens = None
+    max_item_tokens = None
+    producer = None
+    actor = None
+    project = None
+    session = None
+    include_shared = False
+    include_legacy_shared = False
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--json":
+            json_output = True
+            i += 1
+        elif arg == "--explain":
+            explain = True
+            i += 1
+        elif arg == "--top-k":
+            top_k, i = _require_value(args, i, "--top-k", _parse_int)
+            if top_k < 1:
+                _fail("--top-k must be a positive integer")
+        elif arg == "--max-tokens":
+            max_tokens, i = _require_value(args, i, "--max-tokens", _parse_int)
+            if max_tokens < 1:
+                _fail("--max-tokens must be a positive integer")
+        elif arg == "--max-item-tokens":
+            max_item_tokens, i = _require_value(args, i, "--max-item-tokens", _parse_int)
+            if max_item_tokens < 1:
+                _fail("--max-item-tokens must be a positive integer")
+        elif arg == "--producer":
+            producer, i = _require_value(args, i, "--producer", lambda v, _n: v)
+        elif arg == "--actor":
+            actor, i = _require_value(args, i, "--actor", lambda v, _n: v)
+        elif arg == "--project":
+            project, i = _require_value(args, i, "--project", lambda v, _n: v)
+        elif arg == "--session":
+            session, i = _require_value(args, i, "--session", lambda v, _n: v)
+        elif arg == "--include-shared":
+            include_shared = True
+            i += 1
+        elif arg == "--include-legacy-shared":
+            include_legacy_shared = True
+            i += 1
+        elif arg.startswith("--"):
+            _fail(f"Unknown recall option: {arg}")
+        else:
+            query_parts.append(arg)
+            i += 1
+
+    if not query_parts:
+        _fail("recall requires a query")
+
+    from mnemosyne.core.recall_bounded import RecallPolicy
+
+    policy_kwargs = {}
+    if top_k is not None:
+        policy_kwargs["top_k"] = top_k
+    if max_tokens is not None:
+        policy_kwargs["max_tokens"] = max_tokens
+    if max_item_tokens is not None:
+        policy_kwargs["max_item_tokens"] = max_item_tokens
+    if producer is not None:
+        policy_kwargs["producer_ids"] = [producer]
+    if actor is not None:
+        policy_kwargs["actor_ids"] = [actor]
+    if project is not None:
+        policy_kwargs["project_ids"] = [project]
+    if session is not None:
+        policy_kwargs["session_ids"] = [session]
+    policy_kwargs["include_shared"] = include_shared
+    policy_kwargs["include_legacy_shared"] = include_legacy_shared
+
+    try:
+        policy = RecallPolicy(**policy_kwargs)
+    except (ValueError, TypeError) as exc:
+        _fail(f"Invalid recall policy: {exc}")
+
+    mem = _get_memory()
+    env = mem.recall_bounded(" ".join(query_parts), policy)
+    envelope_dict = {
+        "results": env.results,
+        "rendered_context": env.rendered_context,
+        "token_count": env.token_count,
+        "retrieval_mode": env.retrieval_mode,
+        "applied_filters": env.applied_filters,
+        "degradation_reasons": env.degradation_reasons,
+        "trace_id": env.trace_id,
+    }
+    if json_output:
+        print(json.dumps(envelope_dict, ensure_ascii=False, default=str))
+    else:
+        print(f"\nBounded recall: {env.retrieval_mode} "
+              f"({env.token_count} tokens, {len(env.results)} results)\n")
+        for r in env.results:
+            content = r.get("content", "")
+            print(f"  ID: {r.get('id', '?')}")
+            print(f"  Content: {content[:150]}{'...' if len(content) > 150 else ''}")
+            print(f"  Score: {r.get('score', 0):.3f}")
+            print()
+        if env.degradation_reasons:
+            print("Degradation: " + ", ".join(env.degradation_reasons))
+
+
+def cmd_reclaim_orphans(args):
+    """Clear stale sleep claims that have no episodic summary.
+
+    Safe dry-run by default; mutates only with explicit --apply.
+    """
+    dry_run = True
+    stale_after_seconds = 3600
+    limit = 1000
+    json_output = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--apply":
+            dry_run = False
+            i += 1
+        elif arg == "--dry-run":
+            dry_run = True
+            i += 1
+        elif arg == "--stale-after-seconds":
+            stale_after_seconds, i = _require_value(args, i, "--stale-after-seconds", _parse_int)
+            if stale_after_seconds < 0:
+                _fail("--stale-after-seconds must be non-negative")
+        elif arg == "--limit":
+            limit, i = _require_value(args, i, "--limit", _parse_int)
+            if limit < 0:
+                _fail("--limit must be non-negative")
+        elif arg == "--json":
+            json_output = True
+            i += 1
+        else:
+            _fail(f"Unknown reclaim-orphans option: {arg}")
+
+    if not dry_run and "--dry-run" in args and "--apply" in args:
+        _fail("--apply and --dry-run cannot be used together")
+
+    mem = _get_memory()
+    result = mem.reclaim_orphans(
+        dry_run=dry_run,
+        stale_after_seconds=stale_after_seconds,
+        limit=limit,
+    )
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False, default=str))
+    else:
+        mode = "DRY RUN" if dry_run else "APPLIED"
+        print(f"[{mode}] reclaimed={result.get('reclaimed', 0)} "
+              f"candidates={result.get('candidates', 0)}")
+
+
+_DREAM_USAGE = (
+    "Usage: mnemosyne dream <plan|review|verify|status|resume|apply|undo> ..."
+)
+
+
+def cmd_dream(args):
+    """Native Dream lifecycle CLI.
+
+    Subcommands map to the dream core module: plan, review, verify, status,
+    resume, apply, undo. ``review`` and ``verify`` submit PASS receipts with
+    fixed reviewer/verifier roles via dream_submit_receipt; distinct actor
+    validation is enforced by the core.
+    """
+    if not args:
+        _usage(_DREAM_USAGE)
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub not in ("plan", "review", "verify", "status", "resume", "apply", "undo"):
+        _fail(f"Unknown dream subcommand: {sub}. Use {_DREAM_USAGE}")
+
+    mem = _get_memory()
+
+    if sub == "plan":
+        scope = {}
+        limits = None
+        request_id = None
+        json_output = False
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "--session-id":
+                scope["session_id"], i = _require_value(rest, i, "--session-id", lambda v, _n: v)
+            elif arg == "--actor-id":
+                scope["actor_id"], i = _require_value(rest, i, "--actor-id", lambda v, _n: v)
+            elif arg == "--producer":
+                scope["producer"], i = _require_value(rest, i, "--producer", lambda v, _n: v)
+            elif arg == "--project-id":
+                scope["project_id"], i = _require_value(rest, i, "--project-id", lambda v, _n: v)
+            elif arg == "--request-id":
+                request_id, i = _require_value(rest, i, "--request-id", lambda v, _n: v)
+            elif arg == "--limits":
+                raw, i = _require_value(rest, i, "--limits", lambda v, _n: v)
+                try:
+                    limits = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    _fail(f"--limits must be valid JSON: {exc}")
+            elif arg == "--json":
+                json_output = True
+                i += 1
+            else:
+                _fail(f"Unknown dream plan option: {arg}")
+        if not scope.get("session_id"):
+            _fail("--session-id is required for dream plan")
+        run = mem.dream_plan(scope=scope, limits=limits, request_id=request_id)
+        if json_output:
+            print(_serialize_dataclass(run))
+        else:
+            print(f"Dream plan: run_id={run.run_id} state={run.state}")
+            if run.error_code:
+                print(f"  error: {run.error_code}")
+            if run.manifest_hash:
+                print(f"  manifest_hash: {run.manifest_hash}")
+        # plan returning no_candidates/rejected is a valid structured outcome,
+        # not a CLI failure; do not exit non-zero (the JSON carries the state).
+
+    elif sub in ("review", "verify"):
+        role = "reviewer" if sub == "review" else "verifier"
+        run_id = None
+        manifest_hash = None
+        actor_id = None
+        verdict = "PASS"
+        reason_code = "ok"
+        json_output = False
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "--run-id":
+                run_id, i = _require_value(rest, i, "--run-id", lambda v, _n: v)
+            elif arg == "--manifest-hash":
+                manifest_hash, i = _require_value(rest, i, "--manifest-hash", lambda v, _n: v)
+            elif arg == "--actor-id":
+                actor_id, i = _require_value(rest, i, "--actor-id", lambda v, _n: v)
+            elif arg == "--verdict":
+                verdict, i = _require_value(rest, i, "--verdict", lambda v, _n: v)
+            elif arg == "--reason-code":
+                reason_code, i = _require_value(rest, i, "--reason-code", lambda v, _n: v)
+            elif arg == "--json":
+                json_output = True
+                i += 1
+            else:
+                _fail(f"Unknown dream {sub} option: {arg}")
+        if not run_id:
+            _fail("--run-id is required for dream " + sub)
+        if not actor_id:
+            _fail("--actor-id is required for dream " + sub)
+        if verdict not in ("PASS", "FAIL"):
+            _fail("--verdict must be PASS or FAIL")
+
+        from datetime import datetime, timezone
+        receipt = {
+            "role": role,
+            "actor_id": actor_id,
+            "run_id": run_id,
+            "manifest_hash": manifest_hash or "",
+            "verdict": verdict,
+            "reason_code": reason_code,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        # Bind manifest_hash from the durable run if not supplied.
+        if not receipt["manifest_hash"]:
+            existing = mem.dream_status(run_id)
+            receipt["manifest_hash"] = existing.manifest_hash or ""
+        run = mem.dream_submit_receipt(run_id, receipt)
+        if json_output:
+            print(_serialize_dataclass(run))
+        else:
+            print(f"Dream {sub}: run_id={run.run_id} state={run.state}")
+            if run.error_code:
+                print(f"  error: {run.error_code}")
+        if run.state in ("rejected", "failed_terminal"):
+            raise SystemExit(1)
+
+    elif sub == "status":
+        run_id = None
+        json_output = False
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "--run-id":
+                run_id, i = _require_value(rest, i, "--run-id", lambda v, _n: v)
+            elif arg == "--json":
+                json_output = True
+                i += 1
+            else:
+                _fail(f"Unknown dream status option: {arg}")
+        if not run_id:
+            _fail("--run-id is required for dream status")
+        run = mem.dream_status(run_id)
+        if json_output:
+            print(_serialize_dataclass(run))
+        else:
+            print(f"Dream status: run_id={run.run_id} state={run.state}")
+            if run.error_code:
+                print(f"  error: {run.error_code}")
+
+    elif sub == "resume":
+        run_id = None
+        json_output = False
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "--run-id":
+                run_id, i = _require_value(rest, i, "--run-id", lambda v, _n: v)
+            elif arg == "--json":
+                json_output = True
+                i += 1
+            else:
+                _fail(f"Unknown dream resume option: {arg}")
+        if not run_id:
+            _fail("--run-id is required for dream resume")
+        run = mem.dream_resume(run_id)
+        if json_output:
+            print(_serialize_dataclass(run))
+        else:
+            print(f"Dream resume: run_id={run.run_id} state={run.state}")
+
+    elif sub == "apply":
+        run_id = None
+        json_output = False
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "--run-id":
+                run_id, i = _require_value(rest, i, "--run-id", lambda v, _n: v)
+            elif arg == "--json":
+                json_output = True
+                i += 1
+            else:
+                _fail(f"Unknown dream apply option: {arg}")
+        if not run_id:
+            _fail("--run-id is required for dream apply")
+        run = mem.dream_apply(run_id)
+        if json_output:
+            print(_serialize_dataclass(run))
+        else:
+            print(f"Dream apply: run_id={run.run_id} state={run.state}")
+        if run.state in ("failed_terminal", "rejected"):
+            raise SystemExit(1)
+
+    elif sub == "undo":
+        run_id = None
+        json_output = False
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "--run-id":
+                run_id, i = _require_value(rest, i, "--run-id", lambda v, _n: v)
+            elif arg == "--json":
+                json_output = True
+                i += 1
+            else:
+                _fail(f"Unknown dream undo option: {arg}")
+        if not run_id:
+            _fail("--run-id is required for dream undo")
+        run = mem.dream_undo(run_id)
+        if json_output:
+            print(_serialize_dataclass(run))
+        else:
+            print(f"Dream undo: run_id={run.run_id} state={run.state}")
+
+
+
+
 COMMANDS = {
     "store": cmd_store,
     "remember": cmd_store,
@@ -1692,6 +2283,11 @@ COMMANDS = {
     "hygiene": cmd_hygiene,
     "profile": cmd_profile,
     "config": cmd_config,
+    "ingest": cmd_ingest,
+    "ingest-status": cmd_ingest_status,
+    "ingest-retry": cmd_ingest_retry,
+    "reclaim-orphans": cmd_reclaim_orphans,
+    "dream": cmd_dream,
 }
 
 
