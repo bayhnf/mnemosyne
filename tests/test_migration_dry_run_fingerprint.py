@@ -128,6 +128,38 @@ def test_e7_dry_run_leaves_schema_fingerprint_unchanged(tmp_path):
     assert "sync_meta" not in tables
 
 
+def test_e7_dry_run_missing_bank_reports_empty_would_add(tmp_path):
+    """A missing bank still returns a truthful dry-run report."""
+    db_path = tmp_path / "missing.db"
+
+    report = migrate_311_tables(db_path, dry_run=True)
+
+    assert report["added"] == 0
+    assert report["would_add"] == 0
+    assert report["tables_would_add"] == []
+    assert report["indices_would_add"] == 0
+
+
+def test_e7_dry_run_report_fields_are_not_notrequired():
+    """Regression: typing.NotRequired is 3.11+; project supports 3.10.
+
+    The dry-run fields must be plain required TypedDict keys (no
+    typing_extensions, no 3.11-only typing import) so the module keeps
+    importing on Python 3.10.
+    """
+    from mnemosyne.migrations.e7_311_tables import MigrationDryRunReport
+
+    assert MigrationDryRunReport.__required_keys__ >= {
+        "added",
+        "tables_added",
+        "tables_already_present",
+        "indices_added",
+        "would_add",
+        "tables_would_add",
+        "indices_would_add",
+    }
+
+
 def test_e6_dry_run_leaves_schema_fingerprint_unchanged(tmp_path):
     db_path = _fresh_e6_bank(tmp_path)
     before = _schema_fingerprint(db_path)

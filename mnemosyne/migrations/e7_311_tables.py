@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from typing import TypedDict
 
 
 # Canonical DDL from mnemosyne/core/sync.py:641-665
@@ -88,10 +88,13 @@ class MigrationReport(TypedDict):
     tables_added: list[str]
     tables_already_present: list[str]
     indices_added: int
-    # Report-only (dry-run) fields; present only in dry-run reports.
-    would_add: NotRequired[int]
-    tables_would_add: NotRequired[list[str]]
-    indices_would_add: NotRequired[int]
+
+
+class MigrationDryRunReport(MigrationReport):
+    # Report-only (dry-run) fields; present in every dry-run report.
+    would_add: int
+    tables_would_add: list[str]
+    indices_would_add: int
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -110,7 +113,9 @@ def _has_index(conn: sqlite3.Connection, name: str) -> bool:
     return cursor.fetchone() is not None
 
 
-def migrate_311_tables(db_path: Path, dry_run: bool = False) -> MigrationReport:
+def migrate_311_tables(
+    db_path: Path, dry_run: bool = False
+) -> MigrationReport | MigrationDryRunReport:
     """Add the 3.11.1 schema tables to an existing bank at the older
     54-table schema. Idempotent.
 
@@ -118,15 +123,17 @@ def migrate_311_tables(db_path: Path, dry_run: bool = False) -> MigrationReport:
     (``mode=ro`` + ``PRAGMA query_only=ON``), no DDL is executed and no
     commit happens. The report keeps ``added`` / ``tables_added`` /
     ``indices_added`` at zero and instead exposes ``would_add`` /
-    ``tables_would_add`` / ``indices_would_add`` for the pending DDL.
+    ``tables_would_add`` / ``indices_would_add`` for the pending DDL
+    (all zero/empty when the bank does not exist yet).
 
     Returns a report dict with:
       - added: int (number of tables added in this call)
       - tables_added: List[str] (names of tables added in this call)
       - tables_already_present: List[str] (names already in the schema)
       - indices_added: int (number of indices added in this call)
-      - dry-run only: would_add / tables_would_add / indices_would_add
-        describing the DDL a real run would execute.
+      - dry-run reports additionally carry would_add /
+        tables_would_add / indices_would_add describing the DDL a real
+        run would execute.
     """
     db_path = Path(db_path)
     report: MigrationReport = {
@@ -135,17 +142,19 @@ def migrate_311_tables(db_path: Path, dry_run: bool = False) -> MigrationReport:
         "tables_already_present": [],
         "indices_added": 0,
     }
+    if dry_run:
+        report["would_add"] = 0
+        report["tables_would_add"] = []
+        report["indices_would_add"] = 0
     if not db_path.exists():
-        # Nothing to migrate (the bank doesn't exist yet).
+        # Nothing to migrate (the bank doesn't exist yet); the dry-run
+        # fields above still describe the pending DDL truthfully.
         return report
 
     if dry_run:
         conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         try:
             conn.execute("PRAGMA query_only=ON")
-            report["would_add"] = 0
-            report["tables_would_add"] = []
-            report["indices_would_add"] = 0
             for name, _ddl in _TABLES:
                 if _has_table(conn, name):
                     report["tables_already_present"].append(name)
