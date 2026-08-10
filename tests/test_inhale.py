@@ -256,6 +256,144 @@ def test_corrected_event_id_can_succeed_after_rejection(beam, vec_ready):
 
 
 # ---------------------------------------------------------------------------
+# Log privacy: conflict and rejection records must be content-free
+# (Task 28). Mirrors the Task 26 embedding/enrichment log contract: no
+# content-derived identifiers, hashes, memory IDs, exception text, or
+# tracebacks in observable logger records; only static operation/reason
+# diagnostics. Idempotency/dedup/conflict/rejection decision paths and
+# returned receipt fields stay untouched.
+# ---------------------------------------------------------------------------
+
+
+def _assert_records_content_free(caplog, *forbidden):
+    """Assert no forbidden token appears in rendered text or any record's
+    formatted message or cached exception text/traceback."""
+    blob = caplog.text
+    for token in forbidden:
+        assert token not in blob, f"forbidden token leaked into caplog.text: {token!r}"
+    for record in caplog.records:
+        rendered = record.getMessage()
+        for token in forbidden:
+            assert token not in rendered, (
+                f"forbidden token leaked into rendered record: {token!r}"
+            )
+            assert token not in str(getattr(record, "exc_text", None) or ""), (
+                f"forbidden token leaked into record.exc_text: {token!r}"
+            )
+
+
+def test_conflict_warning_log_is_content_free(beam, vec_ready, caplog):
+    """Single-event conflict WARNING must carry only static diagnostics:
+    no event_id, payload_hash, content, or traceback."""
+    marker = "TASK28_CONFLICT_MARKER_w4Q9"
+    eid = hashlib.sha256(f"codex:session-1:{marker}:user".encode()).hexdigest()[:32]
+    first = beam.remember_event(_event(content=f"top-secret {marker}", event_id=eid))
+    assert first.status == "stored"
+
+    caplog.set_level(logging.WARNING, logger="mnemosyne.core.inhale")
+    conflict = beam.remember_event(_event(content=f"different {marker}", event_id=eid))
+    assert conflict.status == "conflict"
+    assert conflict.last_error_code == "event_id_conflict"
+
+    _assert_records_content_free(
+        caplog,
+        marker,
+        eid,
+        first.payload_hash,
+        conflict.metadata["conflicting_payload_hash"],
+        "Traceback",
+    )
+    assert "ingest conflict" in caplog.text
+    # Decision-path/receipt semantics untouched.
+    audit = list(
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM ingest_conflicts WHERE event_id = ?", (eid,)
+        )
+    )[0][0]
+    assert audit == 1
+    persisted = _receipt_rows(beam.conn)[0]
+    assert persisted["status"] == "stored"
+    assert persisted["payload_hash"] == first.payload_hash
+
+
+def test_atomic_batch_conflict_warning_log_is_content_free(beam, vec_ready, caplog):
+    """Atomic-batch conflict WARNING (second site) must be content-free too."""
+    marker = "TASK28_ATOMIC_MARKER_p8K2"
+    eid = hashlib.sha256(f"codex:session-1:{marker}:user".encode()).hexdigest()[:32]
+    first = remember_turns_atomic(
+        beam, [_turn(content=f"first {marker}", event_id=eid, turn_id="t1")]
+    )[0]
+    assert first.status == "stored"
+
+    caplog.set_level(logging.WARNING, logger="mnemosyne.core.inhale")
+    receipts = remember_turns_atomic(
+        beam,
+        [_turn(content=f"challenger {marker}", event_id=eid, turn_id="t2")],
+    )
+    assert receipts[0].status == "conflict"
+    assert receipts[0].last_error_code == "event_id_conflict"
+
+    _assert_records_content_free(
+        caplog,
+        marker,
+        eid,
+        first.payload_hash,
+        receipts[0].metadata["conflicting_payload_hash"],
+        "Traceback",
+    )
+    assert "ingest conflict" in caplog.text
+    audit = list(
+        beam.conn.execute(
+            "SELECT COUNT(*) FROM ingest_conflicts WHERE event_id = ?", (eid,)
+        )
+    )[0][0]
+    assert audit == 1
+    persisted = _receipt_rows(beam.conn)[0]
+    assert persisted["status"] == "stored"
+
+
+def test_rejection_log_is_content_free(beam, vec_ready, caplog):
+    """Rejection ERROR must carry only static diagnostics: no event_id (which
+    is content-derived under Hermes and may carry raw content for arbitrary
+    callers), no payload_hash, no content, no traceback. Both a
+    Hermes-style derived id and a verbatim-content id are locked down."""
+    caplog.set_level(logging.ERROR, logger="mnemosyne.core.inhale")
+
+    # Case 1: Hermes-style content-derived event_id.
+    marker = "TASK28_REJECT_MARKER_r7M3"
+    derived_eid = hashlib.sha256(f"codex:session-1:{marker}:user".encode()).hexdigest()[
+        :32
+    ]
+    bad = beam.remember_event(
+        _event(
+            content=f"secret {marker}", event_id=derived_eid, content_hash="deadbeef"
+        )
+    )
+    assert bad.status == "rejected"
+    assert bad.last_error_code == "validation_failed"
+    _assert_records_content_free(
+        caplog, marker, derived_eid, bad.payload_hash, "Traceback"
+    )
+
+    # Case 2: caller-supplied event_id carrying raw content verbatim.
+    vmarker = "TASK28_VERBATIM_MARKER_s5N1"
+    verbatim_eid = f"TASK28_VERBATIM {vmarker} raw content"
+    bad_v = beam.remember_event(
+        _event(
+            content=f"secret {vmarker}", event_id=verbatim_eid, content_hash="deadbeef"
+        )
+    )
+    assert bad_v.status == "rejected"
+    _assert_records_content_free(caplog, vmarker, verbatim_eid, "Traceback")
+
+    assert "ingest rejected" in caplog.text
+    assert "content_hash: does not match sha256(content)" in caplog.text
+    # Receipt/status semantics unchanged by the log change.
+    assert len(_working_rows(beam.conn)) == 0
+    assert len(_receipt_rows(beam.conn)) == 0
+
+
+# ---------------------------------------------------------------------------
 # Atomicity and crash windows
 # ---------------------------------------------------------------------------
 

@@ -201,13 +201,7 @@ def remember_event(beam, event: IngestEvent) -> IngestReceipt:
                 (event.event_id, row["payload_hash"], payload_hash, now),
             )
             conn.commit()
-            logger.warning(
-                "ingest conflict event_id=%r: stored payload_hash=%s, "
-                "conflicting payload_hash=%s (original receipt untouched)",
-                event.event_id,
-                row["payload_hash"],
-                payload_hash,
-            )
+            logger.warning("ingest conflict (original receipt untouched)")
             # Synthesize the conflict outcome WITHOUT persisting it on the
             # original lifecycle row.
             return _conflict_receipt(row, payload_hash, now)
@@ -385,13 +379,7 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
                        VALUES (?, ?, ?, ?)""",
                     (turn.event_id, row["payload_hash"], payload_hash, now),
                 )
-                logger.warning(
-                    "ingest conflict event_id=%r: stored payload_hash=%s, "
-                    "conflicting payload_hash=%s (original receipt untouched)",
-                    turn.event_id,
-                    row["payload_hash"],
-                    payload_hash,
-                )
+                logger.warning("ingest conflict (original receipt untouched)")
                 receipts[idx] = _conflict_receipt(row, payload_hash, now)
                 continue
 
@@ -873,8 +861,7 @@ def _reject(
             str(getattr(event, "event_id", "")).encode("utf-8", "replace")
         ).hexdigest()
     logger.error(
-        "ingest rejected event_id=%r (%s): %s",
-        getattr(event, "event_id", None),
+        "ingest rejected (%s): %s",
         "; ".join(errors),
         type(event).__name__,
     )
