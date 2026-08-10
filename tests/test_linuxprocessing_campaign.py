@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -37,7 +38,7 @@ REPORT_KEYS = frozenset(
 )
 
 FORBIDDEN_FRAGMENTS = (
-    "/home/bell",
+    "/home/",
     "/users/",
     "manifest:",
     "receipt body:",
@@ -52,7 +53,7 @@ FORBIDDEN_FRAGMENTS = (
 def _run_stage(
     stage: str, trial_root: Path, monkeypatch, *extra: str
 ) -> tuple[int, Path]:
-    report_path = trial_root / "report.json"
+    report_path = trial_root / "reports" / "report.json"
     argv = [
         "linuxprocessing_campaign.py",
         "--trial-root",
@@ -246,6 +247,8 @@ class TestContainment:
     def test_report_path_must_be_under_trial_root(self, tmp_path, monkeypatch):
         trial = tmp_path / "trial"
         trial.mkdir()
+        # Path inside the trial root but outside reports/ must be rejected
+        # under the R1 evidence boundary (and an outside-trial path too).
         outside_report = tmp_path / "leaked.json"
         monkeypatch.setattr(
             sys,
@@ -418,7 +421,7 @@ class TestReportProjection:
         raw user input. An injection attempt must not appear verbatim."""
         trial = tmp_path / "trial"
         trial.mkdir()
-        report_path = trial / "r.json"
+        report_path = trial / "reports" / "r.json"
         monkeypatch.setattr(
             sys,
             "argv",
@@ -443,16 +446,16 @@ class TestReportProjection:
         ancestors. The report file must be 0600."""
         trial = tmp_path / "trial"
         trial.mkdir()
-        # Nest the report several levels deep under the trial root.
+        # Nest the report several levels deep under the reports/ evidence root.
         _, report_path = _run_stage_custom(
             "g0",
             trial,
-            "nested/deep/report.json",
+            "reports/nested/deep/report.json",
             monkeypatch,
             "--ack-t0-ssh",
             "--ack-image-digest",
         )
-        _assert_all_dirs_0700(trial / "nested")
+        _assert_all_dirs_0700(trial / "reports" / "nested")
         assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
 
 
@@ -758,7 +761,10 @@ class TestSelfScan:
         """The self-scan must catch a directory with mode != 0700."""
         trial = tmp_path / "trial"
         trial.mkdir()
-        bad_dir = trial / "loose"
+        reports = trial / "reports"
+        reports.mkdir()
+        reports.chmod(0o700)
+        bad_dir = reports / "loose"
         bad_dir.mkdir()
         # Explicitly chmod to defeat umask and plant a too-open dir.
         bad_dir.chmod(0o755)
@@ -777,8 +783,11 @@ class TestSelfScan:
         """The self-scan must fail closed on a stat/read error, not skip."""
         trial = tmp_path / "trial"
         trial.mkdir()
+        reports = trial / "reports"
+        reports.mkdir()
+        reports.chmod(0o700)
         # Plant a file then remove permissions to read it.
-        bad = trial / "unreadable.json"
+        bad = reports / "unreadable.json"
         bad.write_text("{}")
         bad.chmod(0o000)
         try:
@@ -877,7 +886,7 @@ class TestSkeleton:
         trial = tmp_path / "trial"
         trial.mkdir()
         _run_stage("g0", trial, monkeypatch, "--ack-t0-ssh", "--ack-image-digest")
-        report_path = trial / "report.json"
+        report_path = trial / "reports" / "report.json"
         assert stat.S_IMODE(report_path.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
 
@@ -898,7 +907,7 @@ class TestSkeleton:
     def test_unknown_error_is_static_and_content_free(self, tmp_path, monkeypatch):
         trial = tmp_path / "trial"
         trial.mkdir()
-        report_path = trial / "r.json"
+        report_path = trial / "reports" / "r.json"
 
         def _boom(*_a, **_kw):
             raise RuntimeError("secret path /home/bell leaked")
@@ -1054,7 +1063,10 @@ class TestG6CheckpointsAndScan:
     def test_g6_self_scan_detects_canary(self, tmp_path, monkeypatch):
         trial = tmp_path / "trial"
         trial.mkdir()
-        bad = trial / "canary.json"
+        reports = trial / "reports"
+        reports.mkdir()
+        reports.chmod(0o700)
+        bad = reports / "canary.json"
         bad.write_text('{"token": "api_key=sk-canaryleak0123456789"}')
         bad.chmod(0o600)
         code, _ = _run_stage(
@@ -1065,3 +1077,48 @@ class TestG6CheckpointsAndScan:
             "--ack-hermes-smoke",
         )
         assert code == 1
+
+    def test_report_path_must_be_under_reports_dir(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        report = trial / "outside-reports" / "report.json"
+        exit_code, _ = _run_stage_custom(
+            "g0", trial, "outside-reports/report.json", monkeypatch, *_ack_all()
+        )
+        assert exit_code == lpc.EXIT_FAIL
+        assert not report.exists()
+
+    def test_g6_rejects_home_canary_in_evidence(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        evidence = trial / "reports"
+        evidence.mkdir()
+        (evidence / "canary.json").write_text("/home/canary", encoding="utf-8")
+        os.chmod(evidence / "canary.json", 0o600)
+        exit_code, report = _run_stage("g6", trial, monkeypatch, *_ack_all())
+        assert exit_code == lpc.EXIT_FAIL
+        assert _read_report(report)["checks"]["self_scan"]["reason_code"] == "canary_content"
+
+    def test_g6_ignores_home_canary_outside_evidence(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        metadata = trial / "venv" / "direct_url.json"
+        metadata.parent.mkdir()
+        metadata.write_text("/home/canary", encoding="utf-8")
+        os.chmod(metadata, 0o600)
+        monkeypatch.setattr(lpc, "_FORBIDDEN_FRAGMENTS", ("/home/",))
+        exit_code, _ = _run_stage("g6", trial, monkeypatch, *_ack_all())
+        assert exit_code == lpc.EXIT_PASS
+
+    def test_g6_rejects_symlink_in_reports_tree(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        reports = trial / "reports"
+        reports.mkdir()
+        outside = trial / "outside.json"
+        outside.write_text("safe", encoding="utf-8")
+        os.chmod(outside, 0o600)
+        (reports / "link.json").symlink_to(outside)
+        exit_code, report = _run_stage("g6", trial, monkeypatch, *_ack_all())
+        assert exit_code == lpc.EXIT_FAIL
+        assert _read_report(report)["checks"]["self_scan"]["reason_code"] == "scan_read_error"

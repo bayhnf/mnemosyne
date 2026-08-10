@@ -368,7 +368,7 @@ def assert_content_free(report: dict) -> None:
         "api_key=",
         "<analysis>",
         "APPROVAL RECEIPT:",
-        "/home/bell",
+        "/home/",
     ):
         assert forbidden not in blob, f"report leaked: {forbidden!r}"
 
@@ -809,6 +809,6 @@ def test_trial_reports_contain_no_content_or_secrets(tmp_path, monkeypatch):
         "api_key=",
         "<analysis>",
         "APPROVAL RECEIPT:",
-        "/home/bell",
+        "/home/",
     ):
         assert forbidden not in blob

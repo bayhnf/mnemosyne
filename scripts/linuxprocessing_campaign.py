@@ -255,7 +255,7 @@ _SELF_SCAN_REASON_CODES = frozenset(
 
 # Fragments that must NEVER appear in a serialized report.
 _FORBIDDEN_FRAGMENTS = (
-    "/home/bell",
+    "/home/",
     "/users/",
     "manifest:",
     "receipt body:",
@@ -320,9 +320,14 @@ def _safe_source_db(source_db: Path, trial_root: Path) -> Path | None:
 
 
 def _safe_report_path(report_path: Path, trial_root: Path) -> Path | None:
-    """Return the report path only if it is contained under the trial root."""
+    """Return the report path only if it is a strict descendant of
+    ``<trial_root>/reports/`` (R1 evidence boundary). Rejects the reports
+    root itself, paths outside it, and symlink escapes."""
+    reports_root = Path(trial_root) / "reports"
     report_path = Path(report_path)
-    if not _contained_under(report_path, trial_root):
+    if not _contained_under(report_path, reports_root):
+        return None
+    if _resolve(report_path) == _resolve(reports_root):
         return None
     return report_path
 
@@ -1343,16 +1348,31 @@ def _is_text_artifact(path: Path) -> bool:
 
 
 def _self_scan(trial_root: Path) -> tuple[str, str]:
-    """Scan trial tree: every dir must be 0700, every file 0600, text
-    artifacts must not contain forbidden fragments or internal error classes.
-    Fail closed on stat/read errors (High 3)."""
-    root = Path(trial_root)
+    """Scan the ``<trial_root>/reports/`` evidence tree: every dir must be
+    0700, every file 0600, text artifacts must not contain forbidden fragments
+    or internal error classes, and no entry may be a symlink. A missing reports
+    tree is empty evidence (ok); fail closed on a symlinked/non-dir root, any
+    symlink in the tree, or stat/read errors (R1, High 3)."""
+    root = Path(trial_root) / "reports"
+    # Fail closed if the evidence root is itself a symlink or a non-directory.
+    # A missing reports/ tree is simply empty evidence (scan ok).
+    try:
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            return FAIL, "scan_read_error"
+    except OSError:
+        return FAIL, "scan_read_error"
     bad_modes: list[str] = []
     canary_hits: list[str] = []
 
     for path in root.rglob("*"):
         if not path.is_file() and not path.is_dir():
             continue
+        # R1: every symlink in the evidence tree fails closed.
+        try:
+            if path.is_symlink():
+                return FAIL, "scan_read_error"
+        except OSError:
+            return FAIL, "scan_read_error"
         try:
             mode = stat.S_IMODE(path.stat().st_mode)
         except OSError:
@@ -2021,8 +2041,9 @@ def main(argv: list[str] | None = None) -> int:
     started = _utcnow_ms()
     started_at = _now_iso()
 
-    # Critical 1: report path must be contained under trial root.
-    if not _contained_under(Path(args.report), Path(args.trial_root)):
+    # Critical 1 / R1: report path must be a strict descendant of
+    # <trial_root>/reports/.
+    if _safe_report_path(Path(args.report), Path(args.trial_root)) is None:
         return EXIT_FAIL
     # Critical 3: static stage token, never raw user input.
     static = _static_stage(stage)
