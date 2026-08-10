@@ -1666,10 +1666,19 @@ def _dream_run_projection(run) -> dict:
     raw_actions = getattr(run, "actions", None)
     if isinstance(raw_actions, list):
         action_count = len(raw_actions)
+    # Whitelist scope to the public provenance contract only. Dream core
+    # preserves unknown scope keys, so an SDK caller could persist
+    # scope={'content':'SECRET',...} — the projection must never echo those.
+    _raw_scope = getattr(run, "scope", {}) or {}
+    _SCOPE_KEYS = ("session_id", "actor_id", "producer", "project_id")
+    safe_scope = {
+        k: _raw_scope[k] for k in _SCOPE_KEYS
+        if _raw_scope.get(k) not in (None, "")
+    }
     return {
         "run_id": run.run_id,
         "state": run.state,
-        "scope": getattr(run, "scope", {}) or {},
+        "scope": safe_scope,
         "manifest_hash": getattr(run, "manifest_hash", "") or "",
         "checkpoint": getattr(run, "checkpoint", "") or "",
         "error_code": getattr(run, "error_code", None),

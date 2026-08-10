@@ -101,10 +101,15 @@ def vec_ready(monkeypatch):
 
 
 def run_cli(args, tmp_path):
-    """Run the CLI in a subprocess with an isolated data dir."""
+    """Run the CLI in a subprocess with an isolated data dir.
+
+    Removes inherited MNEMOSYNE_BANK so every test is deterministic
+    (defaults to the 'default' bank in the throwaway data dir).
+    """
     env = os.environ.copy()
     env["HOME"] = str(tmp_path / "home")
     env["MNEMOSYNE_DATA_DIR"] = str(tmp_path / "mnemosyne-data")
+    env.pop("MNEMOSYNE_BANK", None)
     return subprocess.run(
         [sys.executable, "-m", "mnemosyne.cli", *args],
         text=True,
@@ -803,3 +808,173 @@ class TestCLIHelpDiscoverability:
         for cmd in ("ingest", "ingest-status", "ingest-retry",
                      "reclaim-orphans", "dream"):
             assert cmd in r.stdout, f"'{cmd}' missing from --help output"
+
+
+# ===========================================================================
+# Task 6A fix round 2: scope whitelist + populated projection + determinism
+# ===========================================================================
+
+
+class TestDreamScopeWhitelist:
+    """P2: projection scope must be filtered to public provenance keys only.
+
+    Dream core preserves unknown scope keys, so a run created via SDK with
+    scope={'content':'TOP-SECRET-MEMORY',...} would leak through dream status
+    --json unless the projection whitelists.
+    """
+
+    _MALICIOUS_SCOPE = {
+        "session_id": "scope-test-sess",
+        "actor_id": "actor-1",
+        "producer": "codex",
+        "project_id": "proj-1",
+        "content": "TOP-SECRET-MEMORY",
+        "query": "secret-query-data",
+        "config": {"model": "gpt-4", "api_key": "sk-leaked"},
+    }
+
+    def _seed_run_with_malicious_scope(self, tmp_path):
+        """Create a Dream run via SDK with extra scope keys, return run_id."""
+        data_dir = tmp_path / "mnemosyne-data"
+        db_path = data_dir / "mnemosyne.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        from mnemosyne.core.beam import BeamMemory
+        from mnemosyne.core import dream
+        beam = BeamMemory(session_id="scope-test-sess", db_path=db_path)
+        run = dream.dream_plan(beam, scope=dict(self._MALICIOUS_SCOPE))
+        beam.conn.close()
+        return run.run_id
+
+    def test_status_json_filters_scope_to_whitelist(self, tmp_path):
+        run_id = self._seed_run_with_malicious_scope(tmp_path)
+        r = run_cli(["dream", "status", "--run-id", run_id, "--json"], tmp_path)
+        assert r.returncode == 0, r.stderr
+        payload = json.loads(r.stdout)
+        scope = payload.get("scope", {})
+        # Only public provenance keys allowed.
+        allowed = {"session_id", "actor_id", "producer", "project_id"}
+        assert set(scope.keys()) <= allowed, (
+            f"scope has non-whitelisted keys: {set(scope.keys()) - allowed}"
+        )
+        # Malicious keys must NOT appear anywhere in the output.
+        raw = r.stdout
+        assert "TOP-SECRET-MEMORY" not in raw
+        assert "secret-query-data" not in raw
+        assert "sk-leaked" not in raw
+
+    def test_plan_json_filters_scope_to_whitelist(self, tmp_path):
+        """Even dream plan --json must not echo untrusted scope keys."""
+        # Plan via CLI with a session-id; the projection scope should only
+        # contain whitelisted keys. We verify the session_id is present and
+        # no unexpected keys appear.
+        r = run_cli(
+            ["dream", "plan", "--session-id", "wl-sess",
+             "--actor-id", "wl-actor", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        payload = json.loads(r.stdout)
+        scope = payload.get("scope", {})
+        allowed = {"session_id", "actor_id", "producer", "project_id"}
+        assert set(scope.keys()) <= allowed, (
+            f"scope has non-whitelisted keys: {set(scope.keys()) - allowed}"
+        )
+
+
+class TestDreamPopulatedProjection:
+    """Test-hygiene: exercise a populated run, not only terminal no-candidate.
+
+    Prove that an actual non-empty plan + review + verify JSON remains
+    content-free (no manifest/actions/images/raw receipts) even when the run
+    carries real actions and receipts.
+    """
+
+    def _seed_proposals(self, tmp_path):
+        env = os.environ.copy()
+        env["HOME"] = str(tmp_path / "home")
+        data_dir = tmp_path / "mnemosyne-data"
+        env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+        db_path = data_dir / "mnemosyne.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        from mnemosyne.core.beam import BeamMemory
+        from mnemosyne.core.shmr import _init_schema, PROPOSAL_SCHEMA_SQL
+        beam = BeamMemory(session_id="pop-proj-sess", db_path=db_path)
+        _init_schema(beam.conn)
+        beam.conn.executescript(PROPOSAL_SCHEMA_SQL)
+        for fid, subj, pred, obj in (
+            ("pf1", "alice", "likes", "rust lang"),
+            ("pf2", "alice", "likes", "rust programming"),
+        ):
+            beam.conn.execute(
+                "INSERT INTO facts "
+                "(fact_id, session_id, subject, predicate, object, confidence) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (fid, "pop-proj-sess", subj, pred, obj, 0.9),
+            )
+        beam.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("pop-run", "pc1", "pop-proj-sess",
+             json.dumps({"session_id": "pop-proj-sess"}),
+             json.dumps(["pf1", "pf2"]),
+             "alice", "prefers", "rust", 0.9, "create",
+             "pf1", "seeded", "proposed"),
+        )
+        beam.conn.commit()
+        beam.conn.close()
+
+    def test_populated_plan_json_content_free(self, tmp_path):
+        self._seed_proposals(tmp_path)
+        r = run_cli(
+            ["dream", "plan", "--session-id", "pop-proj-sess", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        payload = json.loads(r.stdout)
+        assert payload["state"] == "awaiting_approval"
+        assert payload["action_count"] >= 1
+        assert payload["manifest_hash"]
+        for forbidden in ("manifest", "actions", "receipts", "before_image",
+                          "after_image", "content", "config"):
+            assert forbidden not in payload, (
+                f"populated plan --json leaks '{forbidden}'"
+            )
+
+    def test_populated_review_verify_json_content_free(self, tmp_path):
+        self._seed_proposals(tmp_path)
+        r = run_cli(
+            ["dream", "plan", "--session-id", "pop-proj-sess", "--json"],
+            tmp_path,
+        )
+        run_id = json.loads(r.stdout)["run_id"]
+
+        r = run_cli(
+            ["dream", "review", "--run-id", run_id, "--actor-id", "revA",
+             "--verdict", "PASS", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        review_payload = json.loads(r.stdout)
+        assert review_payload["state"] == "awaiting_approval"
+        # After review, receipt_counts should show reviewer:PASS.
+        assert review_payload.get("receipt_counts", {}).get("reviewer:PASS", 0) >= 1
+        for forbidden in ("manifest", "actions", "receipts", "before_image",
+                          "after_image", "content", "config"):
+            assert forbidden not in review_payload
+
+        r = run_cli(
+            ["dream", "verify", "--run-id", run_id, "--actor-id", "verB",
+             "--verdict", "PASS", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        verify_payload = json.loads(r.stdout)
+        assert verify_payload["state"] == "ready"
+        assert verify_payload.get("receipt_counts", {}).get("verifier:PASS", 0) >= 1
+        for forbidden in ("manifest", "actions", "receipts", "before_image",
+                          "after_image", "content", "config"):
+            assert forbidden not in verify_payload
