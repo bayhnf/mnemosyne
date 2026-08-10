@@ -963,3 +963,214 @@ class TestDreamPopulatedProjection:
         for forbidden in ("manifest", "actions", "receipts", "before_image",
                           "after_image", "content", "config"):
             assert forbidden not in verify_payload
+
+
+# ===========================================================================
+# I-4: Dream mutation failures must signal failure (exit code + error code)
+# ===========================================================================
+
+
+class TestDreamFailureSignaling:
+    """Audit I-4: failed apply/resume/undo must not look like success.
+
+    A failed mutation must (a) exit non-zero, (b) surface a safe error_code
+    (no manifest/action/before-image/private content), and (c) emit the
+    structured projection on --json. Successful and explicit idempotent
+    terminal cases retain their existing behavior.
+
+    The common root cause: apply/resume/undo exit 0 on retryable/terminal
+    failures. The unifying failure signal is ``error_code is not None``.
+    """
+
+    # JSON keys that must NEVER appear in the curated projection.
+    _FORBIDDEN_KEYS = (
+        "manifest", "actions", "receipts", "before_image", "after_image",
+        "content", "config", "scope", "failure_reason",
+    )
+
+    def _assert_no_content_leak(self, run_result, *, private_reason):
+        """Assert the curated projection leaks no private content.
+
+        Checks both stdout and stderr: the structured projection must carry
+        only safe identifiers/state/error_code, never the unbounded
+        ``failure_reason`` (which may contain DB error text or row detail),
+        never raw manifest/actions/images, and never the seeded private
+        detail string.
+        """
+        # The private failure_reason text must never reach the CLI surface.
+        for stream in (run_result.stdout, run_result.stderr):
+            assert private_reason not in stream, (
+                f"CLI output leaks private failure_reason: {private_reason!r}"
+            )
+        # If JSON was emitted, forbidden keys must be absent.
+        stripped = run_result.stdout.strip()
+        if stripped.startswith("{"):
+            payload = json.loads(stripped)
+            for bad in self._FORBIDDEN_KEYS:
+                assert bad not in payload, (
+                    f"projection leaks forbidden key '{bad}': {payload!r}"
+                )
+
+    def _seed_run(self, tmp_path, run_id, state, *,
+                  error_code=None, failure_reason=None,
+                  checkpoint="applied", failing_undo=False):
+        """Seed a dream_run row directly in a given durable state.
+
+        ``failing_undo=True`` seeds an applied run whose sole action has a
+        malformed ``after_image`` so ``dream_undo`` raises inside its
+        transaction and leaves the run at ``applied`` with
+        ``error_code=integrity_failure`` — the exact I-4 undo-failure shape.
+        """
+        data_dir = tmp_path / "mnemosyne-data"
+        db_path = data_dir / "mnemosyne.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        from mnemosyne.core.beam import BeamMemory
+        from mnemosyne.core import dream
+        beam = BeamMemory(session_id="i4-sess", db_path=db_path)
+        dream._init_dream_schema(beam.conn)
+        beam.conn.execute(
+            "INSERT INTO dream_runs (run_id, request_id, state, scope_json, "
+            "manifest_hash, semantic_hash, checkpoint, error_code, "
+            "failure_reason, enrichment_pending, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, "req-" + run_id, state, "{}", "h-" + run_id, "sh",
+             checkpoint, error_code, failure_reason, 0,
+             "2026-08-10T00:00:00Z", "2026-08-10T00:00:00Z"),
+        )
+        if failing_undo:
+            beam.conn.execute(
+                "INSERT INTO dream_actions (run_id, seq, source_table, "
+                "source_id, source_hash, source_producer, action, "
+                "target_json, before_image, after_image, applied, undone) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, 1, "facts", "f1", "hh", "p", "create", "{}",
+                 None, "{NOT VALID JSON", 1, 0),
+            )
+        beam.conn.commit()
+        beam.conn.close()
+        return db_path
+
+    # --- failed_retryable apply must exit non-zero + show error_code ------
+
+    def test_apply_failed_retryable_exits_nonzero_json(self, tmp_path):
+        self._seed_run(tmp_path, "i4-retryable", "failed_retryable",
+                       error_code="database_busy",
+                       failure_reason="db is locked")
+        r = run_cli(["dream", "apply", "--run-id", "i4-retryable", "--json"],
+                    tmp_path)
+        assert r.returncode != 0, (
+            f"failed_retryable apply must exit non-zero: {r.returncode}\n"
+            f"stdout={r.stdout}\nstderr={r.stderr}"
+        )
+        self._assert_no_content_leak(r, private_reason="db is locked")
+        payload = json.loads(r.stdout)
+        # dream_apply from a terminal state surfaces validation_failed; the
+        # key I-4 contract is that an error_code IS set and exit is non-zero.
+        assert payload.get("error_code") is not None
+        assert payload.get("state") in ("failed_retryable", "rejected")
+
+    def test_apply_failed_retryable_exits_nonzero_text(self, tmp_path):
+        self._seed_run(tmp_path, "i4-retryable-text", "failed_retryable",
+                       error_code="database_busy",
+                       failure_reason="db is locked")
+        r = run_cli(["dream", "apply", "--run-id", "i4-retryable-text"],
+                    tmp_path)
+        assert r.returncode != 0, (
+            f"failed_retryable apply (text) must exit non-zero: "
+            f"{r.returncode}"
+        )
+        # Plain-text path must surface a safe error code (the specific code
+        # depends on core state-machine resolution; the I-4 contract is that
+        # SOME structured error code is printed).
+        assert "error:" in r.stdout or "error:" in r.stderr
+        self._assert_no_content_leak(r, private_reason="db is locked")
+
+    # --- failed undo must exit non-zero + show error_code -----------------
+
+    def test_undo_failed_exits_nonzero_json(self, tmp_path):
+        # Seed an applied run whose undo will fail inside its transaction
+        # (malformed after_image) and leave error_code=integrity_failure.
+        self._seed_run(tmp_path, "i4-undo-fail", "applied",
+                       failing_undo=True)
+        r = run_cli(["dream", "undo", "--run-id", "i4-undo-fail", "--json"],
+                    tmp_path)
+        assert r.returncode != 0, (
+            f"undo on a run carrying an error_code must exit non-zero: "
+            f"{r.returncode}\nstdout={r.stdout}\nstderr={r.stderr}"
+        )
+        # The raw JSON parser error (unbounded text) must NOT be printed.
+        self._assert_no_content_leak(r, private_reason="NOT VALID JSON")
+        payload = json.loads(r.stdout)
+        assert payload.get("error_code") == "integrity_failure"
+
+    def test_undo_failed_exits_nonzero_text(self, tmp_path):
+        self._seed_run(tmp_path, "i4-undo-fail-text", "applied",
+                       failing_undo=True)
+        r = run_cli(["dream", "undo", "--run-id", "i4-undo-fail-text"],
+                    tmp_path)
+        assert r.returncode != 0, (
+            f"undo (text) on a failed run must exit non-zero: {r.returncode}"
+        )
+        assert "integrity_failure" in r.stdout or "integrity_failure" in r.stderr
+        self._assert_no_content_leak(r, private_reason="NOT VALID JSON")
+
+    # --- failed resume must exit non-zero + show error_code ---------------
+
+    def test_resume_failed_exits_nonzero_json(self, tmp_path):
+        # stale_manifest is NOT retried by resume (returns the run as-is);
+        # the CLI must surface that as a failure.
+        self._seed_run(tmp_path, "i4-resume-stale", "failed_retryable",
+                       error_code="stale_manifest",
+                       failure_reason="source hash mismatch",
+                       checkpoint="applied")
+        r = run_cli(["dream", "resume", "--run-id", "i4-resume-stale", "--json"],
+                    tmp_path)
+        assert r.returncode != 0, (
+            f"resume ending in failure must exit non-zero: {r.returncode}\n"
+            f"stdout={r.stdout}\nstderr={r.stderr}"
+        )
+        self._assert_no_content_leak(r, private_reason="source hash mismatch")
+        payload = json.loads(r.stdout)
+        assert payload.get("error_code") is not None
+
+    def test_resume_failed_exits_nonzero_text(self, tmp_path):
+        self._seed_run(tmp_path, "i4-resume-stale-text", "failed_retryable",
+                       error_code="stale_manifest",
+                       failure_reason="source hash mismatch",
+                       checkpoint="applied")
+        r = run_cli(["dream", "resume", "--run-id", "i4-resume-stale-text"],
+                    tmp_path)
+        assert r.returncode != 0, (
+            f"resume (text) ending in failure must exit non-zero: "
+            f"{r.returncode}"
+        )
+        assert "stale_manifest" in r.stdout or "stale_manifest" in r.stderr
+        self._assert_no_content_leak(r, private_reason="source hash mismatch")
+
+    # --- success / idempotent / explicit-terminal compatibility -----------
+
+    def test_apply_unknown_run_exits_nonzero(self, tmp_path):
+        # 'rejected' with validation_failed (run not found) — already exits
+        # non-zero for apply; keep that behavior.
+        r = run_cli(["dream", "apply", "--run-id", "no-such-run", "--json"],
+                    tmp_path)
+        assert r.returncode != 0
+        payload = json.loads(r.stdout)
+        assert payload.get("error_code") == "validation_failed"
+
+    def test_undo_already_undone_idempotent_exits_zero(self, tmp_path):
+        # Idempotent second undo: state=undone, NO error_code (only a benign
+        # failure_reason='already_undone'). Must remain exit 0.
+        self._seed_run(tmp_path, "i4-idempotent", "undone",
+                       error_code=None,
+                       failure_reason="already_undone",
+                       checkpoint="undone")
+        r = run_cli(["dream", "undo", "--run-id", "i4-idempotent", "--json"],
+                    tmp_path)
+        assert r.returncode == 0, (
+            f"idempotent undo must exit 0: {r.returncode}\n"
+            f"stdout={r.stdout}\nstderr={r.stderr}"
+        )
+        payload = json.loads(r.stdout)
+        assert payload.get("state") == "undone"
+        assert payload.get("error_code") is None

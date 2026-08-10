@@ -1682,6 +1682,29 @@ def _dream_run_projection(run) -> dict:
     }
 
 
+def _dream_emit_and_exit(run, *, label: str, json_output: bool) -> None:
+    """Emit a Dream mutation result and exit non-zero on failure.
+
+    Unified I-4 failure signaling for dream apply/resume/undo: a run whose
+    durable ``error_code`` is set is a failure regardless of state taxonomy
+    (covers failed_retryable, failed_terminal, rejected, and a failed undo
+    that leaves the run at ``applied`` with an error_code). The JSON
+    projection already carries ``error_code``; the text path prints it. No
+    ``failure_reason`` (unbounded, may contain private detail) is ever
+    printed. Idempotent terminal cases that carry only a benign
+    ``failure_reason`` (e.g. ``already_undone``) and no ``error_code``
+    remain exit 0.
+    """
+    if json_output:
+        print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
+    else:
+        print(f"Dream {label}: run_id={run.run_id} state={run.state}")
+        if run.error_code:
+            print(f"  error: {run.error_code}")
+    if run.error_code:
+        raise SystemExit(1)
+
+
 _INGEST_USAGE = (
     "Usage: mnemosyne ingest --event-id ID --producer P --actor-id A "
     "--project-id P --session-id S --turn-id T --role R --content C "
@@ -2237,10 +2260,7 @@ def cmd_dream(args):
         if not run_id:
             _fail("--run-id is required for dream resume")
         run = mem.dream_resume(run_id)
-        if json_output:
-            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
-        else:
-            print(f"Dream resume: run_id={run.run_id} state={run.state}")
+        _dream_emit_and_exit(run, label="resume", json_output=json_output)
 
     elif sub == "apply":
         run_id = None
@@ -2258,12 +2278,7 @@ def cmd_dream(args):
         if not run_id:
             _fail("--run-id is required for dream apply")
         run = mem.dream_apply(run_id)
-        if json_output:
-            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
-        else:
-            print(f"Dream apply: run_id={run.run_id} state={run.state}")
-        if run.state in ("failed_terminal", "rejected"):
-            raise SystemExit(1)
+        _dream_emit_and_exit(run, label="apply", json_output=json_output)
 
     elif sub == "undo":
         run_id = None
@@ -2281,10 +2296,7 @@ def cmd_dream(args):
         if not run_id:
             _fail("--run-id is required for dream undo")
         run = mem.dream_undo(run_id)
-        if json_output:
-            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
-        else:
-            print(f"Dream undo: run_id={run.run_id} state={run.state}")
+        _dream_emit_and_exit(run, label="undo", json_output=json_output)
 
 
 
