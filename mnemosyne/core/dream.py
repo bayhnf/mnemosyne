@@ -629,28 +629,92 @@ def _validate_and_snapshot_action(
 ELIGIBLE_PROPOSAL_STATUSES = ("proposed",)
 
 
-def _scope_matches(proposal_scope: Dict[str, Any], plan_scope: Dict[str, Any]) -> bool:
-    """Strict scope-provenance match.
+# Alias map between the public Dream scope contract and Task-4 ``scope_json``
+# storage fields. Task-4 ``_scope_from_row`` (shmr.py:659-670) persists
+# ``session_id``, ``author_id``, ``author_type``, ``channel_id``; the public
+# Dream scope contract uses ``session_id``, ``actor_id``, ``producer``,
+# ``project_id``. These are the same logical fields under different names.
+# We normalize both sides to the canonical (public) name at the trust
+# boundary before comparing, so a mismatch on ANY logical field rejects.
+_SCOPE_ALIASES = {
+    # canonical public name -> tuple of all known aliases (including itself)
+    "actor_id": ("actor_id", "author_id"),
+    "producer": ("producer", "author_type"),
+    "project_id": ("project_id", "channel_id"),
+}
 
-    A proposal is eligible only if its explicit provenance fields (actor_id,
-    author_type, channel_id) match the plan scope, OR the proposal carries no
-    explicit provenance and the plan asserts none either. This prevents
-    cross-actor/project leakage: a proposal whose ``scope_json.actor_id`` is
-    ``"other"`` is never planned under a scope that asserts ``"my-actor"``.
+
+def _normalize_scope(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a raw scope dict to canonical logical field names.
+
+    ``session_id`` is always passed through (exact match, no alias). For the
+    three provenance fields, the first non-null value among the canonical name
+    and its Task-4 storage aliases wins, recorded under the canonical name.
+    Fields not in the alias map are preserved verbatim so future fields are
+    not silently dropped.
     """
-    for key in ("actor_id", "author_type", "channel_id"):
-        p_val = proposal_scope.get(key)
-        plan_val = plan_scope.get(key)
+    out: Dict[str, Any] = {}
+    sid = raw.get("session_id")
+    if sid is not None:
+        out["session_id"] = sid
+    for canonical, aliases in _SCOPE_ALIASES.items():
+        for alias in aliases:
+            val = raw.get(alias)
+            if val is not None and val != "":
+                out[canonical] = val
+                break
+    # Preserve any non-alias fields verbatim (forward compatibility).
+    known = {"session_id"}
+    for aliases in _SCOPE_ALIASES.values():
+        known.update(aliases)
+    for k, v in raw.items():
+        if k not in known and v is not None:
+            out.setdefault(k, v)
+    return out
+
+
+def _scope_matches(proposal_scope_raw: Dict[str, Any],
+                   plan_scope_raw: Dict[str, Any]) -> bool:
+    """Strict logical-field scope-provenance match.
+
+    Both sides are normalized to canonical names (``actor_id``,
+    ``producer``, ``project_id``) via :func:`_normalize_scope` before
+    comparison. A proposal is eligible only if, for every logical provenance
+    field, either both sides declare the same value, or neither side declares
+    it. If either side declares a field the other does not match/declare,
+    the proposal is rejected. ``session_id`` is always required and exact.
+    """
+    proposal = _normalize_scope(proposal_scope_raw)
+    plan = _normalize_scope(plan_scope_raw)
+    for canonical in _SCOPE_ALIASES:
+        p_val = proposal.get(canonical)
+        plan_val = plan.get(canonical)
         if p_val is not None and plan_val is not None and p_val != plan_val:
             return False
-        # If the proposal declares a provenance field the plan does not, and
-        # the plan is selective (asserts some provenance), treat as mismatch.
-        if p_val is not None and plan_val is None:
-            # The plan did not assert this field; only mismatch if the plan
-            # asserts any provenance at all (selective plan).
-            if any(plan_scope.get(k) is not None
-                   for k in ("actor_id", "author_type", "channel_id")):
-                return False
+        # If EITHER side declares this field and the other does not, reject.
+        # This is stricter than the old "both-declared" check: a proposal
+        # that declares author_id='x' must not be planned under a scope that
+        # asserts no actor_id (and vice versa).
+        if (p_val is None) != (plan_val is None):
+            # Exception: if the plan asserts NO provenance at all (a bare
+            # session-only scope), allow proposals that declare provenance --
+            # the plan is non-selective. This preserves the common path where
+            # a plan does not filter by actor/producer/project.
+            plan_is_selective = any(
+                plan.get(c) is not None for c in _SCOPE_ALIASES
+            )
+            proposal_is_selective = any(
+                proposal.get(c) is not None for c in _SCOPE_ALIASES
+            )
+            if plan_is_selective or proposal_is_selective:
+                # Only reject if the SELECTIVE side declares this specific
+                # field and the other does not. A non-selective plan with a
+                # selective proposal field is allowed only when the plan
+                # asserts nothing at all.
+                if plan_is_selective and p_val is not None:
+                    return False
+                if proposal_is_selective and plan_val is not None:
+                    return False
     return True
 
 
@@ -752,79 +816,135 @@ def dream_plan(beam, scope: Dict[str, Any], limits: Optional[Dict[str, Any]] = N
     now = _now_iso()
     run_id = str(uuid.uuid4())
 
-    # Insert the run row in planning first so partial failures still leave a
-    # durable, terminal run record rather than vanishing silently.
-    conn.execute(
-        "INSERT INTO dream_runs "
-        "(run_id, request_id, state, scope_json, manifest_json, manifest_hash, "
-        "semantic_hash, checkpoint, error_code, failure_reason, "
-        "enrichment_pending, created_at, updated_at) "
-        "VALUES (?, ?, 'planning', ?, '{}', '', '', '', NULL, NULL, 0, ?, ?)",
-        (run_id, request_id, _canonical_json(scope), now, now),
-    )
-    conn.commit()
+    # I6-B: the ENTIRE gather + claim + run/action persistence happens inside
+    # ONE BEGIN IMMEDIATE transaction (serialized via _deferred_commits). This
+    # closes the TOCTOU window: a concurrent dream_plan on another connection
+    # blocks on BEGIN IMMEDIATE until this transaction commits, so two plans
+    # can never both SELECT the same 'proposed' proposal and both claim it.
+    # The claim UPDATE additionally has a CAS guard (status='proposed') +
+    # row-count validation as defense-in-depth.
+    try:
+        with _deferred_commits(conn):
+            conn.execute("BEGIN IMMEDIATE")
 
-    actions, consumed_ids = _gather_actions(beam, scope)
+            actions, consumed_ids = _gather_actions(beam, scope)
 
-    if not actions:
-        err = "no_candidates"
+            if not actions:
+                # No eligible proposals. Persist a terminal run so the caller
+                # has a durable structured result.
+                conn.execute(
+                    "INSERT INTO dream_runs "
+                    "(run_id, request_id, state, scope_json, manifest_json, "
+                    "manifest_hash, semantic_hash, checkpoint, error_code, "
+                    "failure_reason, enrichment_pending, created_at, updated_at) "
+                    "VALUES (?, ?, 'rejected', ?, '{}', '', '', '', "
+                    "'no_candidates', NULL, 0, ?, ?)",
+                    (run_id, request_id, _canonical_json(scope), now,
+                     _now_iso()),
+                )
+                return _load_run(beam, run_id)  # type: ignore[return-value]
+
+            bound_err = _enforce_bounds(actions, scope)
+            if bound_err is not None:
+                conn.execute(
+                    "INSERT INTO dream_runs "
+                    "(run_id, request_id, state, scope_json, manifest_json, "
+                    "manifest_hash, semantic_hash, checkpoint, error_code, "
+                    "failure_reason, enrichment_pending, created_at, updated_at) "
+                    "VALUES (?, ?, 'rejected', ?, '{}', '', '', '', "
+                    "?, NULL, 0, ?, ?)",
+                    (run_id, request_id, _canonical_json(scope), bound_err,
+                     now, _now_iso()),
+                )
+                return _load_run(beam, run_id)  # type: ignore[return-value]
+
+            # CAS claim: only claim proposals still in 'proposed' status. The
+            # BEGIN IMMEDIATE write lock serializes concurrent plans, but the
+            # CAS guard + row-count check is defense-in-depth for any path
+            # that claims outside this transaction. If a competitor claimed
+            # first (or the proposal was rolled_back between gather and
+            # claim), the row count will be less than expected -> no_candidates.
+            if consumed_ids:
+                placeholders = ",".join("?" for _ in consumed_ids)
+                cursor = conn.execute(
+                    f"UPDATE shmr_proposals SET status = 'dream_claimed' "
+                    f"WHERE proposal_id IN ({placeholders}) "
+                    f"AND status IN ("
+                    + ",".join("?" for _ in ELIGIBLE_PROPOSAL_STATUSES)
+                    + ")",
+                    tuple(consumed_ids) + tuple(ELIGIBLE_PROPOSAL_STATUSES),
+                )
+                if cursor.rowcount != len(consumed_ids):
+                    # A competitor claimed at least one proposal between our
+                    # gather and claim (or the proposal was concurrently
+                    # invalidated). Abort as no_candidates -- the caller can
+                    # re-plan once new proposals are available.
+                    conn.execute(
+                        "INSERT INTO dream_runs "
+                        "(run_id, request_id, state, scope_json, manifest_json, "
+                        "manifest_hash, semantic_hash, checkpoint, error_code, "
+                        "failure_reason, enrichment_pending, created_at, "
+                        "updated_at) "
+                        "VALUES (?, ?, 'rejected', ?, '{}', '', '', '', "
+                        "'no_candidates', 'proposal claimed by another run', "
+                        "0, ?, ?)",
+                        (run_id, request_id, _canonical_json(scope), now,
+                         _now_iso()),
+                    )
+                    return _load_run(beam, run_id)  # type: ignore[return-value]
+
+            config_snap = _config_snapshot()
+            manifest = _build_manifest(run_id, scope, actions, config_snap)
+            manifest_hash = manifest["manifest_hash"]
+
+            # Persist the run row + actions in the SAME transaction as the
+            # claim. A failure rolls everything back, leaving proposals
+            # eligible.
+            conn.execute(
+                "INSERT INTO dream_runs "
+                "(run_id, request_id, state, scope_json, manifest_json, "
+                "manifest_hash, semantic_hash, checkpoint, error_code, "
+                "failure_reason, enrichment_pending, created_at, updated_at) "
+                "VALUES (?, ?, 'awaiting_approval', ?, ?, ?, '', '', NULL, "
+                "NULL, 0, ?, ?)",
+                (run_id, request_id, _canonical_json(scope),
+                 _canonical_json(manifest), manifest_hash, now, _now_iso()),
+            )
+            for i, a in enumerate(actions):
+                conn.execute(
+                    "INSERT INTO dream_actions "
+                    "(run_id, seq, source_table, source_id, source_hash, "
+                    "source_producer, action, target_json, before_image, "
+                    "after_image, applied, undone) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0)",
+                    (
+                        run_id, i + 1, a["source_table"], a["source_id"],
+                        a["source_hash"], a.get("source_producer"),
+                        a["action"], _canonical_json(a["target"]),
+                    ),
+                )
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if "locked" in msg or "busy" in msg:
+            # A concurrent planner holds the write lock; surface a retryable
+            # structured failure rather than silently double-consuming.
+            code = "database_busy"
+            state = "failed_retryable"
+        else:
+            code = "integrity_failure"
+            state = "failed_terminal"
         conn.execute(
-            "UPDATE dream_runs SET state = ?, error_code = ?, updated_at = ? "
-            "WHERE run_id = ?",
-            ("rejected", err, _now_iso(), run_id),
+            "INSERT OR IGNORE INTO dream_runs "
+            "(run_id, request_id, state, scope_json, manifest_json, "
+            "manifest_hash, semantic_hash, checkpoint, error_code, "
+            "failure_reason, enrichment_pending, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, '{}', '', '', '', ?, ?, 0, ?, ?)",
+            (run_id, request_id, _canonical_json(scope), state, code,
+             str(exc), now, _now_iso()),
         )
         conn.commit()
         return _load_run(beam, run_id)  # type: ignore[return-value]
 
-    bound_err = _enforce_bounds(actions, scope)
-    if bound_err is not None:
-        conn.execute(
-            "UPDATE dream_runs SET state = ?, error_code = ?, updated_at = ? "
-            "WHERE run_id = ?",
-            ("rejected", bound_err, _now_iso(), run_id),
-        )
-        conn.commit()
-        return _load_run(beam, run_id)  # type: ignore[return-value]
-
-    config_snap = _config_snapshot()
-    manifest = _build_manifest(run_id, scope, actions, config_snap)
-    manifest_hash = manifest["manifest_hash"]
-
-    # I6: atomically claim the consumed proposals so a later plan (even under
-    # a different request_id) cannot reuse them. This mutates the proposal
-    # queue status only -- never source memory. The claim is in the SAME
-    # transaction as the run/actions insert, so a failure rolls both back and
-    # the proposals remain eligible.
-    placeholders = ",".join("?" for _ in consumed_ids)
-    if consumed_ids:
-        conn.execute(
-            f"UPDATE shmr_proposals SET status = 'dream_claimed' "
-            f"WHERE proposal_id IN ({placeholders})",
-            tuple(consumed_ids),
-        )
-
-    # Persist actions (without the bulky source_snapshot column, which lives
-    # only in the manifest JSON to bound row size).
-    for i, a in enumerate(actions):
-        conn.execute(
-            "INSERT INTO dream_actions "
-            "(run_id, seq, source_table, source_id, source_hash, "
-            "source_producer, action, target_json, before_image, after_image, "
-            "applied, undone) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0)",
-            (
-                run_id, i + 1, a["source_table"], a["source_id"],
-                a["source_hash"], a.get("source_producer"), a["action"],
-                _canonical_json(a["target"]),
-            ),
-        )
-
-    conn.execute(
-        "UPDATE dream_runs SET state = ?, manifest_json = ?, manifest_hash = ?, "
-        "updated_at = ? WHERE run_id = ?",
-        ("awaiting_approval", _canonical_json(manifest), manifest_hash,
-         _now_iso(), run_id),
-    )
-    conn.commit()
     return _load_run(beam, run_id)  # type: ignore[return-value]
 
 

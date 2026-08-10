@@ -1288,3 +1288,243 @@ class TestResumeDoesNotLoopOnStaleManifest:
         resumed = dream.dream_resume(beam, run.run_id)
         assert resumed.error_code == "stale_manifest"
         assert resumed.state != "applied"
+
+
+# ===========================================================================
+# Fix round 2 — I6: real scope-provenance mapping + concurrent claim CAS
+# ===========================================================================
+
+
+class TestI6RealScopeProvenanceAliases:
+    """I6-A: the scope matcher must compare LOGICAL fields using the real
+    Task-4 ``scope_json`` keys (``author_id``, ``author_type``,
+    ``channel_id``), aliased to the public Dream scope contract
+    (``actor_id``, ``producer``, ``project_id``). A plan must never select a
+    proposal whose declared provenance mismatches the plan scope."""
+
+    def _seed_proposal_with_scope(self, beam, proposal_scope_json: dict):
+        """Seed one shmr_proposals row with an explicit scope_json."""
+        shmr._init_proposal_schema(beam.conn)
+        _seed_facts(beam, [
+            {"fact_id": "fz1", "subject": "z", "predicate": "p",
+             "object": "zeta value one", "confidence": 0.9},
+        ])
+        beam.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "shmr_z", "cz", beam.session_id,
+                json.dumps(proposal_scope_json),
+                json.dumps(["fz1"]), "z", "p", "zeta", 0.9, "create", None,
+                "r", "proposed",
+            ),
+        )
+        beam.conn.commit()
+
+    def test_real_author_id_mismatch_rejected(self, beam):
+        """Proposal scope_json has ``author_id='other-actor'`` (the REAL
+        Task-4 field); plan scope has ``actor_id='my-actor'``. The alias
+        mapper must treat these as the same logical field and reject."""
+        self._seed_proposal_with_scope(
+            beam, {"session_id": beam.session_id, "author_id": "other-actor"}
+        )
+        run = dream.dream_plan(
+            beam,
+            scope={"session_id": beam.session_id, "actor_id": "my-actor"},
+        )
+        assert run.state == "rejected"
+        assert run.error_code == "no_candidates"
+        # Proposal must remain eligible (not claimed).
+        status = beam.conn.execute(
+            "SELECT status FROM shmr_proposals WHERE proposal_id = 1"
+        ).fetchone()
+        assert status is not None
+        assert status["status"] == "proposed"
+
+    def test_author_type_channel_id_mismatch_via_aliases_rejected(self, beam):
+        """Proposal scope_json has ``author_type='hermes'`` and
+        ``channel_id='proj-x'``; plan scope has ``producer='codex'`` and
+        ``project_id='proj-x'``. The producer alias must catch the mismatch."""
+        self._seed_proposal_with_scope(
+            beam,
+            {
+                "session_id": beam.session_id,
+                "author_type": "hermes",
+                "channel_id": "proj-x",
+            },
+        )
+        run = dream.dream_plan(
+            beam,
+            scope={
+                "session_id": beam.session_id,
+                "producer": "codex",
+                "project_id": "proj-x",
+            },
+        )
+        assert run.state == "rejected"
+        assert run.error_code == "no_candidates"
+
+    def test_equal_alias_values_are_eligible(self, beam):
+        """Proposal scope_json ``author_id='my-actor'`` matches plan scope
+        ``actor_id='my-actor'`` via the alias. This proves the normalizer is
+        not a blanket rejector."""
+        self._seed_proposal_with_scope(
+            beam, {"session_id": beam.session_id, "author_id": "my-actor"}
+        )
+        run = dream.dream_plan(
+            beam,
+            scope={"session_id": beam.session_id, "actor_id": "my-actor"},
+        )
+        assert run.state == "awaiting_approval"
+        assert len(run.actions) == 1
+
+
+class TestI6ConcurrentClaimCAS:
+    """I6-B: two concurrent dream_plan calls on distinct connections must not
+    both consume the same proposal. Exactly one run must own the action;
+    the other must get no_candidates/rejected without consuming it."""
+
+    def test_two_connections_cannot_double_consume_one_proposal(
+        self, tmp_path
+    ):
+        """Two concurrent dream_plan calls on distinct connections with one
+        eligible proposal must not double-consume it.
+
+        Under 2af4737 (no serialized CAS) both plans could SELECT the same
+        'proposed' proposal and both claim it. After the fix (BEGIN IMMEDIATE
+        + CAS UPDATE with status='proposed' guard), exactly one wins; the
+        other gets no_candidates/database_busy.
+
+        This test uses a start barrier so both threads enter dream_plan at
+        the same time. The fix's BEGIN IMMEDIATE serializes them: the first
+        to acquire the write lock gathers + claims + commits atomically;
+        the second then sees the proposal as 'dream_claimed' (status filter
+        excludes it) and gets no_candidates.
+        """
+        import threading
+        config_module.MnemosyneConfig.reset_instance()
+        db = tmp_path / "conc.db"
+        b0 = BeamMemory(session_id="conc-sess", db_path=db)
+        shmr._init_proposal_schema(b0.conn)
+        _seed_facts(b0, [
+            {"fact_id": "fc1", "subject": "c", "predicate": "p",
+             "object": "common value one", "confidence": 0.9},
+        ])
+        b0.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "shmr_c", "cc", "conc-sess",
+                json.dumps({"session_id": "conc-sess"}),
+                json.dumps(["fc1"]), "c", "p", "common", 0.9,
+                "create", None, "r", "proposed",
+            ),
+        )
+        b0.conn.commit()
+        b0.conn.close()
+
+        scope = {"session_id": "conc-sess"}
+        results = {}
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def planner(rid):
+            try:
+                b = BeamMemory(session_id="conc-sess", db_path=db)
+                # Start barrier: both threads reach dream_plan together.
+                barrier.wait(timeout=15)
+                results[rid] = dream.dream_plan(b, scope=scope, request_id=rid)
+                b.conn.close()
+            except Exception as exc:
+                errors.append((rid, exc))
+
+        t1 = threading.Thread(target=planner, args=("req-a",))
+        t2 = threading.Thread(target=planner, args=("req-b",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        assert not errors, f"threads raised: {errors}"
+
+        run_a = results.get("req-a")
+        run_b = results.get("req-b")
+        assert run_a is not None and run_b is not None
+
+        owners = [r for r in (run_a, run_b) if r.state == "awaiting_approval"]
+        losers = [
+            r for r in (run_a, run_b)
+            if r.state in ("rejected", "failed_retryable")
+        ]
+        assert len(owners) == 1, (
+            f"expected exactly 1 owner, got {len(owners)}: "
+            f"a={run_a.state}/{run_a.error_code} "
+            f"b={run_b.state}/{run_b.error_code}"
+        )
+        assert len(losers) == 1
+        assert losers[0].error_code in ("no_candidates", "database_busy")
+
+        # No duplicate active plan can apply the same proposal.
+        check = BeamMemory(session_id="conc-sess", db_path=db)
+        actions = check.conn.execute(
+            "SELECT COUNT(*) FROM dream_actions WHERE source_id = 'fc1'"
+        ).fetchone()[0]
+        assert actions == 1
+
+    def test_concurrent_claim_loses_proposals_remain_eligible(self, tmp_path):
+        """If a concurrent planner loses the claim race, the proposals it
+        tried to claim must NOT be mutated by the loser -- they remain
+        'proposed' for the winner (or 'dream_claimed' by the winner)."""
+        import threading
+        config_module.MnemosyneConfig.reset_instance()
+        db = tmp_path / "conc.db"
+        b0 = BeamMemory(session_id="conc-sess", db_path=db)
+        shmr._init_proposal_schema(b0.conn)
+        _seed_facts(b0, [
+            {"fact_id": "fc2", "subject": "c", "predicate": "p",
+             "object": "second value two", "confidence": 0.9},
+        ])
+        b0.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "shmr_c2", "cc2", "conc-sess",
+                json.dumps({"session_id": "conc-sess"}),
+                json.dumps(["fc2"]), "c", "p", "second", 0.9,
+                "create", None, "r", "proposed",
+            ),
+        )
+        b0.conn.commit()
+        b0.conn.close()
+
+        scope = {"session_id": "conc-sess"}
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def planner(rid):
+            b = BeamMemory(session_id="conc-sess", db_path=db)
+            barrier.wait(timeout=15)
+            results[rid] = dream.dream_plan(b, scope=scope, request_id=rid)
+            b.conn.close()
+
+        t1 = threading.Thread(target=planner, args=("req-x",))
+        t2 = threading.Thread(target=planner, args=("req-y",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        # Exactly one proposal-claim should exist.
+        check = BeamMemory(session_id="conc-sess", db_path=db)
+        claimed = check.conn.execute(
+            "SELECT COUNT(*) FROM shmr_proposals WHERE status = 'dream_claimed'"
+        ).fetchone()[0]
+        assert claimed == 1, (
+            f"expected exactly 1 dream_claimed proposal, got {claimed}"
+        )
