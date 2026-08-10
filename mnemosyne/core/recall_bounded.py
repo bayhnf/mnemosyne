@@ -90,6 +90,30 @@ class RecallPolicy:
             raise ValueError(f"only_active must be bool, got {type(self.only_active)}")
         if not isinstance(self.require_fallback, bool):
             raise ValueError(f"require_fallback must be bool, got {type(self.require_fallback)}")
+        # I-6: every allowlist must be a sequence of strings (or None).
+        # A bare string is rejected so it cannot be char-split into a
+        # set of characters (e.g. "ab" -> {'a','b'}) by _passes_policy
+        # or _build_where. Empty allowlists are allowed and fail closed
+        # (match nothing) in both code paths.
+        for _field in (
+            "session_ids", "actor_ids", "producer_ids", "project_ids",
+            "producer_types", "memory_types", "veracity",
+        ):
+            _val = getattr(self, _field)
+            if _val is None:
+                continue
+            # str is a Sequence[str] by accident (iterates chars); reject it.
+            if isinstance(_val, str) or not isinstance(_val, Sequence):
+                raise ValueError(
+                    f"{_field} must be a sequence of strings, got "
+                    f"{type(_val).__name__}: {_val!r}"
+                )
+            for _el in _val:
+                if not isinstance(_el, str):
+                    raise ValueError(
+                        f"{_field} must contain only strings, got "
+                        f"element of type {type(_el).__name__}: {_el!r}"
+                    )
 
 
 @dataclass
@@ -310,44 +334,44 @@ def _build_where(
     beam, policy: RecallPolicy, now_iso: str
 ) -> Tuple[str, List[Any]]:
     """Build native identity/session/lifecycle SQL from the policy."""
-    where_parts: List[str] = [
-        "(valid_until IS NULL OR valid_until > ?)",
-        "superseded_by IS NULL",
-    ]
-    params: List[Any] = [now_iso]
+    where_parts: List[str] = []
+    params: List[Any] = []
+    if policy.only_active:
+        # Fail-closed lifecycle pre-filter. When only_active=False the
+        # gate (_passes_policy) still authoritatively decides, so we do
+        # NOT pre-filter here — expired/superseded rows must be able to
+        # reach the gate subject to the remaining scope/policy filters.
+        where_parts.append("(valid_until IS NULL OR valid_until > ?)")
+        params.append(now_iso)
+        where_parts.append("superseded_by IS NULL")
     if policy.include_shared or policy.include_legacy_shared:
         where_parts.append("(1=1)")
     else:
         where_parts.append("(session_id = ? OR scope = 'global')")
         params.append(beam.session_id)
-    if policy.session_ids is not None:
-        ph = ",".join("?" * len(policy.session_ids))
-        where_parts.append(f"session_id IN ({ph})")
-        params.extend(policy.session_ids)
-    if policy.actor_ids is not None:
-        ph = ",".join("?" * len(policy.actor_ids))
-        where_parts.append(f"author_id IN ({ph})")
-        params.extend(policy.actor_ids)
-    if policy.producer_ids is not None:
-        ph = ",".join("?" * len(policy.producer_ids))
-        where_parts.append(f"author_type IN ({ph})")
-        params.extend(policy.producer_ids)
-    if policy.producer_types is not None:
-        ph = ",".join("?" * len(policy.producer_types))
-        where_parts.append(f"author_type IN ({ph})")
-        params.extend(policy.producer_types)
-    if policy.project_ids is not None:
-        ph = ",".join("?" * len(policy.project_ids))
-        where_parts.append(f"channel_id IN ({ph})")
-        params.extend(policy.project_ids)
-    if policy.memory_types is not None:
-        ph = ",".join("?" * len(policy.memory_types))
-        where_parts.append(f"memory_type IN ({ph})")
-        params.extend(policy.memory_types)
-    if policy.veracity is not None:
-        ph = ",".join("?" * len(policy.veracity))
-        where_parts.append(f"veracity IN ({ph})")
-        params.extend(policy.veracity)
+    # I-6: empty allowlists fail closed (match nothing) via a
+    # guaranteed-false predicate; non-empty use parameterized IN (...).
+    for _field, _col in (
+        ("session_ids", "session_id"),
+        ("actor_ids", "author_id"),
+        ("producer_ids", "author_type"),
+        ("producer_types", "author_type"),
+        ("project_ids", "channel_id"),
+        ("memory_types", "memory_type"),
+        ("veracity", "veracity"),
+    ):
+        _vals = getattr(policy, _field)
+        if _vals is None:
+            continue
+        if len(_vals) == 0:
+            # Empty allowlist = allow nothing. 1=0 is always false and
+            # avoids invalid `IN ()` SQL. _passes_policy also enforces
+            # this in Python as a defense-in-depth check.
+            where_parts.append("(1=0)")
+        else:
+            ph = ",".join("?" * len(_vals))
+            where_parts.append(f"{_col} IN ({ph})")
+            params.extend(_vals)
     if policy.source is not None:
         where_parts.append("source = ?")
         params.append(policy.source)
@@ -364,7 +388,8 @@ def _build_where(
 _WM_COLS = (
     "id, content, source, timestamp, session_id, importance, "
     "recall_count, last_recalled, valid_until, superseded_by, scope, "
-    "author_id, author_type, channel_id, veracity, memory_type"
+    "author_id, author_type, channel_id, veracity, memory_type, "
+    "metadata_json"
 )
 
 
@@ -438,14 +463,21 @@ def _hydrate_candidates(
     try:
         wm_fts = _beam_mod._fts_search_working(conn, query, k=max(policy.top_k * 3, 50))
     except Exception:
+        # I-3: structured degradation signal + content-free log. Never
+        # echo the raw query or exception detail into log messages.
         wm_fts = []
+        degradation.append("fts_working_failed")
+        logger.info("bounded: working fts search failed", exc_info=True)
     for fr in wm_fts:
         had_fts = True
         candidates.setdefault(fr["id"], {"id": fr["id"], "_fts_rank": fr["rank"]})
     try:
         em_fts = _beam_mod._fts_search(conn, query, k=max(policy.top_k * 3, 20))
     except Exception:
+        # I-3: structured degradation signal + content-free log.
         em_fts = []
+        degradation.append("fts_episodic_failed")
+        logger.info("bounded: episodic fts search failed", exc_info=True)
     for fr in em_fts:
         had_fts = True
         candidates.setdefault(
@@ -505,7 +537,10 @@ def _hydrate_candidates(
             for sid in source_memory_ids:
                 candidates.setdefault(sid, {"id": sid, "_memoria_source": True})
     except Exception:
-        pass  # MEMORIA is best-effort
+        # I-3: structured degradation signal + content-free log. Never
+        # echo the raw query or memory content.
+        degradation.append("memoria_failed")
+        logger.info("bounded: memoria lookup failed", exc_info=True)
 
     # --- Resolve candidate ids → full rows ---
     # First pass: resolve string ids against working_memory.
@@ -840,6 +875,26 @@ def _applied_filters(policy: RecallPolicy) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _public_metadata_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip internal metadata_json and expose parsed ``metadata: dict``.
+
+    Runs after policy/fallback selection and before dedupe/rank/token
+    rendering. Rows that already carry a parsed ``metadata`` dict
+    (polyphonic hydration via beam._fetch_polyphonic_row) keep it;
+    MEMORIA/fact/associative synthetic rows receive ``{}``. The raw
+    ``metadata_json`` storage field is never surfaced.
+    """
+    from mnemosyne.core import beam as _beam_mod
+
+    public = dict(row)
+    if not isinstance(public.get("metadata"), dict):
+        raw = public.pop("metadata_json", None)
+        public["metadata"] = _beam_mod._parse_recall_metadata(raw)
+    else:
+        public.pop("metadata_json", None)
+    return public
+
+
 def _run_gate(
     rows: List[Dict[str, Any]],
     beam,
@@ -888,6 +943,13 @@ def _run_gate(
             if gated:
                 mode = "recent_fallback"
                 degradation.append("recent_fallback_after_filter")
+
+    # Normalize every public row: strip internal metadata_json and
+    # expose parsed ``metadata: dict``. Synthetic rows (MEMORIA, fact,
+    # associative) receive ``{}``; polyphonic rows keep their already-
+    # parsed dict. Runs after policy/fallback, before dedupe/rank/token
+    # rendering, so metadata never affects ranking or the token budget.
+    gated = [_public_metadata_row(r) for r in gated]
 
     gated = _dedupe(gated)
     gated = (

@@ -1024,3 +1024,310 @@ class TestEnhancedBoundedRecall:
         assert expanded_queries == ["enhanced counter sentinel"]
         assert memory_id in {row["id"] for row in env.results}
         assert after == before
+
+
+# ---------------------------------------------------------------------------
+# Recall metadata reconciliation (Task 1 bounded-gate regressions)
+# ---------------------------------------------------------------------------
+
+
+class TestRecallMetadataBounded:
+    """Bounded recall must expose parsed ``metadata: dict`` on every real
+    result row, never the raw ``metadata_json`` storage field, and must
+    not leak metadata values into rendered context or diagnostics."""
+
+    def test_bounded_recall_returns_parsed_metadata_without_raw_storage(self, beam):
+        working_id = _remember(
+            beam, "bounded metadata alpha", metadata={"scope": "authorized"}
+        )
+        envelope = beam.recall_bounded(
+            "bounded metadata", RecallPolicy(top_k=5, max_tokens=80)
+        )
+        row = next(
+            (item for item in envelope.results if item["id"] == working_id),
+            None,
+        )
+        assert row is not None, "seeded working row missing from bounded results"
+        assert row["metadata"] == {"scope": "authorized"}
+        assert "metadata_json" not in row
+        assert "authorized" not in envelope.rendered_context
+
+    def test_bounded_recall_does_not_expose_foreign_row_metadata(self, beam):
+        _remember(
+            beam,
+            "foreign metadata alpha",
+            session_id="sess-b",
+            metadata={"private": "never-return"},
+        )
+        envelope = beam.recall_bounded(
+            "foreign metadata", RecallPolicy(top_k=10)
+        )
+
+        assert all(
+            row.get("metadata") != {"private": "never-return"}
+            for row in envelope.results
+        )
+        assert "never-return" not in envelope.rendered_context
+
+    def test_bounded_every_result_row_has_metadata_dict(self, beam):
+        """Every public result row -- real or synthetic -- must carry a
+        parsed ``metadata: dict`` and never the raw storage field."""
+        _remember(beam, "dict-shape alpha", metadata={"k": "v"})
+        _remember(beam, "dict-shape beta")
+        envelope = beam.recall_bounded(
+            "dict-shape", RecallPolicy(top_k=10, require_fallback=True)
+        )
+        assert envelope.results, "bounded recall returned no rows"
+        for row in envelope.results:
+            assert isinstance(row.get("metadata"), dict), (
+                f"row {row.get('id')!r} missing parsed metadata dict"
+            )
+            assert "metadata_json" not in row, (
+                f"raw metadata_json leaked on row {row.get('id')!r}"
+            )
+
+    def test_bounded_malformed_metadata_is_empty_dict(self, beam):
+        """Malformed ``metadata_json`` must surface as ``{}`` without
+        raising or leaking the raw value."""
+        mid = _remember(beam, "malformed bounded alpha")
+        beam.conn.execute(
+            "UPDATE working_memory SET metadata_json = ? WHERE id = ?",
+            ("{not-json", mid),
+        )
+        beam.conn.commit()
+        envelope = beam.recall_bounded(
+            "malformed bounded", RecallPolicy(top_k=10)
+        )
+        row = next(
+            (r for r in envelope.results if r["id"] == mid), None,
+        )
+        assert row is not None, "seeded malformed-metadata row not returned"
+        assert row["metadata"] == {}
+        assert "metadata_json" not in row
+        assert "not-json" not in envelope.rendered_context
+
+    def test_bounded_metadata_absent_from_diagnostics(self, beam):
+        """Metadata keys/values must never appear in rendered context,
+        trace id, or applied filters."""
+        _remember(
+            beam, "diagnostic leak alpha",
+            metadata={"secret_key": "secret_value_42"},
+        )
+        envelope = beam.recall_bounded(
+            "diagnostic leak", RecallPolicy(top_k=10)
+        )
+        for field in ("rendered_context", "trace_id"):
+            text = getattr(envelope, field)
+            assert "secret_key" not in text, (
+                f"metadata key leaked into {field}"
+            )
+            assert "secret_value_42" not in text, (
+                f"metadata value leaked into {field}"
+            )
+        assert "secret_key" not in str(envelope.applied_filters)
+
+
+
+# ---------------------------------------------------------------------------
+# Security hardening (I-3 / I-5 / I-6)
+# ---------------------------------------------------------------------------
+
+
+class TestAllowlistTypingI6:
+    """I-6: every allowlist field must reject a bare str / non-sequence
+    deterministically, and empty allowlists must fail closed (reject all)
+    without producing invalid ``IN ()`` SQL or silently widening scope."""
+
+    @pytest.mark.parametrize("field", [
+        "session_ids", "actor_ids", "producer_ids", "project_ids",
+        "producer_types", "memory_types", "veracity",
+    ])
+    def test_bare_string_rejected(self, field):
+        """A bare string like ``"ab"`` must not be char-split into
+        ``{'a', 'b'}``; it must raise at construction."""
+        kwargs = {field: "ab"}
+        with pytest.raises((ValueError, TypeError)):
+            RecallPolicy(top_k=5, **kwargs)
+
+    @pytest.mark.parametrize("field", [
+        "session_ids", "actor_ids", "producer_ids", "project_ids",
+        "producer_types", "memory_types", "veracity",
+    ])
+    def test_non_string_element_rejected(self, field):
+        """A sequence containing non-string elements must raise."""
+        kwargs = {field: [1, 2, 3]}
+        with pytest.raises((ValueError, TypeError)):
+            RecallPolicy(top_k=5, **kwargs)
+
+    @pytest.mark.parametrize("field", [
+        "session_ids", "actor_ids", "producer_ids", "project_ids",
+        "producer_types", "memory_types", "veracity",
+    ])
+    def test_int_rejected(self, field):
+        """An int is not a valid allowlist."""
+        kwargs = {field: 5}
+        with pytest.raises((ValueError, TypeError)):
+            RecallPolicy(top_k=5, **kwargs)
+
+    def test_valid_string_sequence_accepted(self):
+        """Sanity: a legitimate list of strings is accepted."""
+        p = RecallPolicy(top_k=5, session_ids=["s1", "s2"], veracity=["stated"])
+        assert p.session_ids == ["s1", "s2"]
+
+    def test_tuple_of_strings_accepted(self):
+        p = RecallPolicy(top_k=5, actor_ids=("a1", "a2"))
+        assert p.actor_ids == ("a1", "a2")
+
+
+class TestEmptyAllowlistFailClosedI6:
+    """I-6: an empty allowlist must fail closed (match nothing), not
+    crash with ``IN ()`` or silently widen to all rows."""
+
+    def test_empty_session_ids_returns_no_rows(self, beam):
+        _remember(beam, "empty allowlist alpha")
+        env = beam.recall_bounded(
+            "empty allowlist", RecallPolicy(top_k=5, session_ids=[]),
+        )
+        assert env.results == []
+
+    def test_empty_actor_ids_returns_no_rows(self, beam):
+        _remember(beam, "empty actor alpha")
+        env = beam.recall_bounded(
+            "empty actor", RecallPolicy(top_k=5, actor_ids=[]),
+        )
+        assert env.results == []
+
+
+class TestOnlyActivePolicyI5:
+    """I-5: ``only_active=False`` must actually allow lifecycle-expired
+    and superseded rows through the gate (subject to remaining
+    scope/policy filters). ``True`` (default) stays fail-closed."""
+
+    def test_only_active_true_expires_row(self, beam):
+        """Default policy excludes expired rows (fail-closed)."""
+        from datetime import datetime, timedelta, timezone
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        mid = _remember(beam, "expired lifecycle alpha", valid_until=past)
+        env = beam.recall_bounded(
+            "expired lifecycle", RecallPolicy(top_k=10),
+        )
+        assert mid not in {r["id"] for r in env.results}
+
+    def test_only_active_false_admits_expired_row(self, beam):
+        """only_active=False must let the expired row through, subject
+        to session scope (same session → admitted)."""
+        from datetime import datetime, timedelta, timezone
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        mid = _remember(beam, "expired lifecycle beta", valid_until=past)
+        env = beam.recall_bounded(
+            "expired lifecycle",
+            RecallPolicy(top_k=10, only_active=False),
+        )
+        ids = {r["id"] for r in env.results}
+        assert mid in ids, (
+            f"only_active=False failed to admit expired row {mid}; "
+            f"got {sorted(ids)}"
+        )
+
+    def test_only_active_false_admits_superseded_row(self, beam):
+        mid = _remember(
+            beam, "superseded lifecycle beta", superseded_by="ep-xyz",
+        )
+        env = beam.recall_bounded(
+            "superseded lifecycle",
+            RecallPolicy(top_k=10, only_active=False),
+        )
+        ids = {r["id"] for r in env.results}
+        assert mid in ids, (
+            f"only_active=False failed to admit superseded row {mid}; "
+            f"got {sorted(ids)}"
+        )
+
+    def test_only_active_false_still_enforces_session_scope(self, beam):
+        """only_active=False must NOT bypass session isolation: an
+        expired foreign-session row must still be rejected."""
+        from datetime import datetime, timedelta, timezone
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        foreign_mid = _remember(
+            beam, "expired foreign gamma",
+            session_id="sess-b", valid_until=past,
+        )
+        env = beam.recall_bounded(
+            "expired foreign",
+            RecallPolicy(top_k=10, only_active=False),
+        )
+        assert foreign_mid not in {r["id"] for r in env.results}
+
+
+class TestBoundedDegradationObservabilityI3:
+    """I-3: FTS working/episodic and MEMORIA exceptions must produce
+    structured ``degradation_reasons`` entries and a safe log signal,
+    with no raw query/memory content in log messages."""
+
+    def test_fts_working_failure_emits_degradation_reason(self, beam, monkeypatch):
+        _remember(beam, "fts working observability alpha")
+        import mnemosyne.core.beam as beam_mod
+
+        def _boom(conn, query, k=20):
+            raise RuntimeError("fts_working boom")
+
+        monkeypatch.setattr(beam_mod, "_fts_search_working", _boom)
+        env = beam.recall_bounded(
+            "fts working observability", RecallPolicy(top_k=10),
+        )
+        assert "fts_working_failed" in env.degradation_reasons, (
+            f"missing fts_working_failed; got {env.degradation_reasons}"
+        )
+
+    def test_fts_episodic_failure_emits_degradation_reason(self, beam, monkeypatch):
+        _remember(beam, "fts episodic observability alpha")
+        import mnemosyne.core.beam as beam_mod
+
+        def _boom(conn, query, k=20):
+            raise RuntimeError("fts_episodic boom")
+
+        monkeypatch.setattr(beam_mod, "_fts_search", _boom)
+        env = beam.recall_bounded(
+            "fts episodic observability", RecallPolicy(top_k=10),
+        )
+        assert "fts_episodic_failed" in env.degradation_reasons, (
+            f"missing fts_episodic_failed; got {env.degradation_reasons}"
+        )
+
+    def test_memoria_failure_emits_degradation_reason(self, beam, monkeypatch):
+        _remember(beam, "memoria observability alpha")
+
+        def _boom(self, query, ability=None, top_k=10):
+            raise RuntimeError("memoria boom")
+
+        monkeypatch.setattr(
+            type(beam), "memoria_retrieve", _boom,
+        )
+        env = beam.recall_bounded(
+            "memoria observability", RecallPolicy(top_k=10),
+        )
+        assert "memoria_failed" in env.degradation_reasons, (
+            f"missing memoria_failed; got {env.degradation_reasons}"
+        )
+
+    def test_degradation_logs_are_content_free(self, beam, monkeypatch, caplog):
+        """The safe log signal for FTS/MEMORIA failures must not echo
+        the raw query or memory content."""
+        import logging
+        _remember(beam, "content free log sentinel alpha")
+        import mnemosyne.core.beam as beam_mod
+
+        def _boom(conn, query, k=20):
+            raise RuntimeError("sentinel detail boom")
+
+        monkeypatch.setattr(beam_mod, "_fts_search_working", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            beam.recall_bounded(
+                "content free log sentinel", RecallPolicy(top_k=10),
+            )
+        full = caplog.text
+        # The query string and the exception message detail must not
+        # appear in log output — only a bounded, content-free signal.
+        assert "content free log sentinel" not in full, (
+            "raw query leaked into degradation log"
+        )

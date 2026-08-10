@@ -2208,6 +2208,21 @@ def _find_memories_by_fact(beam: "BeamMemory", query: str) -> List[str]:
         return []
 
 
+def _parse_recall_metadata(raw):
+    """Safe decoder for the public recall metadata contract.
+
+    Parses the ``metadata_json`` storage field into a dict. Malformed,
+    null, or non-object JSON collapses to ``{}`` without raising or
+    logging the raw value. Used only for public recall result shaping —
+    never for diagnostics, traces, or logs.
+    """
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def _in_memory_vec_search(conn: sqlite3.Connection, query_embedding: np.ndarray, k: int = 20) -> List[Dict]:
     """Fallback vector search using memory_embeddings table + numpy cosine similarity."""
     if np is None:
@@ -5786,6 +5801,59 @@ class BeamMemory:
             return {"context": "\n".join(ctx_lines), "facts": facts, "source": "memoria_preferences"}
         return {"context": "", "facts": [], "source": "fallback"}
 
+    def _attach_recall_metadata(self, results: List[Dict]) -> List[Dict]:
+        """Attach parsed ``metadata: dict`` to legacy recall result rows.
+
+        Runs AFTER all ranking, fact synthesis, and MEMORIA supplements
+        are complete so metadata never changes ranking or filtering.
+        Real working/episodic rows are resolved in two batched queries
+        (one per tier); every unsupported or synthetic tier receives
+        ``{}``. The raw ``metadata_json`` field is never surfaced.
+
+        Preserves the original list order and scores. Idempotent: rows
+        that already carry a parsed ``metadata`` dict (e.g. polyphonic
+        rows from ``_polyphonic_row_to_dict``) are left untouched.
+        """
+        ids_by_tier = {"working": [], "episodic": []}
+        for item in results:
+            # Skip rows that already have a parsed metadata dict
+            # (polyphonic path, or a prior _attach pass).
+            if isinstance(item.get("metadata"), dict):
+                continue
+            tier = item.get("tier")
+            rid = item.get("id")
+            if tier in ids_by_tier and rid:
+                ids_by_tier[tier].append(rid)
+
+        parsed: Dict[str, Dict[str, Any]] = {}
+        cursor = self.conn.cursor()
+        for tier, ids in ids_by_tier.items():
+            if not ids:
+                continue
+            table = "working_memory" if tier == "working" else "episodic_memory"
+            placeholders = ",".join("?" * len(ids))
+            try:
+                rows = cursor.execute(
+                    f"SELECT id, metadata_json FROM {table} WHERE id IN ({placeholders})",
+                    tuple(ids),
+                ).fetchall()
+            except Exception:
+                rows = []
+            for row in rows:
+                parsed[(tier, row["id"])] = _parse_recall_metadata(
+                    row["metadata_json"]
+                )
+
+        for item in results:
+            if isinstance(item.get("metadata"), dict):
+                continue
+            tier = item.get("tier")
+            rid = item.get("id")
+            item.pop("metadata_json", None)  # never surface raw storage
+            item["metadata"] = parsed.get((tier, rid), {})
+
+        return results
+
     def recall(self, query: str, top_k: int = 40, *,
                from_date: Optional[str] = None, to_date: Optional[str] = None,
                source: Optional[str] = None, topic: Optional[str] = None,
@@ -7067,6 +7135,13 @@ class BeamMemory:
             except Exception:
                 logger.debug("fact recall integration failed (non-fatal)", exc_info=True)
 
+        # Attach parsed metadata to every public result row after all
+        # ranking, fact synthesis, and MEMORIA supplements are complete.
+        # Synthetic tiers (fact, memoria, memoria_source, associative)
+        # receive ``{}``; real working/episodic rows get their stored
+        # metadata parsed safely. Never surfaces raw metadata_json.
+        self._attach_recall_metadata(final_results)
+
         if _explain_trace is not None:
             _explain_trace.set_embedding(
                 available=embeddings_available,
@@ -7357,6 +7432,13 @@ class BeamMemory:
             # ``top_k`` is part of the v2 digest, so truncating here would
             # make a hit differ from the cached pipeline result (notably when
             # associative retrieval appends related memories after top-k).
+            # Normalize cached rows so pre-metadata-contract cache entries
+            # still expose a parsed ``metadata: dict`` and never the raw
+            # storage field, without changing order or scores.
+            for _r in cached:
+                if not isinstance(_r.get("metadata"), dict):
+                    _r.pop("metadata_json", None)
+                    _r["metadata"] = {}
             return cached
 
         # 4. Run base recall with expanded query
@@ -7452,7 +7534,11 @@ class BeamMemory:
             except Exception:
                 logger.info("Regex extraction failed, skipping", exc_info=True)
 
-        # 9. Cache results
+        # 9. Attach parsed metadata to synthetic associative rows (real
+        # rows already carry a parsed dict from the linear recall call).
+        self._attach_recall_metadata(results)
+
+        # 10. Cache results
         if use_cache and not explain and hasattr(self, '_query_cache') and self._query_cache is not None:
             self._query_cache.put_opaque(cache_key, results)
 
@@ -7869,6 +7955,12 @@ class BeamMemory:
         except Exception:
             logger.info("Regex extraction failed, skipping", exc_info=True)
 
+        # Attach parsed metadata to every public result row. Real
+        # working/episodic rows already carry a parsed dict from
+        # _polyphonic_row_to_dict and are left untouched; MEMORIA
+        # synthetic rows receive ``{}``.
+        self._attach_recall_metadata(final)
+
         return final
 
     def _get_polyphonic_engine(self):
@@ -7957,7 +8049,7 @@ class BeamMemory:
             SELECT id, content, source, timestamp, session_id, importance,
                    recall_count, last_recalled, valid_until,
                    superseded_by, scope, author_id, author_type,
-                   channel_id, veracity, memory_type, tier
+                   channel_id, veracity, memory_type, tier, metadata_json
             FROM episodic_memory WHERE id = ?
         """, (memory_id,))
         row = cursor.fetchone()
@@ -7967,7 +8059,7 @@ class BeamMemory:
             SELECT id, content, source, timestamp, session_id, importance,
                    recall_count, last_recalled, valid_until,
                    superseded_by, scope, author_id, author_type,
-                   channel_id, veracity, memory_type
+                   channel_id, veracity, memory_type, metadata_json
             FROM working_memory WHERE id = ?
         """, (memory_id,))
         row = cursor.fetchone()
@@ -7997,6 +8089,12 @@ class BeamMemory:
             "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
             "superseded_by": row["superseded_by"] if "superseded_by" in row.keys() else None,
             "tier": tier_label,
+            # Expose parsed metadata only; never the raw metadata_json
+            # storage field. _attach_recall_metadata leaves rows that
+            # already carry a parsed dict untouched.
+            "metadata": _parse_recall_metadata(
+                row["metadata_json"] if "metadata_json" in row.keys() else None
+            ),
         }
         if tier_label == "episodic":
             d["degradation_tier"] = row["tier"] if "tier" in row.keys() else 1
