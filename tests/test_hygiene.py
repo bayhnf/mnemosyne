@@ -807,14 +807,14 @@ class TestAuditNoise:
         assert capsys.readouterr().err == ""
 
     @pytest.mark.parametrize(
-        ("command_args", "function_name"),
+        ("command_args", "function_name", "expected_code"),
         [
-            (["audit"], "audit_noise"),
-            (["status"], "hygiene_status"),
+            (["audit"], "audit_noise", "hygiene_audit_failed"),
+            (["status"], "hygiene_status", "hygiene_status_failed"),
         ],
     )
     def test_cmd_hygiene_read_commands_close_connection_after_hygiene_error(
-        self, monkeypatch, tmp_path, capsys, command_args, function_name
+        self, monkeypatch, tmp_path, capsys, command_args, function_name, expected_code
     ):
         db_path = tmp_path / "mnemosyne.db"
         sqlite3.connect(db_path).close()
@@ -840,11 +840,19 @@ class TestAuditNoise:
         assert connection is not None
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
-        assert "hygiene read failed" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert f"Error: {expected_code}" in err
+        assert "hygiene read failed" not in err
 
-    @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
+    @pytest.mark.parametrize(
+        ("command_args", "expected_code"),
+        [
+            (["audit"], "hygiene_audit_failed"),
+            (["status"], "hygiene_status_failed"),
+        ],
+    )
     def test_cmd_hygiene_read_commands_report_readonly_open_errors(
-        self, monkeypatch, tmp_path, capsys, command_args
+        self, monkeypatch, tmp_path, capsys, command_args, expected_code
     ):
         db_path = tmp_path / "mnemosyne.db"
         sqlite3.connect(db_path).close()
@@ -858,7 +866,9 @@ class TestAuditNoise:
         with pytest.raises(SystemExit):
             cmd_hygiene(command_args)
 
-        assert "readonly connection failed" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert f"Error: {expected_code}" in err
+        assert "readonly connection failed" not in err
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
