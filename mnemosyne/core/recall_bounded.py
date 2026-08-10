@@ -848,8 +848,8 @@ def _hydrate_polyphonic(beam, query: str, policy: RecallPolicy):
         poly_results = engine.recall(
             query=query, query_embedding=query_embedding, top_k=policy.top_k * 2,
         )
-    except Exception as exc:
-        logger.info("bounded: polyphonic engine failed: %s", exc)
+    except Exception:
+        logger.info("bounded: polyphonic engine failed")
         return [], "recent_fallback", ["polyphonic_engine_failed"]
 
     if not poly_results:

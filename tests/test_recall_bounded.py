@@ -307,6 +307,35 @@ class TestPolyphonicFallback:
         contents = " ".join(r["content"] for r in env.results)
         assert "linear visible" in contents
 
+    def test_polyphonic_engine_failure_log_is_content_free(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+
+        canary = "TASK21_PRIVATE_POLYPHONIC_FAILURE"
+        _remember(beam, "linear fallback remains available")
+        monkeypatch.setenv("MNEMOSYNE_POLYPHONIC_RECALL", "1")
+
+        class _FailingEngine:
+            def recall(self, **_kwargs):
+                raise RuntimeError(canary)
+
+        monkeypatch.setattr(
+            type(beam),
+            "_get_polyphonic_engine",
+            lambda _self: _FailingEngine(),
+        )
+
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            env = recall_bounded(beam, "fallback", policy=RecallPolicy(top_k=5))
+
+        assert "polyphonic_engine_failed" in env.degradation_reasons
+        assert env.results
+        rendered = caplog.text
+        assert "bounded: polyphonic engine failed" in rendered
+        assert canary not in rendered
+        assert "Traceback" not in rendered
+
 
 # ---------------------------------------------------------------------------
 # Legacy compatibility
