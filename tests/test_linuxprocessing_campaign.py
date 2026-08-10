@@ -697,3 +697,130 @@ class TestG4FaultMatrix:
         report = self._run_matrix(tmp_path, monkeypatch)
         _assert_content_free(json.dumps(report))
         _assert_allowlist(report)
+
+
+# ===========================================================================
+# Commit 6: G5/G6 manual checkpoints and evidence scan
+# ===========================================================================
+
+
+class TestG5StaticChecks:
+    def test_g5_passes_static_plugin_package_checks(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage("g5", trial, monkeypatch)
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        assert checks["package_import"]["verdict"] == PASS
+        assert checks["plugin_surface"]["verdict"] == PASS
+
+    def test_g5_content_free(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage("g5", trial, monkeypatch)
+        report = _read_report(report_path)
+        _assert_content_free(json.dumps(report))
+        _assert_allowlist(report)
+
+    def test_g5_fails_without_trial_root(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"  # not created
+        report_path = trial / "r.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "lpc.py",
+                "--trial-root",
+                str(trial),
+                "--report",
+                str(report_path),
+                "--stage",
+                "g5",
+            ],
+        )
+        assert lpc.main() == 1
+
+
+class TestG6CheckpointsAndScan:
+    def test_g6_gates_pending_without_codex_desktop_ack(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage("g6", trial, monkeypatch)
+        # Codex Desktop + Hermes smoke are ack-gated; missing -> exit 2.
+        assert code == 2
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.GATE
+        checks = report["checks"]
+        assert checks["codex_desktop_ack"]["verdict"] == "PENDING"
+        assert checks["hermes_smoke_ack"]["verdict"] == "PENDING"
+
+    def test_g6_passes_with_acks_and_self_scan(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g6",
+            trial,
+            monkeypatch,
+            "--ack-codex-desktop",
+            "--ack-hermes-smoke",
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        assert checks["codex_desktop_ack"]["verdict"] == "ACKNOWLEDGED"
+        assert checks["hermes_smoke_ack"]["verdict"] == "ACKNOWLEDGED"
+        assert checks["self_scan"]["verdict"] == PASS
+
+    def test_g6_self_scan_detects_bad_mode(self, tmp_path, monkeypatch):
+        """The self-scan must catch a trial file with a bad (too-open) mode."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        # Plant a too-open file in the trial tree.
+        bad = trial / "leaked.json"
+        bad.write_text("{}")
+        bad.chmod(0o644)  # too open; should be 0600
+        code, report_path = _run_stage(
+            "g6",
+            trial,
+            monkeypatch,
+            "--ack-codex-desktop",
+            "--ack-hermes-smoke",
+        )
+        assert code == 1
+        report = _read_report(report_path)
+        checks = report["checks"]
+        assert checks["self_scan"]["verdict"] == FAIL
+        assert "bad_mode" in checks["self_scan"]["reason_code"]
+
+    def test_g6_self_scan_detects_canary_content(self, tmp_path, monkeypatch):
+        """The self-scan must catch a canary secret in a trial file."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        bad = trial / "canary.json"
+        bad.write_text('{"token": "api_key=sk-canaryleak0123456789"}')
+        bad.chmod(0o600)
+        code, _ = _run_stage(
+            "g6",
+            trial,
+            monkeypatch,
+            "--ack-codex-desktop",
+            "--ack-hermes-smoke",
+        )
+        assert code == 1
+
+    def test_g6_content_free(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage(
+            "g6",
+            trial,
+            monkeypatch,
+            "--ack-codex-desktop",
+            "--ack-hermes-smoke",
+        )
+        report = _read_report(report_path)
+        _assert_content_free(json.dumps(report))
+        _assert_allowlist(report)

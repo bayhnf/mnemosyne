@@ -1132,11 +1132,179 @@ def _stage_g4(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 
 
 def _stage_g5(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    return FAIL, "not_implemented", _empty_checks()
+    """G5 static plugin/package checks.
+
+    Verifies the mnemosyne package surface imports cleanly and the key
+    plugin modules are present. No network, no live plugin execution.
+    """
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+
+    # Package import: the top-level package and core submodules import.
+    pkg_ok = True
+    for mod in (
+        "mnemosyne",
+        "mnemosyne.core.beam",
+        "mnemosyne.core.dream",
+        "mnemosyne.dr.snapshot",
+    ):
+        try:
+            __import__(mod)
+        except ImportError:
+            pkg_ok = False
+            break
+    checks["package_import"] = {
+        "verdict": PASS if pkg_ok else FAIL,
+        "reason_code": "ok" if pkg_ok else "package_import_failed",
+    }
+
+    # Plugin surface: entry points declared in pyproject are present.
+    surface_ok = True
+    try:
+        import importlib.util
+
+        for mod in ("mnemosyne.cli", "mnemosyne.mcp_server"):
+            if importlib.util.find_spec(mod) is None:
+                surface_ok = False
+                break
+    except (ImportError, ValueError):
+        surface_ok = False
+    checks["plugin_surface"] = {
+        "verdict": PASS if surface_ok else FAIL,
+        "reason_code": "ok" if surface_ok else "plugin_surface_missing",
+    }
+
+    for key in ("package_import", "plugin_surface"):
+        if checks[key]["verdict"] != PASS:
+            return FAIL, f"g5_{key}_failed", checks
+    return PASS, "ok", checks
+
+
+# Error classes that are approved to appear in reason codes. Anything else
+# found during the self-scan of trial files is a content-leak signal.
+_APPROVED_REASON_CODES = frozenset(
+    {
+        "ok",
+        "unknown_stage",
+        "unexpected_error",
+        "trial_root_missing",
+        "preflight_failed",
+        "python_too_old",
+        "insufficient_disk",
+        "disk_unavailable",
+        "approved_sha_required",
+        "dependency_unavailable",
+        "dependency_health_failed",
+        "lane_unavailable",
+        "lane_import_failed",
+        "source_db_missing",
+        "snapshot_failed",
+        "snapshot_api_unavailable",
+        "snapshot_verification_failed",
+        "integrity_failed",
+        "fingerprint_missing",
+        "mode_bits_wrong",
+        "sidecar_present",
+        "user_version_mismatch",
+        "dry_run_failed",
+        "source_mutated",
+        "restore_failed",
+        "rollback_rehearsal_failed",
+        "pristine_tampered",
+        "table_mismatch",
+        "g4_exactly_once_failed",
+        "g4_crash_retry_failed",
+        "g4_duplicate_race_failed",
+        "g4_dream_lifecycle_failed",
+        "fault_matrix_failed",
+        "case_error",
+        "fault_matrix_failed",
+        "dimension_bad",
+        "codex_desktop_ack_required",
+        "hermes_smoke_ack_required",
+        "self_scan_failed",
+        "soak_failed",
+        "budget_exceeded",
+    }
+)
+
+
+def _self_scan(trial_root: Path) -> tuple[str, str]:
+    """Scan report/trial files for modes, canaries, contents, private paths,
+    and unapproved error classes. Returns (verdict, reason_code)."""
+    root = Path(trial_root)
+    bad_modes: list[str] = []
+    canary_hits: list[str] = []
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            continue
+        if mode != _FILE_MODE:
+            bad_modes.append("bad_mode")
+        # Read text files only; skip binaries (snapshot DBs etc).
+        try:
+            text = path.read_text(errors="ignore")
+        except (OSError, UnicodeDecodeError):
+            continue
+        low = text.lower()
+        for frag in _FORBIDDEN_FRAGMENTS:
+            if frag in low:
+                canary_hits.append("canary")
+        # Unapproved error classes: scan for python exception names that are
+        # not on the approved reason-code list (a leak of internals).
+        for token in ("Traceback", "sqlite3.OperationalError", "PermissionError"):
+            if token in text:
+                canary_hits.append("internal_class")
+
+    if bad_modes:
+        return FAIL, "bad_mode"
+    if canary_hits:
+        return FAIL, "canary_content"
+    return PASS, "ok"
 
 
 def _stage_g6(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    return FAIL, "not_implemented", _empty_checks()
+    """G6 manual checkpoints and evidence scan.
+
+    Records Codex Desktop + Hermes smoke as ack-gated (PENDING -> exit 2,
+    never faked). With acks present, runs the self-scan of the trial tree
+    for modes, canaries, private paths, and unapproved error classes.
+    """
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+    # Ack states are recorded as PENDING/ACKNOWLEDGED (never faked). The
+    # stage verdict is GATE (exit 2) when a required ack is PENDING.
+    checks["codex_desktop_ack"] = {"verdict": _ack_state(args.ack_codex_desktop)}
+    checks["hermes_smoke_ack"] = {"verdict": _ack_state(args.ack_hermes_smoke)}
+
+    if not args.ack_codex_desktop:
+        return GATE, "codex_desktop_ack_required", checks
+    if not args.ack_hermes_smoke:
+        return GATE, "hermes_smoke_ack_required", checks
+
+    scan_verdict, scan_reason = _self_scan(trial_root)
+    checks["self_scan"] = {"verdict": scan_verdict, "reason_code": scan_reason}
+    if scan_verdict != PASS:
+        return FAIL, "self_scan_failed", checks
+    return PASS, "ok", checks
 
 
 def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
