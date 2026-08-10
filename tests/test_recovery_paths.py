@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -510,3 +511,136 @@ class TestBackupAndStagingRaces:
 
         leftovers = list(target.parent.glob("*restore_staged*"))
         assert leftovers == [], f"staged file not cleaned up: {leftovers}"
+
+
+# ---------------------------------------------------------------------------
+# Security I-1: restore must not execute untrusted dump SQL with SQLite
+# extension loading left enabled. The optional sqlite-vec loader calls
+# enable_load_extension(True); it must be disabled again before any
+# caller runs executescript on backup-provided SQL, and it must stay
+# disabled even when the loader raised ImportError/OperationalError.
+#
+# These tests stub the sqlite_vec module so the leak is exercised
+# deterministically regardless of whether real sqlite_vec is installed
+# (the bug is latent when sqlite_vec is absent because the ImportError
+# fires before enable_load_extension runs).
+# ---------------------------------------------------------------------------
+
+def _install_sqlite_vec_stub(monkeypatch, load_side_effect=None):
+    """Install a fake ``sqlite_vec`` module whose ``load(conn)`` mirrors the
+    real extension's behavior: it requires (and enables) extension loading on
+    the connection to register itself.
+
+    If ``load_side_effect`` is given, ``load`` raises it instead, simulating
+    sqlite3.OperationalError from a failed dlopen (another path where the
+    current loader calls enable_load_extension(True) and never restores it).
+    """
+    import sys, types
+    fake = types.ModuleType("sqlite_vec")
+
+    def _load(conn):
+        if load_side_effect is not None:
+            raise load_side_effect
+        conn.enable_load_extension(True)  # mirror real sqlite_vec.load
+
+    fake.load = _load
+    monkeypatch.setitem(sys.modules, "sqlite_vec", fake)
+    return fake
+
+
+def _assert_load_extension_blocked(conn):
+    """Extension loading must be DISABLED: SQLite rejects load_extension up
+    front with 'not authorized'. If it is still enabled, the call instead
+    reaches the filesystem and fails with 'cannot open shared object' — that
+    is the leak signature.
+    """
+    with pytest.raises(sqlite3.OperationalError) as excinfo:
+        conn.execute("SELECT load_extension('definitely_not_a_real_extension')")
+    assert "not authorized" in str(excinfo.value), (
+        f"extension loading still enabled after _load_sqlite_vec "
+        f"(load_extension was reachable): {excinfo.value!r}"
+    )
+
+
+def test_load_sqlite_vec_disables_extension_loading_after_success(monkeypatch):
+    """RED driver: when sqlite_vec.load() succeeds (and itself enables
+    extension loading to register), _load_sqlite_vec must re-disable
+    extension loading before returning.
+
+    Pre-fix the call to enable_load_extension(True) inside the loader is never
+    reverted, so load_extension remains callable afterward.
+    """
+    _install_sqlite_vec_stub(monkeypatch)
+    conn = sqlite3.connect(":memory:")
+    recovery._load_sqlite_vec(conn)
+    _assert_load_extension_blocked(conn)
+
+
+def test_load_sqlite_vec_disables_extension_loading_after_operational_error(monkeypatch):
+    """If sqlite_vec.load() itself raises OperationalError (e.g. a failed
+    dlopen on a present-but-broken build), enable_load_extension(True) has
+    already run and must still be re-disabled.
+    """
+    _install_sqlite_vec_stub(
+        monkeypatch, load_side_effect=sqlite3.OperationalError("dlopen failed")
+    )
+    conn = sqlite3.connect(":memory:")
+    recovery._load_sqlite_vec(conn)
+    _assert_load_extension_blocked(conn)
+
+
+def test_load_sqlite_vec_disables_extension_loading_when_absent(monkeypatch):
+    """When sqlite-vec is NOT installed, _load_sqlite_vec swallows the
+    ImportError and must leave extension loading disabled. (Today this passes
+    incidentally because the ImportError fires before the toggle; the stub
+    makes the assertion load-bearing for the future.)
+    """
+    import sys
+    monkeypatch.setitem(sys.modules, "sqlite_vec", None)
+    conn = sqlite3.connect(":memory:")
+    recovery._load_sqlite_vec(conn)  # must not raise
+    _assert_load_extension_blocked(conn)
+
+
+def test_restore_backup_rejects_load_extension_in_dump(tmp_path, monkeypatch):
+    """End-to-end: a tampered-but-checksum-valid backup whose dump SQL invokes
+    load_extension must NOT execute that call. The staged-restore connection
+    must have extension loading disabled when executescript runs.
+
+    We stub sqlite_vec so the leak is deterministic, craft a backup whose dump
+    embeds ``SELECT load_extension(...)``, and recompute both checksums so it
+    passes restore's integrity gate — isolating the extension-loading vector
+    from the checksum gate (checksums are integrity, not authenticity).
+    """
+    import gzip as _gz
+
+    _install_sqlite_vec_stub(monkeypatch)
+
+    db_path = tmp_path / "src.db"
+    bdir = tmp_path / "bk"
+    _make_simple_db(db_path)
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+    backup_path = Path(backup["backup_path"])
+    meta_path = backup_path.with_suffix(".gz.json")
+
+    raw = _gz.decompress(backup_path.read_bytes())
+    malicious = raw + b"\nSELECT load_extension('evil_extension_payload');\n"
+    backup_path.write_bytes(_gz.compress(malicious))
+
+    new_backup_checksum = hashlib.sha256(backup_path.read_bytes()).hexdigest()[:16]
+    new_dump_checksum = hashlib.sha256(malicious).hexdigest()
+    meta = json.loads(meta_path.read_text())
+    meta["backup_checksum"] = new_backup_checksum
+    meta["dump_checksum"] = new_dump_checksum
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    target = tmp_path / "target.db"
+    _make_simple_db(target)
+
+    with pytest.raises(sqlite3.OperationalError) as excinfo:
+        recovery.restore_backup(backup_path, target)
+    assert "not authorized" in str(excinfo.value), (
+        f"untrusted dump SQL reached load_extension during restore "
+        f"(extension loading was enabled on the staged connection): "
+        f"{excinfo.value!r}"
+    )

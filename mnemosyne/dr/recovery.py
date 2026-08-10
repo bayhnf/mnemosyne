@@ -117,14 +117,8 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     # when copying vec0 virtual tables, AND dst.iterdump() (used to
     # serialize the in-memory backup to gzipped SQL) fails the same
     # way when introspecting the destination's vec0 schema.
-    # Mirrors the graceful-fallback pattern in core/beam.py.
-    def _load_sqlite_vec(conn):
-        try:
-            import sqlite_vec
-            conn.enable_load_extension(True)
-            sqlite_vec.load(conn)
-        except (ImportError, sqlite3.OperationalError):
-            pass  # optional extra; absence just means no vec0 tables
+    # Uses the module-level helper, which always re-disables extension
+    # loading afterward so no connection leaks an enabled state (I-1).
     _load_sqlite_vec(src)
     dst = sqlite3.connect(":memory:")
     _load_sqlite_vec(dst)
@@ -176,13 +170,24 @@ def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
 
     Mirrors core/beam.py's graceful fallback: absence of sqlite-vec just means
     no vec0 virtual tables to introspect.
+
+    Security: sqlite_vec.load() registers itself via SQLite's extension-loading
+    facility, which requires enable_load_extension(True). We MUST re-disable
+    extension loading before returning, regardless of whether the load
+    succeeded, failed with OperationalError, or the module was absent — callers
+    (notably restore_backup's executescript of backup-provided SQL) must never
+    run with extension loading left enabled. See security-privacy-audit-6a I-1.
     """
+    conn.enable_load_extension(True)
     try:
         import sqlite_vec
-        conn.enable_load_extension(True)
         sqlite_vec.load(conn)
     except (ImportError, sqlite3.OperationalError):
-        pass
+        pass  # optional extra; absence/breakage just means no vec0 tables
+    finally:
+        # Always restore the default (extensions disabled) so untrusted SQL
+        # executed later on this connection cannot invoke load_extension.
+        conn.enable_load_extension(False)
 
 
 def _reject_active_sidecars(db_path: Path) -> None:
