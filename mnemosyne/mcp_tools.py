@@ -448,8 +448,8 @@ def _recall_bounded_envelope(arguments: Dict[str, Any], query: str, bank: str) -
 
     try:
         policy = RecallPolicy(**policy_kwargs)
-    except (ValueError, TypeError) as exc:
-        return {"error": f"invalid recall policy: {exc}"}
+    except (ValueError, TypeError):
+        return {"error": "invalid_recall_policy"}
 
     mem = _create_instance(
         author_id=arguments.get("author_id"),
@@ -682,8 +682,8 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
                  new_content if action == "update" else None,
                  note or None),
             )
-    except Exception as exc:
-        return {"error": "validation_failed", "reason": str(exc), "memory_id": memory_id}
+    except Exception:
+        return {"error": "validation_failed", "memory_id": memory_id}
 
     return {
         "status": f"validation_{action}",
@@ -1394,8 +1394,8 @@ def _handle_ingest_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "unavailable", "error": "database_unavailable", "bank": bank}
     try:
         rows = _ingest_status(beam, event_id=event_id, limit=limit)
-    except ValueError as exc:
-        return {"error": str(exc)}
+    except ValueError:
+        return {"status": "error", "error": "invalid_request", "bank": bank}
     except sqlite3.Error:
         # Corrupt/malformed/missing-table DB: structured, content-free,
         # no raw exception text. Matches the doctor adapter error pattern.
