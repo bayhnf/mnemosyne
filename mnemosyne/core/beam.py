@@ -1395,11 +1395,10 @@ def _deferred_commits(conn: sqlite3.Connection):
         conn._defer_commit = False
         try:
             conn._real_commit()
-        except sqlite3.Error as exc:
+        except sqlite3.Error:
             logger.error(
-                "_deferred_commits: final commit failed: %s; "
+                "_deferred_commits: final commit failed; "
                 "rolling back the buffered transaction",
-                exc,
             )
             try:
                 conn.rollback()
@@ -3337,8 +3336,8 @@ class BeamMemory:
         # Always ensure the annotations table exists (cheap, idempotent).
         try:
             init_annotations(self.db_path)
-        except Exception as e:
-            logger.error("E6: failed to initialize annotations schema: %s", e)
+        except Exception:
+            logger.error("E6: failed to initialize annotations schema")
             return
 
         # Honor opt-out for operators who want explicit migrations only.
@@ -3359,11 +3358,9 @@ class BeamMemory:
                     if pending > 0:
                         logger.warning(
                             "E6: MNEMOSYNE_AUTO_MIGRATE=0 and %d annotation "
-                            "rows remain in the legacy triples table. Run "
-                            "`python scripts/migrate_triplestore_split.py "
-                            "--db %s` to migrate manually.",
+                            "rows remain in the legacy triples table. "
+                            "Run migrate_triplestore_split.py to migrate manually.",
                             pending,
-                            self.db_path,
                         )
             except Exception as e:
                 logger.debug("E6: opt-out probe failed: %s", e)
@@ -3403,20 +3400,14 @@ class BeamMemory:
             if written > 0:
                 logger.warning(
                     "E6: auto-migrated %d annotation rows from triples → "
-                    "annotations. Backup is at %s.pre_e6_backup "
-                    "(from this run if newly created, or an earlier run if "
-                    "the file already existed). "
+                    "annotations. A .pre_e6_backup was created. "
                     "Set MNEMOSYNE_AUTO_MIGRATE=0 to disable auto-migration.",
                     written,
-                    self.db_path,
                 )
-        except Exception as e:
+        except Exception:
             logger.error(
                 "E6: auto-migration failed (continuing init with current schema "
-                "state). Run `python scripts/migrate_triplestore_split.py "
-                "--db %s` manually. Error: %s",
-                self.db_path,
-                e,
+                "state). Run migrate_triplestore_split.py manually.",
             )
 
     # ------------------------------------------------------------------
@@ -7816,8 +7807,8 @@ class BeamMemory:
                 query_embedding=query_embedding,
                 top_k=top_k * 2,  # over-fetch for filter dropouts
             )
-        except Exception as exc:
-            logger.exception("polyphonic recall engine failed: %s", exc)
+        except Exception:
+            logger.error("polyphonic recall engine failed")
             return []
 
         # Map → recall's dict shape with filters + multipliers applied.
@@ -9227,12 +9218,11 @@ class BeamMemory:
                     refresh = result.get("model_refresh") or {}
                     model_refresh_proposals += int(refresh.get("proposals", 0) or 0)
                     model_refresh_applied += int(refresh.get("applied", 0) or 0)
-            except Exception as exc:
+            except Exception:
                 logger.error(
-                    "sleep_all_sessions: session %r consolidation failed: %s",
-                    session_id, exc, exc_info=True,
+                    "sleep_all_sessions: session consolidation failed",
                 )
-                errors.append({"session_id": session_id, "error": repr(exc)})
+                errors.append({"session_id": session_id, "error": "consolidation_failed"})
 
         # Run tiered degradation after all-sessions consolidation
         degrade_result = self.degrade_episodic(dry_run=dry_run)

@@ -252,7 +252,7 @@ def _call_llm(prompt: str, system: str = "") -> str:
         if result:
             return result
     except Exception:
-        logger.debug("SHMR cloud fallback failed", exc_info=True)
+        logger.debug("SHMR cloud fallback failed")
 
     return ""
 

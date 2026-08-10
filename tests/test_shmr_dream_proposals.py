@@ -1706,3 +1706,47 @@ class TestRolledBackContentFree:
         assert secret not in rendered, (
             f"raw exception text leaked into WARNING log: {rendered!r}"
         )
+
+
+class TestShmrCloudFallbackContentFree:
+    """Task 19: the SHMR cloud-fallback DEBUG path must not attach a
+    traceback."""
+
+    def test_cloud_fallback_debug_traceback_omits_exception(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import mnemosyne.core.shmr as shmr_mod
+
+        # Force the local path to fail so the cloud-fallback path is reached.
+        monkeypatch.setattr(
+            "mnemosyne.core.local_llm._call_local_llm",
+            lambda *a, **k: None,
+        )
+
+        canary = "TASK19_CLOUD_CANARY"
+
+        class _RaisingExtractionClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def chat(self, *a, **kw):
+                raise RuntimeError(canary + ":: http://secret/model-endpoint")
+
+        monkeypatch.setattr(
+            "mnemosyne.extraction.ExtractionClient", _RaisingExtractionClient
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="mnemosyne.shmr"):
+            result = shmr_mod._call_llm("test prompt")
+
+        assert result == ""
+        debug_records = [
+            r for r in caplog.records
+            if r.name == "mnemosyne.shmr" and r.levelno == logging.DEBUG
+            and "cloud fallback failed" in r.getMessage()
+        ]
+        assert debug_records, "expected cloud-fallback DEBUG record"
+        for r in debug_records:
+            assert canary not in r.getMessage()
+            assert canary not in (r.exc_text or "")
+            assert r.exc_info is None or not r.exc_info
