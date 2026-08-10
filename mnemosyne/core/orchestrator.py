@@ -6,10 +6,7 @@ Provides a small compatibility entry point for callers that want a single
 All retrieval/scoring logic remains in beam.py and related recall modules.
 """
 
-import logging
 from typing import Any, Dict, List, Optional
-
-logger = logging.getLogger(__name__)
 
 
 def orchestrate_recall(
@@ -34,22 +31,16 @@ def orchestrate_recall(
         **kwargs: Passed through to ``BeamMemory.recall``.
 
     Returns:
-        Recall result dictionaries. Returns an empty list only if recall raises.
+        Recall result dictionaries. An empty list means no matches; recall
+        failures raise the original exception unchanged.
     """
-    try:
-        if beam is not None:
-            return beam.recall(query, top_k=top_k, **kwargs)
+    if beam is not None:
+        return beam.recall(query, top_k=top_k, **kwargs)
 
-        from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.beam import BeamMemory
 
-        temp_beam = BeamMemory(session_id=session_id)
-        if conn is not None:
-            # Keep legacy raw-connection callers on their provided DB.
-            temp_beam.conn = conn
-        return temp_beam.recall(query, top_k=top_k, **kwargs)
-    except Exception:
-        logger.warning(
-            "orchestrate_recall: BeamMemory recall failed; returning empty list",
-            exc_info=True,
-        )
-        return []
+    temp_beam = BeamMemory(session_id=session_id)
+    if conn is not None:
+        # Keep legacy raw-connection callers on their provided DB.
+        temp_beam.conn = conn
+    return temp_beam.recall(query, top_k=top_k, **kwargs)
