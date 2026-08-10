@@ -2797,8 +2797,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         try:
             if not self.has_tool(tool_name):
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
-        except ValueError as exc:
-            return json.dumps({"error": str(exc)})
+        except ValueError:
+            return json.dumps({"error": "invalid_tool_name"})
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
         if not self._beam:
@@ -2889,9 +2889,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 return self._handle_persona_tool(tool_name, args)
             else:
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
-        except Exception as e:
-            logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
-            return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
+        except Exception:
+            logger.error("Mnemosyne tool %s failed", tool_name)
+            return json.dumps({"error": "tool_failed", "tool": tool_name})
 
     def _handle_sync_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         try:
@@ -2901,10 +2901,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 adapter = SyncAdapter(self._beam, {})
                 self._sync_adapter = adapter
             return adapter.handle_tool_call(tool_name, args)
-        except Exception as exc:
+        except Exception:
             return json.dumps({
                 "status": "error",
-                "error": f"Sync adapter unavailable: {exc}",
+                "error": "sync_adapter_unavailable",
             })
 
     def _handle_persona_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
@@ -2915,10 +2915,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 adapter = PersonaAdapter(self._beam, {})
                 self._persona_adapter = adapter
             return adapter.handle_tool_call(tool_name, args)
-        except Exception as exc:
+        except Exception:
             return json.dumps({
                 "status": "error",
-                "error": f"Persona adapter unavailable: {exc}",
+                "error": "persona_adapter_unavailable",
             })
 
     def _handle_remember(self, args: Dict[str, Any]) -> str:
@@ -3361,10 +3361,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                  note or None),
             )
             conn.commit()
-        except Exception as exc:
+        except Exception:
             return json.dumps({
                 "error": "validation_failed",
-                "reason": str(exc),
+                "reason": "validation_error",
                 "memory_id": memory_id,
             })
 
@@ -3615,8 +3615,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 record_path.unlink(missing_ok=True)
                 applied.append({"id": pid, "memory_id": memory_id})
-            except Exception as exc:
-                failed.append({"id": pid, "error": str(exc)})
+            except Exception:
+                failed.append({"id": pid, "error": "apply_failed"})
 
         return json.dumps({
             "applied": applied,
@@ -3918,10 +3918,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             ].get("after", {})
                         else:
                             result["active_provider_vec_working"] = vec_working_coverage(self._beam.conn)
-                    except Exception as exc:
-                        result["active_provider_vec_working_error"] = str(exc)
-                except Exception as exc:
-                    result["active_provider_counts_error"] = str(exc)
+                    except Exception:
+                        result["active_provider_vec_working_error"] = "diagnostic_unavailable"
+                except Exception:
+                    result["active_provider_counts_error"] = "diagnostic_unavailable"
 
             return json.dumps(result, indent=2, default=str)
 

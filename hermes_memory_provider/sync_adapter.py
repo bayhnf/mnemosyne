@@ -32,7 +32,6 @@ import os
 import threading
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -241,7 +240,7 @@ class SyncAdapter:
         if not self.is_ready:
             return json.dumps({
                 "status": "error",
-                "error": f"Sync adapter not available: {self._error or 'not initialized'}",
+                "error": "sync_adapter_unavailable",
             })
 
         try:
@@ -253,9 +252,13 @@ class SyncAdapter:
                 return self._handle_status()
             else:
                 return json.dumps({"status": "error", "error": f"Unknown tool: {tool_name}"})
-        except Exception as exc:
-            logger.debug("Sync tool %s failed: %s", tool_name, exc)
-            return json.dumps({"status": "error", "error": str(exc)})
+        except Exception:
+            logger.debug("Sync tool %s failed", tool_name)
+            return json.dumps({
+                "status": "error",
+                "error": "sync_tool_failed",
+                "tool": tool_name,
+            })
 
     # --- Push --------------------------------------------------------------
 

@@ -59,9 +59,13 @@ class PersonaAdapter:
                 return self._list(**args)
             elif tool_name == "mnemosyne_persona_reinforce":
                 return self._reinforce(**args)
-        except Exception as exc:
+        except Exception:
             logger.exception("Persona tool %s failed", tool_name)
-            return json.dumps({"status": "error", "error": str(exc)})
+            return json.dumps({
+                "status": "error",
+                "error": "persona_tool_failed",
+                "tool": tool_name,
+            })
         return json.dumps({"status": "error", "error": f"Unknown tool: {tool_name}"})
 
     def _promote(self, memory_id: str = "", tier: str = "long_term",

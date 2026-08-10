@@ -82,7 +82,7 @@ def test_diagnose_reports_count_error_without_failing(tmp_path, monkeypatch):
 
     assert result["active_provider_db_path"] == str(db_path)
     assert "active_provider_counts_error" in result
-    assert "no such table: facts" in result["active_provider_counts_error"]
+    assert result["active_provider_counts_error"] == "diagnostic_unavailable"
 
 
 
