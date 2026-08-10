@@ -2084,8 +2084,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 self._memory = mem
                 self._beam = mem.beam
                 logger.info(
-                    "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
-                    self._session_id, bank_name, mem.db_path,
+                    "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s",
+                    self._session_id, bank_name,
                 )
             else:
                 BeamMemory = _get_beam_class()

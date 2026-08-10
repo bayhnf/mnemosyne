@@ -1445,8 +1445,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 self._memory = mem
                 self._beam = mem.beam
                 logger.info(
-                    "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s, db=%s",
-                    self._session_id, bank_name, mem.db_path,
+                    "Mnemosyne initialized (profile isolation ON): session=%s, bank=%s",
+                    self._session_id, bank_name,
                 )
             else:
                 BeamMemory = _get_beam_class()
@@ -1459,10 +1459,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if kwargs.get("channel_id"):
                     beam_kwargs["channel_id"] = kwargs["channel_id"]
                 self._beam = BeamMemory(**beam_kwargs)
-                logger.info(
-                    "Mnemosyne initialized: session=%s, db=%s",
-                    self._session_id, db_path or "default",
-                )
+                logger.info("Mnemosyne initialized: session=%s", self._session_id)
 
         except Exception as e:
             # C27: capture the exception so system_prompt_block() can render a
