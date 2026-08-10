@@ -7432,13 +7432,11 @@ class BeamMemory:
             # ``top_k`` is part of the v2 digest, so truncating here would
             # make a hit differ from the cached pipeline result (notably when
             # associative retrieval appends related memories after top-k).
-            # Normalize cached rows so pre-metadata-contract cache entries
-            # still expose a parsed ``metadata: dict`` and never the raw
-            # storage field, without changing order or scores.
-            for _r in cached:
-                if not isinstance(_r.get("metadata"), dict):
-                    _r.pop("metadata_json", None)
-                    _r["metadata"] = {}
+            # Rehydrate metadata so pre-metadata-contract cache entries
+            # expose the real row's parsed ``metadata: dict`` (not ``{}``)
+            # for real working/episodic rows, while synthetic rows still
+            # receive ``{}``. Never surfaces the raw ``metadata_json``.
+            self._attach_recall_metadata(cached)
             return cached
 
         # 4. Run base recall with expanded query

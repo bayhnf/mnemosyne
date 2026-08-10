@@ -195,3 +195,119 @@ def test_no_recall_row_exposes_raw_metadata_json(tmp_path, monkeypatch):
         assert isinstance(row.get("metadata"), dict), (
             f"row {row.get('id')!r} missing parsed metadata dict"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-2: stale enhanced-cache hits must rehydrate real metadata
+# ---------------------------------------------------------------------------
+
+
+def _make_enhanced_cache_key(beam, query):
+    """Reproduce the exact opaque key recall_enhanced computes for a
+    no-argument enhanced call (no explicit weights/flags)."""
+    from mnemosyne.core.beam import _resolve_recall_weights, expand_query
+    from mnemosyne.core.config import resolve_beam_runtime
+    ws = _resolve_recall_weights(None, None, None)
+    kwargs = {
+        "vec_weight": ws.vec,
+        "fts_weight": ws.fts,
+        "importance_weight": ws.importance,
+    }
+    expanded = expand_query(query) if expand_query is not None else query
+    return beam._enhanced_recall_cache_key(
+        original_query=query,
+        expanded_query=expanded,
+        top_k=40,
+        runtime=resolve_beam_runtime(),
+        use_weibull=True,
+        use_mmr=True,
+        use_intent=True,
+        use_synonyms=True,
+        use_associative=False,
+        associative_depth=1,
+        mmr_lambda=0.7,
+        recall_kwargs=kwargs,
+        weights=ws.as_tuple(),
+    )
+
+
+def _ensure_cache(beam):
+    from mnemosyne.core.query_cache import QueryCache
+    if not hasattr(beam, "_query_cache"):
+        beam._query_cache = QueryCache(
+            db_path=beam.db_path.parent / "query_cache.db"
+        )
+    return beam._query_cache
+
+
+def test_enhanced_cache_hit_rehydrates_real_row_metadata(tmp_path, monkeypatch):
+    """Round-2 I-2: a cache entry created before the metadata contract
+    (row dict without a ``metadata`` key) must rehydrate the real row's
+    persisted metadata on hit, not collapse to ``{}``.
+
+    Simulates an upgraded process whose ``query_cache.db`` was written
+    by a pre-contract version: the opaque v2 key is unchanged, so the
+    stale entry is reachable, and the rows lack a parsed ``metadata``
+    dict. Only synthetic rows (no real id) should get ``{}``.
+    """
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    beam = BeamMemory(db_path=tmp_path / "cache.db", session_id="s1")
+
+    real_id = beam.remember(
+        "cached metadata alpha", metadata={"kind": "real", "n": 1},
+    )
+
+    cache_key = _make_enhanced_cache_key(beam, "cached metadata alpha")
+    # Simulate a pre-contract cache entry: real row id, no `metadata`
+    # key, and the raw `metadata_json` still present.
+    stale_entry = [{
+        "id": real_id,
+        "content": "cached metadata alpha",
+        "tier": "working",
+        "session_id": "s1",
+        "scope": "session",
+        "score": 0.9,
+        "metadata_json": '{"kind": "real", "n": 1}',
+    }]
+    _ensure_cache(beam).put_opaque(cache_key, stale_entry)
+
+    results = beam.recall_enhanced("cached metadata alpha", top_k=40)
+    assert results, "cache hit returned nothing"
+    target = next((r for r in results if r["id"] == real_id), None)
+    assert target is not None, "real row missing from cached results"
+    assert target["metadata"] == {"kind": "real", "n": 1}, (
+        f"stale cache hit failed to rehydrate real metadata; "
+        f"got {target['metadata']!r}"
+    )
+    assert "metadata_json" not in target, "raw metadata_json leaked on cache hit"
+
+
+def test_enhanced_cache_hit_synthetic_row_still_empty(tmp_path, monkeypatch):
+    """Synthetic rows (no real DB id) in a stale cache entry must still
+    get ``metadata == {}`` after rehydration — only real rows are
+    rehydrated."""
+    monkeypatch.setenv("MNEMOSYNE_ENHANCED_RECALL", "1")
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    beam = BeamMemory(db_path=tmp_path / "cache_syn.db", session_id="s1")
+
+    cache_key = _make_enhanced_cache_key(beam, "synthetic cache query")
+    stale_entry = [{
+        "id": "memoria_regex_synthetic",
+        "content": "synthetic cache content",
+        "tier": "memoria",
+        "session_id": "s1",
+        "scope": "session",
+        "score": 0.5,
+    }]
+    _ensure_cache(beam).put_opaque(cache_key, stale_entry)
+
+    results = beam.recall_enhanced("synthetic cache query", top_k=40)
+    assert results, "cache hit returned nothing"
+    target = next(
+        (r for r in results if r["id"] == "memoria_regex_synthetic"), None,
+    )
+    assert target is not None, "synthetic row missing from cached results"
+    assert target["metadata"] == {}, (
+        f"synthetic row should have empty metadata; got {target['metadata']!r}"
+    )

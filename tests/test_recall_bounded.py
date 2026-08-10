@@ -1331,3 +1331,218 @@ class TestBoundedDegradationObservabilityI3:
         assert "content free log sentinel" not in full, (
             "raw query leaked into degradation log"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review remediation: vector-path only_active, content-free logs
+# ---------------------------------------------------------------------------
+
+
+class TestOnlyActiveVectorPathRound2:
+    """Round-2 I-1: ``only_active=False`` must admit lifecycle-expired/
+    superseded rows via the **working-memory vector path** specifically
+    — not just FTS or recent fallback. The test pins embedding
+    availability so the vector path is the *only* matching retrieval
+    voice, then asserts both admission and mode."""
+
+    def test_only_active_false_admits_expired_row_via_vector_path(
+        self, beam, monkeypatch,
+    ):
+        import numpy as np
+        from datetime import datetime, timedelta, timezone
+        import mnemosyne.core.beam as beam_mod
+        from mnemosyne.core import embeddings as emb_mod
+
+        # Seed an expired working-memory row with a vector embedding.
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        mid = _remember(
+            beam, "vector lifecycle expired unique alpha",
+            valid_until=past,
+        )
+        # Insert a matching embedding so _wm_vec_search_fallback finds it.
+        fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
+        beam.conn.execute(
+            "INSERT INTO memory_embeddings(memory_id, embedding_json, model) "
+            "VALUES (?, ?, ?)",
+            (mid, __import__("json").dumps(fake_vec.tolist()), "test"),
+        )
+        beam.conn.commit()
+
+        # Force embeddings "available" + deterministic query embedding.
+        monkeypatch.setattr(emb_mod, "available", lambda: True)
+        monkeypatch.setattr(
+            beam_mod._embeddings, "available", lambda: True,
+        )
+        monkeypatch.setattr(
+            beam_mod._embeddings, "embed_query",
+            lambda q: fake_vec.copy(),
+        )
+        # Kill FTS so it cannot mask the vector-path defect.
+        monkeypatch.setattr(beam_mod, "_fts_search_working", lambda *a, **k: [])
+        monkeypatch.setattr(beam_mod, "_fts_search", lambda *a, **k: [])
+
+        env = beam.recall_bounded(
+            "vector lifecycle expired unique alpha",
+            RecallPolicy(top_k=10, only_active=False),
+        )
+        ids = {r["id"] for r in env.results}
+        assert mid in ids, (
+            f"only_active=False failed to admit expired row {mid} via "
+            f"vector path; got {sorted(ids)}"
+        )
+        # Must have used the vector path (not FTS or recent fallback).
+        assert env.retrieval_mode == "vector", (
+            f"expected vector mode; got {env.retrieval_mode!r} "
+            "(FTS/fallback would mask the vector-path defect)"
+        )
+
+    def test_only_active_false_admits_superseded_row_via_vector_path(
+        self, beam, monkeypatch,
+    ):
+        import numpy as np
+        import mnemosyne.core.beam as beam_mod
+        from mnemosyne.core import embeddings as emb_mod
+
+        mid = _remember(
+            beam, "vector lifecycle superseded unique beta",
+            superseded_by="ep-replacement",
+        )
+        fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
+        beam.conn.execute(
+            "INSERT INTO memory_embeddings(memory_id, embedding_json, model) "
+            "VALUES (?, ?, ?)",
+            (mid, __import__("json").dumps(fake_vec.tolist()), "test"),
+        )
+        beam.conn.commit()
+
+        monkeypatch.setattr(
+            beam_mod._embeddings, "available", lambda: True,
+        )
+        monkeypatch.setattr(
+            beam_mod._embeddings, "embed_query",
+            lambda q: fake_vec.copy(),
+        )
+        monkeypatch.setattr(beam_mod, "_fts_search_working", lambda *a, **k: [])
+        monkeypatch.setattr(beam_mod, "_fts_search", lambda *a, **k: [])
+
+        env = beam.recall_bounded(
+            "vector lifecycle superseded unique beta",
+            RecallPolicy(top_k=10, only_active=False),
+        )
+        ids = {r["id"] for r in env.results}
+        assert mid in ids, (
+            f"only_active=False failed to admit superseded row {mid} via "
+            f"vector path; got {sorted(ids)}"
+        )
+        assert env.retrieval_mode == "vector", (
+            f"expected vector mode; got {env.retrieval_mode!r}"
+        )
+
+    def test_only_active_true_still_expires_row_via_vector_path(
+        self, beam, monkeypatch,
+    ):
+        """Counterpart: with only_active=True (default), the vector path
+        must still exclude the expired row (fail-closed preserved)."""
+        import numpy as np
+        from datetime import datetime, timedelta, timezone
+        import mnemosyne.core.beam as beam_mod
+        from mnemosyne.core import embeddings as emb_mod
+
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        mid = _remember(
+            beam, "vector lifecycle expired unique gamma",
+            valid_until=past,
+        )
+        fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
+        beam.conn.execute(
+            "INSERT INTO memory_embeddings(memory_id, embedding_json, model) "
+            "VALUES (?, ?, ?)",
+            (mid, __import__("json").dumps(fake_vec.tolist()), "test"),
+        )
+        beam.conn.commit()
+
+        monkeypatch.setattr(
+            beam_mod._embeddings, "available", lambda: True,
+        )
+        monkeypatch.setattr(
+            beam_mod._embeddings, "embed_query",
+            lambda q: fake_vec.copy(),
+        )
+        monkeypatch.setattr(beam_mod, "_fts_search_working", lambda *a, **k: [])
+        monkeypatch.setattr(beam_mod, "_fts_search", lambda *a, **k: [])
+
+        env = beam.recall_bounded(
+            "vector lifecycle expired unique gamma",
+            RecallPolicy(top_k=10),  # only_active=True (default)
+        )
+        assert mid not in {r["id"] for r in env.results}
+
+
+class TestDegradationLogsContentFreeRound2:
+    """Round-2 I-3: degradation logs must be *strictly* content-free —
+    no query, no raw exception message, no traceback text, no payload.
+    The round-1 test only checked the query string; this also asserts
+    the exception message and traceback are absent."""
+
+    def test_fts_working_failure_log_is_strictly_content_free(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+        _remember(beam, "secret canary content alpha")
+        import mnemosyne.core.beam as beam_mod
+
+        def _boom(conn, query, k=20):
+            raise RuntimeError("UNIQUE_EXC_DETAIL_42 boom")
+
+        monkeypatch.setattr(beam_mod, "_fts_search_working", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            beam.recall_bounded(
+                "secret canary content alpha", RecallPolicy(top_k=10),
+            )
+        full = caplog.text
+        assert "secret canary content alpha" not in full, (
+            "raw query leaked into degradation log"
+        )
+        assert "UNIQUE_EXC_DETAIL_42" not in full, (
+            "raw exception message leaked into degradation log "
+            "(exc_info=True renders it into the record)"
+        )
+        assert "Traceback" not in full, (
+            "traceback text leaked into degradation log"
+        )
+
+    def test_memoria_failure_log_is_strictly_content_free(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+        _remember(beam, "memoria secret payload beta")
+        import mnemosyne.core.beam as beam_mod
+
+        def _boom(conn, query, k=20):
+            raise RuntimeError("MEMORIA_EXC_DETAIL_99 leak")
+
+        # Patch at the module level so the bounded path's except block hits it.
+        monkeypatch.setattr(beam_mod, "_fts_search_working", _boom)
+        # Also patch memoria to ensure its exception detail doesn't leak.
+        def _memoria_boom(self, query, ability=None, top_k=10):
+            raise RuntimeError("MEMORIA_INNER_DETAIL_77 leak")
+
+        monkeypatch.setattr(type(beam), "memoria_retrieve", _memoria_boom)
+
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            beam.recall_bounded(
+                "memoria secret payload beta", RecallPolicy(top_k=10),
+            )
+        full = caplog.text
+        assert "memoria secret payload beta" not in full, (
+            "raw query leaked into memoria degradation log"
+        )
+        assert "MEMORIA_EXC_DETAIL_99" not in full, (
+            "FTS exception message leaked even via memoria path"
+        )
+        assert "MEMORIA_INNER_DETAIL_77" not in full, (
+            "memoria exception message leaked into degradation log"
+        )
+        assert "Traceback" not in full, (
+            "traceback text leaked into memoria degradation log"
+        )

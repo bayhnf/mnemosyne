@@ -331,9 +331,15 @@ def _render_row(row: Dict[str, Any]) -> str:
 
 
 def _build_where(
-    beam, policy: RecallPolicy, now_iso: str
+    beam, policy: RecallPolicy, now_iso: str, *, table_prefix: str = "",
 ) -> Tuple[str, List[Any]]:
-    """Build native identity/session/lifecycle SQL from the policy."""
+    """Build native identity/session/lifecycle SQL from the policy.
+
+    ``table_prefix`` (e.g. ``"wm."``) is applied to every column so the
+    same predicate can be pushed into a JOIN'd vector-search query
+    without duplicating the scope/identity/lifecycle logic.
+    """
+    p = table_prefix
     where_parts: List[str] = []
     params: List[Any] = []
     if policy.only_active:
@@ -341,13 +347,13 @@ def _build_where(
         # gate (_passes_policy) still authoritatively decides, so we do
         # NOT pre-filter here — expired/superseded rows must be able to
         # reach the gate subject to the remaining scope/policy filters.
-        where_parts.append("(valid_until IS NULL OR valid_until > ?)")
+        where_parts.append(f"({p}valid_until IS NULL OR {p}valid_until > ?)")
         params.append(now_iso)
-        where_parts.append("superseded_by IS NULL")
+        where_parts.append(f"{p}superseded_by IS NULL")
     if policy.include_shared or policy.include_legacy_shared:
         where_parts.append("(1=1)")
     else:
-        where_parts.append("(session_id = ? OR scope = 'global')")
+        where_parts.append(f"({p}session_id = ? OR {p}scope = 'global')")
         params.append(beam.session_id)
     # I-6: empty allowlists fail closed (match nothing) via a
     # guaranteed-false predicate; non-empty use parameterized IN (...).
@@ -370,18 +376,18 @@ def _build_where(
             where_parts.append("(1=0)")
         else:
             ph = ",".join("?" * len(_vals))
-            where_parts.append(f"{_col} IN ({ph})")
+            where_parts.append(f"{p}{_col} IN ({ph})")
             params.extend(_vals)
     if policy.source is not None:
-        where_parts.append("source = ?")
+        where_parts.append(f"{p}source = ?")
         params.append(policy.source)
     if policy.from_date:
-        where_parts.append("timestamp >= ?")
+        where_parts.append(f"{p}timestamp >= ?")
         params.append(f"{policy.from_date}T00:00:00")
     if policy.to_date:
-        where_parts.append("timestamp <= ?")
+        where_parts.append(f"{p}timestamp <= ?")
         params.append(f"{policy.to_date}T23:59:59")
-    where_parts.append("source NOT IN ('sleep_model_refresh_proposal')")
+    where_parts.append(f"{p}source NOT IN ('sleep_model_refresh_proposal')")
     return " AND ".join(where_parts), params
 
 
@@ -423,21 +429,30 @@ def _hydrate_candidates(
         try:
             query_embedding = _beam_mod._embeddings.embed_query(query)
         except Exception:
-            logger.info("bounded: query embedding failed", exc_info=True)
+            logger.info("bounded: query embedding failed")
             query_embedding = None
 
     if query_embedding is not None:
         try:
+            # Build the working-vector where clause from the same policy
+            # that drives every other path — scope/identity/lifecycle
+            # filters are identical, just prefixed with ``wm.`` for the
+            # JOIN'd vector query. When only_active=False the lifecycle
+            # clauses are omitted so expired/superseded rows can reach
+            # the gate (_passes_policy), matching the FTS/fallback paths.
+            wm_where, wm_params = _build_where(
+                beam, policy, now_iso, table_prefix="wm.",
+            )
             wm_vec = _beam_mod._wm_vec_search(
                 conn, query_embedding, k=max(policy.top_k * 3, 50),
-                where_sql="wm.superseded_by IS NULL AND (wm.valid_until IS NULL OR wm.valid_until > ?)",
-                where_params=(now_iso,),
+                where_sql=wm_where,
+                where_params=tuple(wm_params),
             )
             for vr in wm_vec:
                 had_vector = True
                 candidates.setdefault(vr["id"], {"id": vr["id"], "_vec_sim": vr["sim"]})
         except Exception:
-            logger.info("bounded: wm vec search failed", exc_info=True)
+            logger.info("bounded: wm vec search failed")
         try:
             if _beam_mod._vec_available(conn):
                 vec_rows = _beam_mod._vec_search(
@@ -457,7 +472,7 @@ def _hydrate_candidates(
                         {"id": None, "_rowid": vr["rowid"], "_vec_sim": sim},
                     )
         except Exception:
-            logger.info("bounded: episodic vec search failed", exc_info=True)
+            logger.info("bounded: episodic vec search failed")
 
     # --- FTS path (working + episodic) ---
     try:
@@ -467,7 +482,7 @@ def _hydrate_candidates(
         # echo the raw query or exception detail into log messages.
         wm_fts = []
         degradation.append("fts_working_failed")
-        logger.info("bounded: working fts search failed", exc_info=True)
+        logger.info("bounded: working fts search failed")
     for fr in wm_fts:
         had_fts = True
         candidates.setdefault(fr["id"], {"id": fr["id"], "_fts_rank": fr["rank"]})
@@ -477,7 +492,7 @@ def _hydrate_candidates(
         # I-3: structured degradation signal + content-free log.
         em_fts = []
         degradation.append("fts_episodic_failed")
-        logger.info("bounded: episodic fts search failed", exc_info=True)
+        logger.info("bounded: episodic fts search failed")
     for fr in em_fts:
         had_fts = True
         candidates.setdefault(
@@ -491,7 +506,7 @@ def _hydrate_candidates(
         for eid in entity_ids:
             candidates.setdefault(eid, {"id": eid, "_entity_match": True})
     except Exception:
-        logger.info("bounded: entity lookup failed", exc_info=True)
+        logger.info("bounded: entity lookup failed")
 
     # --- Fact supplement ---
     try:
@@ -499,7 +514,7 @@ def _hydrate_candidates(
         for fid in fact_ids:
             candidates.setdefault(fid, {"id": fid, "_fact_match": True})
     except Exception:
-        logger.info("bounded: fact lookup failed", exc_info=True)
+        logger.info("bounded: fact lookup failed")
 
     # --- MEMORIA supplement ---
     try:
@@ -540,7 +555,7 @@ def _hydrate_candidates(
         # I-3: structured degradation signal + content-free log. Never
         # echo the raw query or memory content.
         degradation.append("memoria_failed")
-        logger.info("bounded: memoria lookup failed", exc_info=True)
+        logger.info("bounded: memoria lookup failed")
 
     # --- Resolve candidate ids → full rows ---
     # First pass: resolve string ids against working_memory.
@@ -702,7 +717,7 @@ def _hydrate_candidates(
                     assoc_added[mid] = real_row
             scored.extend(assoc_added.values())
         except Exception:
-            logger.info("bounded: associative hydration failed", exc_info=True)
+            logger.info("bounded: associative hydration failed")
 
     return scored, mode, degradation
 
