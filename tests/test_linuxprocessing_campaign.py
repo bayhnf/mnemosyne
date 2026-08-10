@@ -616,3 +616,84 @@ class TestG4CoreLifecycle:
             ],
         )
         assert lpc.main() == 1
+
+
+# ===========================================================================
+# Commit 5: G4 fault matrix
+# ===========================================================================
+
+
+class TestG4FaultMatrix:
+    """Each deterministic synthetic fault must produce a structured outcome
+    and prove no partial mutation of the clone."""
+
+    def _run_matrix(self, tmp_path, monkeypatch) -> dict:
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage("g4", trial, monkeypatch, "--fault-matrix")
+        assert code == 0, f"fault matrix failed: code={code}"
+        return _read_report(report_path)
+
+    def test_matrix_runs_all_ten_cases(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        checks = report["checks"]
+        assert "fault_matrix" in checks
+        cases = checks["fault_matrix"]["cases"]
+        expected = {
+            "lock",
+            "read_only",
+            "malformed_db",
+            "provider_failure",
+            "dimension",
+            "crash",
+            "sidecar",
+            "wal",
+            "concurrent_planner",
+            "sleep_vs_dream",
+        }
+        assert set(cases.keys()) == expected
+        for name, outcome in cases.items():
+            assert outcome["verdict"] == PASS, f"{name} did not pass"
+            assert outcome["contained"] is True
+            assert outcome["no_partial_mutation"] is True
+
+    def test_matrix_lock_fault_is_contained(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        lock = report["checks"]["fault_matrix"]["cases"]["lock"]
+        assert lock["verdict"] == PASS
+        assert lock["contained"] is True
+
+    def test_matrix_malformed_db_no_partial_mutation(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        malformed = report["checks"]["fault_matrix"]["cases"]["malformed_db"]
+        assert malformed["no_partial_mutation"] is True
+
+    def test_matrix_read_only_fault(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        ro = report["checks"]["fault_matrix"]["cases"]["read_only"]
+        assert ro["verdict"] == PASS
+
+    def test_matrix_wal_sidecar_faults(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        assert report["checks"]["fault_matrix"]["cases"]["wal"]["verdict"] == PASS
+        assert report["checks"]["fault_matrix"]["cases"]["sidecar"]["verdict"] == PASS
+
+    def test_matrix_provider_failure(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        pf = report["checks"]["fault_matrix"]["cases"]["provider_failure"]
+        assert pf["verdict"] == PASS
+
+    def test_matrix_concurrent_planner(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        cp = report["checks"]["fault_matrix"]["cases"]["concurrent_planner"]
+        assert cp["verdict"] == PASS
+
+    def test_matrix_sleep_vs_dream(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        sd = report["checks"]["fault_matrix"]["cases"]["sleep_vs_dream"]
+        assert sd["verdict"] == PASS
+
+    def test_matrix_content_free(self, tmp_path, monkeypatch):
+        report = self._run_matrix(tmp_path, monkeypatch)
+        _assert_content_free(json.dumps(report))
+        _assert_allowlist(report)
