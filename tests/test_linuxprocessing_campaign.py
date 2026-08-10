@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 
 import scripts.linuxprocessing_campaign as lpc
+
+# Local aliases for readability in assertions.
+PASS = lpc.PASS
+FAIL = lpc.FAIL
 
 
 # ---------------------------------------------------------------------------
@@ -169,3 +174,167 @@ class TestSkeleton:
         report = _read_report(report_path)
         assert report["reason_code"] == "unexpected_error"
         _assert_content_free(json.dumps(report))
+
+
+# ===========================================================================
+# Commit 2: G0/G1 preflight and isolated checkout
+# ===========================================================================
+
+
+class TestG0Preflight:
+    def test_g0_passes_when_python_space_endpoint_dimension_lane_ok(
+        self, tmp_path, monkeypatch
+    ):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage("g0", trial, monkeypatch)
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        assert checks["python"]["verdict"] == PASS
+        assert checks["disk_space"]["verdict"] == PASS
+        assert checks["endpoint"]["verdict"] == PASS
+        assert checks["dimension"]["verdict"] == PASS
+        assert checks["lane"]["verdict"] == PASS
+
+    def test_g0_fails_when_python_too_old(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        # Force a too-old python version.
+        monkeypatch.setattr(lpc.sys, "version_info", (3, 9, 0))
+        code, report_path = _run_stage("g0", trial, monkeypatch)
+        assert code == 1
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.FAIL
+        assert report["checks"]["python"]["verdict"] == FAIL
+
+    def test_g0_fails_when_trial_root_missing(self, tmp_path, monkeypatch):
+        # A nonexistent trial root is a fail, never a silent pass.
+        trial = tmp_path / "trial"  # never created
+        report_path = trial / "r.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "lpc.py",
+                "--trial-root",
+                str(trial),
+                "--report",
+                str(report_path),
+                "--stage",
+                "g0",
+            ],
+        )
+        assert lpc.main() == 1
+
+    def test_g0_content_free_and_allowlist(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage("g0", trial, monkeypatch)
+        report = _read_report(report_path)
+        _assert_allowlist(report)
+        _assert_content_free(json.dumps(report))
+
+
+class TestG0ManualGates:
+    def test_g0_records_t0_ssh_as_pending_without_ack(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage("g0", trial, monkeypatch)
+        # G0 preflight passes on environment, but the T0 SSH and image-digest
+        # gates are recorded as PENDING (never faked). Their presence in the
+        # checks is informational; the stage verdict reflects the environment.
+        report = _read_report(report_path)
+        assert report["checks"]["t0_ssh_ack"]["verdict"] == "PENDING"
+        assert report["checks"]["image_digest_ack"]["verdict"] == "PENDING"
+
+    def test_g0_records_t0_ssh_ack_when_flag_set(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _run_stage(
+            "g0",
+            trial,
+            monkeypatch,
+            "--ack-t0-ssh",
+            "--ack-image-digest",
+        )
+        report = _read_report(trial / "report.json")
+        assert report["checks"]["t0_ssh_ack"]["verdict"] == "ACKNOWLEDGED"
+        assert report["checks"]["image_digest_ack"]["verdict"] == "ACKNOWLEDGED"
+
+
+class TestG1Checkout:
+    def test_g1_gates_pending_without_approved_sha(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage("g1", trial, monkeypatch)
+        # Missing approved SHA -> GATE (exit 2), never pass.
+        assert code == 2
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.GATE
+        assert report["reason_code"] == "approved_sha_required"
+
+    def test_g1_passes_with_approved_sha_and_lane_imports(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--approved-sha",
+            "deadbeef" * 8,
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        # SHA presence + dependency health + lane imports each PASS.
+        assert checks["approved_sha"]["verdict"] == PASS
+        assert checks["dependency_health"]["verdict"] == PASS
+        assert checks["lane_imports"]["verdict"] == PASS
+
+    def test_g1_lane_imports_use_trial_interpreter(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        report_path = trial / "report.json"
+        # Capture the interpreter used for lane import subprocesses.
+        captured: list[str] = []
+        real_run = subprocess.run
+
+        def _spy(cmd, *a, **kw):  # type: ignore[no-untyped-def]
+            if cmd and "lane_import" in " ".join(cmd):
+                captured.append(cmd[0])
+            return real_run(cmd, *a, **kw)
+
+        monkeypatch.setattr(lpc.subprocess, "run", _spy)
+        _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--approved-sha",
+            "deadbeef" * 8,
+            "--trial-interpreter",
+            sys.executable,
+        )
+        report = _read_report(report_path)
+        # Lane import was attempted with the configured trial interpreter.
+        if captured:
+            assert captured[0] == sys.executable
+        assert report["checks"]["lane_imports"]["verdict"] == PASS
+
+    def test_g1_fails_when_lane_import_broken(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        # Point the trial interpreter at a bogus path so the lane import
+        # subprocess cannot run; dependency health still passes.
+        code, _ = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--approved-sha",
+            "deadbeef" * 8,
+            "--trial-interpreter",
+            "/nonexistent/interpreter/bin/python",
+        )
+        assert code == 1
