@@ -19,12 +19,17 @@ import json
 import logging
 import sqlite3
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from mnemosyne.core import beam as _beam_mod
 from mnemosyne.core.sync import _parse_sync_timestamp
+from mnemosyne.core.filters import (
+    classify_memory_write,
+    get_write_classifier_mode,
+    redact_memory_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,8 @@ def _iso_from_epoch(epoch: float) -> str:
 
 def _now_epoch() -> float:
     return datetime.now(timezone.utc).timestamp()
+
+
 MAX_ATTEMPTS = 5
 MAX_CONTENT_CHARS = 1_000_000
 MAX_FIELD_CHARS = 255
@@ -138,13 +145,32 @@ def remember_event(beam, event: IngestEvent) -> IngestReceipt:
     if errors:
         return _reject(event, errors)
 
+    # Native admission: classify before any payload hashing, dedup lookup,
+    # transaction, or memory write. Secrets are always rejected with zero
+    # durable writes; CoT/approval artifacts are canonicalized (warn),
+    # rejected (strict), or unchanged (off). On reject, return a
+    # content-free receipt WITHOUT entering a transaction or writing any row.
+    admitted, admit_errors, admit_labels, admission_marker = _admit_event(event)
+    if admit_errors:
+        return _reject(
+            event,
+            admit_errors,
+            error_code="admission_rejected",
+            labels=admit_labels,
+        )
+    event = admitted
+
     payload_hash = _payload_hash(event)
     conn = beam.conn
     _assert_inhale_transaction_context(conn)
     engine = _get_sync_engine(beam)
     now = _now_iso()
     provenance = _provenance(event)
-    receipt_meta = json.dumps({"_ingest": provenance}, sort_keys=True, default=str)
+    receipt_meta = json.dumps(
+        {"_ingest": provenance, **(admission_marker or {})},
+        sort_keys=True,
+        default=str,
+    )
 
     _begin_write(conn)
     try:
@@ -187,7 +213,9 @@ def remember_event(beam, event: IngestEvent) -> IngestReceipt:
             return _conflict_receipt(row, payload_hash, now)
 
         memory_id = _memory_id_for_event(event.event_id)
-        metadata_json = json.dumps(_memory_metadata(event), sort_keys=True, default=str)
+        metadata_json = json.dumps(
+            _memory_metadata(event, admission_marker), sort_keys=True, default=str
+        )
         conn.execute(
             """INSERT INTO working_memory
                (id, content, source, timestamp, session_id, importance,
@@ -271,7 +299,6 @@ def remember_turn(beam, turn: TurnEvent) -> IngestReceipt:
     return remember_event(beam, turn)
 
 
-
 def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]:
     """Durably ingest multiple turns atomically in one SQLite transaction.
 
@@ -304,14 +331,26 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
     # event id must be able to succeed, so a rejected key is never burned).
     # receipts is sized to len(turns) so every position maps 1:1 to an
     # input turn; a rejected receipt can never be overwritten or suppressed.
-    valid_turns: List[TurnEvent] = []
+    valid_turns: List[tuple] = []
     receipts: List[Optional[IngestReceipt]] = [None] * len(turns)
     for i, turn in enumerate(turns):
         errors = _validate_event(turn)
         if errors:
             receipts[i] = _reject(turn, errors)
+            continue
+        # Native admission runs in the phase-1 validation pass, before the
+        # transaction: rejected events never enter it (their event id stays
+        # reusable), and canonicalized events are what gets hashed/deduped.
+        admitted, admit_errors, admit_labels, admission_marker = _admit_event(turn)
+        if admit_errors:
+            receipts[i] = _reject(
+                turn,
+                admit_errors,
+                error_code="admission_rejected",
+                labels=admit_labels,
+            )
         else:
-            valid_turns.append((i, turn))
+            valid_turns.append((i, admitted, admission_marker))
 
     if not valid_turns:
         return receipts
@@ -325,7 +364,7 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
 
     _begin_write(conn)
     try:
-        for idx, turn in valid_turns:
+        for idx, turn, admission_marker in valid_turns:
             payload_hash = _payload_hash(turn)
             row = conn.execute(
                 "SELECT * FROM ingest_receipts WHERE event_id = ?",
@@ -349,14 +388,16 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
                 logger.warning(
                     "ingest conflict event_id=%r: stored payload_hash=%s, "
                     "conflicting payload_hash=%s (original receipt untouched)",
-                    turn.event_id, row["payload_hash"], payload_hash,
+                    turn.event_id,
+                    row["payload_hash"],
+                    payload_hash,
                 )
                 receipts[idx] = _conflict_receipt(row, payload_hash, now)
                 continue
 
             memory_id = _memory_id_for_event(turn.event_id)
             metadata_json = json.dumps(
-                _memory_metadata(turn), sort_keys=True, default=str
+                _memory_metadata(turn, admission_marker), sort_keys=True, default=str
             )
             conn.execute(
                 """INSERT INTO working_memory
@@ -365,10 +406,20 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
                     author_id, author_type, channel_id, scope)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    memory_id, turn.content, turn.producer, turn.occurred_at,
-                    turn.session_id, 0.5, metadata_json, "unknown", None,
+                    memory_id,
+                    turn.content,
+                    turn.producer,
+                    turn.occurred_at,
+                    turn.session_id,
+                    0.5,
+                    metadata_json,
+                    "unknown",
+                    None,
                     _beam_mod._source_to_trust_tier(turn.producer),
-                    turn.actor_id, turn.producer, turn.project_id, "session",
+                    turn.actor_id,
+                    turn.producer,
+                    turn.project_id,
+                    "session",
                 ),
             )
             conn.execute(
@@ -378,15 +429,26 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
                     updated_at, metadata_json)
                    VALUES (?, ?, ?, 'stored', 'pending', 1, NULL, NULL, ?, ?, ?)""",
                 (
-                    turn.event_id, payload_hash, json.dumps([memory_id]),
-                    now, now,
-                    json.dumps({"_ingest": _provenance(turn)},
-                               sort_keys=True, default=str),
+                    turn.event_id,
+                    payload_hash,
+                    json.dumps([memory_id]),
+                    now,
+                    now,
+                    json.dumps(
+                        {
+                            "_ingest": _provenance(turn),
+                            **(admission_marker or {}),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
                 ),
             )
             engine.log_event(
-                memory_id, "CREATE",
-                payload=_sync_payload(turn, metadata_json), commit=False,
+                memory_id,
+                "CREATE",
+                payload=_sync_payload(turn, metadata_json),
+                commit=False,
             )
             pending_index.append((idx, turn, memory_id))
             receipts[idx] = None  # placeholder; filled after commit
@@ -404,14 +466,21 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
     for pos, turn, memory_id in pending_index:
         try:
             index_status, error_code = _index_memory(
-                beam, memory_id, turn.content, turn.producer, turn.occurred_at,
+                beam,
+                memory_id,
+                turn.content,
+                turn.producer,
+                turn.occurred_at,
             )
             _finalize_receipt(beam, turn.event_id, index_status, error_code, 1)
         except Exception:
             try:
                 _finalize_receipt(
-                    beam, turn.event_id, "failed_retryable",
-                    "indexing_failed", 1,
+                    beam,
+                    turn.event_id,
+                    "failed_retryable",
+                    "indexing_failed",
+                    1,
                 )
             except Exception:
                 pass
@@ -476,9 +545,13 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
         try:
             if attempts >= MAX_ATTEMPTS:
                 if not _finalize_claimed(
-                    conn, event_id, "failed_terminal",
-                    "max_attempts_exceeded", attempts,
-                    release=True, worker_id=worker_id,
+                    conn,
+                    event_id,
+                    "failed_terminal",
+                    "max_attempts_exceeded",
+                    attempts,
+                    release=True,
+                    worker_id=worker_id,
                 ):
                     continue  # Claim was reclaimed; the new owner finalizes.
                 report.attempted += 1
@@ -489,9 +562,13 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
             memory_rows = _load_memory_rows(conn, row["memory_ids"])
             if not memory_rows:
                 if not _finalize_claimed(
-                    conn, event_id, "failed_terminal",
-                    "memory_row_missing", attempts + 1,
-                    release=True, worker_id=worker_id,
+                    conn,
+                    event_id,
+                    "failed_terminal",
+                    "memory_row_missing",
+                    attempts + 1,
+                    release=True,
+                    worker_id=worker_id,
                 ):
                     continue  # Claim was reclaimed; the new owner finalizes.
                 report.attempted += 1
@@ -519,8 +596,13 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
                     final_status, final_code = status, code
 
             if not _finalize_claimed(
-                conn, event_id, final_status, final_code,
-                attempts + 1, release=True, worker_id=worker_id,
+                conn,
+                event_id,
+                final_status,
+                final_code,
+                attempts + 1,
+                release=True,
+                worker_id=worker_id,
             ):
                 continue  # Claim was reclaimed; the new owner finalizes.
         except Exception:
@@ -547,7 +629,9 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
     return report
 
 
-def ingest_status(beam, event_id: Optional[str] = None, limit: int = 100) -> List[IngestReceipt]:
+def ingest_status(
+    beam, event_id: Optional[str] = None, limit: int = 100
+) -> List[IngestReceipt]:
     """Return content-free receipt data for stored ingest events.
 
     One stable idempotency surface for status, diagnostics, and doctor: reads
@@ -572,7 +656,6 @@ def ingest_status(beam, event_id: Optional[str] = None, limit: int = 100) -> Lis
         (limit,),
     ).fetchall()
     return [_receipt_from_row(r) for r in rows]
-
 
 
 def _try_claim(
@@ -621,9 +704,7 @@ def _try_claim(
         raise
 
 
-def _release_claim(
-    conn: sqlite3.Connection, event_id: str, worker_id: str
-) -> None:
+def _release_claim(conn: sqlite3.Connection, event_id: str, worker_id: str) -> None:
     """Clear THIS worker's claim (ownership-guarded CAS).
 
     A worker whose lease was reclaimed by another worker must not clear the
@@ -771,7 +852,13 @@ def _validate_event(event: IngestEvent) -> List[str]:
     return errors
 
 
-def _reject(event: IngestEvent, errors: List[str]) -> IngestReceipt:
+def _reject(
+    event: IngestEvent,
+    errors: List[str],
+    *,
+    error_code: str = "validation_failed",
+    labels: Optional[List[str]] = None,
+) -> IngestReceipt:
     """Structured rejection at the trust boundary.
 
     Deliberately NOT persisted: a rejected event has no partial state, and a
@@ -791,6 +878,12 @@ def _reject(event: IngestEvent, errors: List[str]) -> IngestReceipt:
         "; ".join(errors),
         type(event).__name__,
     )
+    metadata: Dict[str, Any] = {"errors": errors}
+    if labels:
+        # Label-only admission diagnostics: never the matched value or raw
+        # artifact text. ``labels`` arrive from Task 1's classifier warnings,
+        # which carry pattern labels (e.g. ``api_key_prefix``), not secrets.
+        metadata["admission_labels"] = labels
     now = _now_iso()
     return IngestReceipt(
         event_id=getattr(event, "event_id", "") or "",
@@ -799,12 +892,125 @@ def _reject(event: IngestEvent, errors: List[str]) -> IngestReceipt:
         status="rejected",
         index_status="failed_terminal",
         attempts=0,
-        last_error_code="validation_failed",
+        last_error_code=error_code,
         last_error_at=now,
         created_at=now,
         updated_at=now,
-        metadata={"errors": errors},
+        metadata=metadata,
     )
+
+
+# ---------------------------------------------------------------------------
+# Native admission policy (Task 2)
+# ---------------------------------------------------------------------------
+
+
+def _admit_event(
+    event: IngestEvent,
+) -> Tuple[Optional[IngestEvent], List[str], List[str], Optional[Dict[str, Any]]]:
+    """Classify an event at the trust boundary before any durable write.
+
+    Returns ``(admitted_event, reject_errors, reject_labels, admission_marker)``:
+      - ``admitted_event`` is the event to hash/persist. It is ``event`` when
+        no rewrite is required, or a canonical redacted copy (built via
+        ``dataclasses.replace``) when the classifier rewrote content and/or
+        metadata. It is ``None`` when the event must be rejected.
+      - ``reject_errors`` is empty unless the event must be rejected.
+      - ``reject_labels`` carries Task 1 classifier warning labels
+        (pattern/label only, never matched values or raw artifact text).
+      - ``admission_marker`` is ``None`` or a label-only marker
+        (``{"_admission": {"rewritten": reason}}``) for a warn canonicalization.
+        Callers persist it in existing stored metadata / receipt metadata
+        fields; it is never written into ``event.metadata``, so it cannot
+        alter the payload hash or break original/redacted-replay dedupe.
+
+    Native policy:
+      - Secrets are always rejected with zero durable writes, independently of
+        ``MNEMOSYNE_WRITE_CLASSIFIER``. The secret is checked in both
+        ``event.content`` and the canonical serialized ``event.metadata``.
+      - CoT/approval artifacts:
+          ``warn``   -> canonicalize (deterministic redaction via Task 1's
+                       ``redact_memory_artifact``) and proceed; the redacted
+                       event is what gets hashed and deduplicated, and the
+                       returned marker is persisted by callers.
+          ``strict`` -> reject.
+          ``off``    -> unchanged (compatibility preserved).
+    """
+    content_decision = classify_memory_write(event.content)
+
+    metadata_canonical = json.dumps(
+        event.metadata or {}, sort_keys=True, separators=(",", ":"), default=str
+    )
+    metadata_decision = classify_memory_write(metadata_canonical)
+
+    reject_errors: List[str] = []
+    reject_labels: List[str] = []
+
+    # --- Secrets: always reject, independent of classifier mode. ---
+    if content_decision.reason == "secret_detected":
+        reject_errors.append("content: secret_detected")
+        reject_labels.extend(content_decision.warnings)
+    if metadata_decision.reason == "secret_detected":
+        reject_errors.append("metadata: secret_detected")
+        reject_labels.extend(metadata_decision.warnings)
+
+    if reject_errors:
+        return None, reject_errors, reject_labels, None
+
+    # --- CoT/approval artifacts: mode-dependent handling. ---
+    mode = get_write_classifier_mode()
+    artifact_reasons = {"reasoning_artifact", "approval_artifact"}
+    is_artifact = (
+        content_decision.reason in artifact_reasons
+        or metadata_decision.reason in artifact_reasons
+    )
+
+    if mode == "strict" and is_artifact:
+        reason = content_decision.reason or metadata_decision.reason
+        reject_errors.append(f"admission: {reason}")
+        return None, reject_errors, reject_labels, None
+
+    if mode == "warn" and is_artifact:
+        # Deterministic canonicalization: the placeholder token is derived
+        # from the stable reason label, never from the artifact. The
+        # canonical event is what gets hashed/deduped, so an original
+        # (canonicalized here) and a direct redacted replay collide as
+        # duplicates. Content and metadata artifacts are redacted
+        # independently; the label-only admission marker is persisted by
+        # callers (never inside event.metadata, so the payload hash is
+        # unchanged by the marker itself).
+        marker_reason = content_decision.reason or metadata_decision.reason
+        rewritten: Dict[str, Any] = {}
+        if content_decision.reason in artifact_reasons:
+            redacted = redact_memory_artifact(event.content, content_decision.reason)
+            # Recompute content_hash so the canonical event is byte-for-byte
+            # consistent: a later direct replay of the redacted form must
+            # collide as a duplicate (same content, same content_hash,
+            # same payload_hash), not a conflict.
+            rewritten["content"] = redacted
+            rewritten["content_hash"] = hashlib.sha256(
+                redacted.encode("utf-8")
+            ).hexdigest()
+        if metadata_decision.reason in artifact_reasons:
+            # Whole-metadata canonical form: one fixed label-only key holding
+            # the stable redaction token, so no artifact text survives in any
+            # key or value and the canonical form is deterministic.
+            # ponytail: drops non-artifact metadata keys; per-value redaction
+            # if preserving sibling keys ever matters.
+            rewritten["metadata"] = {
+                "_redacted": redact_memory_artifact(
+                    metadata_canonical, metadata_decision.reason
+                )
+            }
+        return (
+            replace(event, **rewritten),
+            [],
+            [],
+            {"_admission": {"rewritten": marker_reason}},
+        )
+
+    # off mode, or warn/strict with no artifact: unchanged.
+    return event, [], [], None
 
 
 # ---------------------------------------------------------------------------
@@ -1019,8 +1225,12 @@ def _provenance(event: IngestEvent) -> Dict[str, str]:
     }
 
 
-def _memory_metadata(event: IngestEvent) -> Dict[str, Any]:
+def _memory_metadata(
+    event: IngestEvent, admission_marker: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     metadata = dict(event.metadata or {})
+    if admission_marker:
+        metadata.update(admission_marker)
     metadata["_ingest"] = _provenance(event)
     return metadata
 

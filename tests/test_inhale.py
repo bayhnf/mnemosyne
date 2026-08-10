@@ -37,6 +37,7 @@ from mnemosyne.core.inhale import (
     TurnEvent,
     _InhaleTransactionError,
     _iso_from_epoch,
+    remember_turns_atomic,
     retry_pending_ingest,
 )
 from mnemosyne.core.sync import SyncEngine
@@ -516,9 +517,7 @@ def test_conflict_must_not_overwrite_original_payload_hash(beam, vec_ready):
     assert replay.payload_hash == original_hash
 
 
-def test_conflict_does_not_create_duplicate_memory_or_sync_event(
-    beam, vec_ready
-):
+def test_conflict_does_not_create_duplicate_memory_or_sync_event(beam, vec_ready):
     """A conflict must mutate nothing except flipping the receipt to conflict;
     no new working_memory row, no new sync event."""
     beam.remember_event(_event(content="original content", event_id="evt-C"))
@@ -625,10 +624,13 @@ def test_conflict_does_not_mutate_original_receipt_lifecycle(beam, vec_ready):
     assert replay.index_status == orig_index_status
 
 
-def test_pending_original_remains_retryable_after_conflict(beam, vec_ready, monkeypatch):
+def test_pending_original_remains_retryable_after_conflict(
+    beam, vec_ready, monkeypatch
+):
     """Exact sequence: raw commit leaves stored/pending; a conflict occurs;
     retry_pending_ingest() can still claim and finish the original without
     duplicate memory/sync rows and without stranding it terminal."""
+
     def _flaky_embed(texts):
         raise RuntimeError("embedding service down")
 
@@ -761,9 +763,7 @@ def test_retry_pending_ingest_rejects_deferred_commit_context(beam, vec_ready):
 # ---------------------------------------------------------------------------
 
 
-def test_two_retry_workers_do_not_duplicate_enrichment(
-    temp_db, vec_ready, monkeypatch
-):
+def test_two_retry_workers_do_not_duplicate_enrichment(temp_db, vec_ready, monkeypatch):
     """Two independent retry workers on the same pending receipt: exactly one
     does enrichment; the other observes the claimed/finished state. Memory
     and sync rows stay exactly-once."""
@@ -852,7 +852,7 @@ def test_stale_retry_claim_is_reclaimed(temp_db, vec_ready, monkeypatch):
     monkeypatch.undo()
 
     # Simulate a crashed worker: claim the receipt with an expired lease.
-    stale = (datetime.now(timezone.utc).timestamp() - 3600)
+    stale = datetime.now(timezone.utc).timestamp() - 3600
     b.conn.execute(
         "UPDATE ingest_receipts SET claim_worker_id='dead-worker',"
         " claim_worker_lease=? WHERE event_id='evt-SC'",
@@ -944,7 +944,9 @@ def test_delayed_worker_cannot_claim_already_finalized_receipt(
     assert row[2] == report_b.receipts[0].attempts
 
 
-def test_delayed_worker_cannot_claim_terminalized_receipt(temp_db, vec_ready, monkeypatch):
+def test_delayed_worker_cannot_claim_terminalized_receipt(
+    temp_db, vec_ready, monkeypatch
+):
     """Same TOCTOU guard but for a receipt finalized to 'failed_terminal'
     (max attempts): the delayed worker must not resurrect it."""
     BeamMemory(session_id="tt", db_path=temp_db)
@@ -969,9 +971,7 @@ def test_delayed_worker_cannot_claim_terminalized_receipt(temp_db, vec_ready, mo
 
     now_iso = inhale._iso_from_epoch(inhale._now_epoch())
     lease_iso = inhale._iso_from_epoch(inhale._now_epoch() + 60)
-    claimed = inhale._try_claim(
-        b.conn, "evt-TERM", "late-worker", lease_iso, now_iso
-    )
+    claimed = inhale._try_claim(b.conn, "evt-TERM", "late-worker", lease_iso, now_iso)
     assert claimed is False, "claimed a failed_terminal receipt"
 
     row = b.conn.execute(
@@ -1019,17 +1019,29 @@ def test_stale_worker_cannot_release_other_workers_live_claim(
     _pending_receipt(b, "evt-I2REL", monkeypatch)
 
     now = inhale._now_epoch()
-    assert inhale._try_claim(
-        b.conn, "evt-I2REL", "worker-a",
-        inhale._iso_from_epoch(now + 60), inhale._iso_from_epoch(now),
-    ) is True
+    assert (
+        inhale._try_claim(
+            b.conn,
+            "evt-I2REL",
+            "worker-a",
+            inhale._iso_from_epoch(now + 60),
+            inhale._iso_from_epoch(now),
+        )
+        is True
+    )
 
     # A's lease expires; B reclaims deterministically while A is still alive.
     late = inhale._iso_from_epoch(now + 3600)
-    assert inhale._try_claim(
-        b.conn, "evt-I2REL", "worker-b",
-        inhale._iso_from_epoch(now + 3660), late,
-    ) is True
+    assert (
+        inhale._try_claim(
+            b.conn,
+            "evt-I2REL",
+            "worker-b",
+            inhale._iso_from_epoch(now + 3660),
+            late,
+        )
+        is True
+    )
 
     # A's release must be ownership-guarded: B's live claim survives.
     inhale._release_claim(b.conn, "evt-I2REL", "worker-a")
@@ -1041,10 +1053,18 @@ def test_stale_worker_cannot_release_other_workers_live_claim(
     assert row["claim_worker_lease"] == inhale._iso_from_epoch(now + 3660)
 
     # B can still finalize its own claim normally.
-    assert inhale._finalize_claimed(
-        b.conn, "evt-I2REL", "ready", None, 2,
-        release=True, worker_id="worker-b",
-    ) is True
+    assert (
+        inhale._finalize_claimed(
+            b.conn,
+            "evt-I2REL",
+            "ready",
+            None,
+            2,
+            release=True,
+            worker_id="worker-b",
+        )
+        is True
+    )
 
 
 def test_stale_worker_cannot_overwrite_other_workers_ready_receipt(
@@ -1060,26 +1080,51 @@ def test_stale_worker_cannot_overwrite_other_workers_ready_receipt(
     _pending_receipt(b, "evt-I2FIN", monkeypatch)
 
     now = inhale._now_epoch()
-    assert inhale._try_claim(
-        b.conn, "evt-I2FIN", "worker-a",
-        inhale._iso_from_epoch(now + 60), inhale._iso_from_epoch(now),
-    ) is True
+    assert (
+        inhale._try_claim(
+            b.conn,
+            "evt-I2FIN",
+            "worker-a",
+            inhale._iso_from_epoch(now + 60),
+            inhale._iso_from_epoch(now),
+        )
+        is True
+    )
     late = inhale._iso_from_epoch(now + 3600)
-    assert inhale._try_claim(
-        b.conn, "evt-I2FIN", "worker-b",
-        inhale._iso_from_epoch(now + 3660), late,
-    ) is True
+    assert (
+        inhale._try_claim(
+            b.conn,
+            "evt-I2FIN",
+            "worker-b",
+            inhale._iso_from_epoch(now + 3660),
+            late,
+        )
+        is True
+    )
 
     # B finishes and finalizes the truthful ready state.
-    assert inhale._finalize_claimed(
-        b.conn, "evt-I2FIN", "ready", None, 2,
-        release=True, worker_id="worker-b",
-    ) is True
+    assert (
+        inhale._finalize_claimed(
+            b.conn,
+            "evt-I2FIN",
+            "ready",
+            None,
+            2,
+            release=True,
+            worker_id="worker-b",
+        )
+        is True
+    )
 
     # A's late degraded result must not regress B's ready receipt.
     finalized = inhale._finalize_claimed(
-        b.conn, "evt-I2FIN", "degraded", "embedding_failure", 3,
-        release=True, worker_id="worker-a",
+        b.conn,
+        "evt-I2FIN",
+        "degraded",
+        "embedding_failure",
+        3,
+        release=True,
+        worker_id="worker-a",
     )
     assert finalized is False
     row = b.conn.execute(
@@ -1104,15 +1149,29 @@ def test_overrun_owner_can_finalize_own_claim_after_lease_expiry(
     _pending_receipt(b, "evt-I2OWN", monkeypatch)
 
     now = inhale._now_epoch()
-    assert inhale._try_claim(
-        b.conn, "evt-I2OWN", "worker-a",
-        inhale._iso_from_epoch(now + 60), inhale._iso_from_epoch(now),
-    ) is True
+    assert (
+        inhale._try_claim(
+            b.conn,
+            "evt-I2OWN",
+            "worker-a",
+            inhale._iso_from_epoch(now + 60),
+            inhale._iso_from_epoch(now),
+        )
+        is True
+    )
     # A finishes after its lease expired; no one reclaimed it.
-    assert inhale._finalize_claimed(
-        b.conn, "evt-I2OWN", "ready", None, 2,
-        release=True, worker_id="worker-a",
-    ) is True
+    assert (
+        inhale._finalize_claimed(
+            b.conn,
+            "evt-I2OWN",
+            "ready",
+            None,
+            2,
+            release=True,
+            worker_id="worker-a",
+        )
+        is True
+    )
     row = b.conn.execute(
         "SELECT index_status, attempts, claim_worker_id, claim_worker_lease"
         " FROM ingest_receipts WHERE event_id = 'evt-I2OWN'"
@@ -1147,6 +1206,7 @@ def test_stale_lease_two_workers_keep_ready_receipt_and_truthful_reports(
 
     def fake_now() -> float:
         return times.get(threading.get_ident(), real_now())
+
     monkeypatch.setattr(inhale, "_now_epoch", fake_now)
 
     def slow_index(beam, memory_id, content, source, timestamp):
@@ -1205,3 +1265,294 @@ def test_stale_lease_two_workers_keep_ready_receipt_and_truthful_reports(
     # Concurrent enrichment stays idempotent: no duplicate rows.
     assert b0.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
     assert b0.conn.execute("SELECT COUNT(*) FROM ingest_receipts").fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 2 supplemental: native admission policy (secret + CoT/approval)
+# ---------------------------------------------------------------------------
+
+
+def _table_count(beam, table: str) -> int:
+    return beam.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def _stored_content(beam, event_id: str) -> Optional[str]:
+    import hashlib as _h
+
+    memory_id = _h.sha256(event_id.encode("utf-8")).hexdigest()[:16]
+    row = beam.conn.execute(
+        "SELECT content FROM working_memory WHERE id = ?", (memory_id,)
+    ).fetchone()
+    return row["content"] if row is not None else None
+
+
+def test_remember_event_rejects_secret_in_metadata_without_persistence(beam, vec_ready):
+    event = _event(content="clean", metadata={"token": "sk-abcdefghij0123456789"})
+
+    receipt = beam.remember_event(event)
+
+    assert receipt.status == "rejected"
+    assert receipt.index_status == "failed_terminal"
+    assert receipt.last_error_code == "admission_rejected"
+    assert "sk-abcdefghij0123456789" not in repr(receipt.metadata)
+    assert _table_count(beam, "working_memory") == 0
+    assert _table_count(beam, "ingest_receipts") == 0
+    assert _table_count(beam, "memory_events") == 0
+
+
+def test_remember_event_rejects_secret_in_content_without_persistence(beam, vec_ready):
+    event = _event(content="leaked key sk-abcdefghij0123456789 in prose")
+
+    receipt = beam.remember_event(event)
+
+    assert receipt.status == "rejected"
+    assert receipt.index_status == "failed_terminal"
+    assert receipt.last_error_code == "admission_rejected"
+    assert "sk-abcdefghij0123456789" not in repr(receipt.metadata)
+    assert _table_count(beam, "working_memory") == 0
+    assert _table_count(beam, "ingest_receipts") == 0
+    assert _table_count(beam, "memory_events") == 0
+
+
+def test_secret_rejection_does_not_burn_event_id(beam, vec_ready):
+    event_id = "same-event"
+    assert (
+        beam.remember_event(
+            _event(event_id=event_id, content="sk-abcdefghij0123456789")
+        ).status
+        == "rejected"
+    )
+    assert (
+        beam.remember_event(
+            _event(event_id=event_id, content="corrected safe content")
+        ).status
+        == "stored"
+    )
+
+
+def test_warn_mode_canonicalizes_cot_before_hashing_and_replay(
+    beam, vec_ready, monkeypatch
+):
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "warn")
+    original = _event(content="<analysis>private reasoning trace</analysis>")
+    redacted = _event(
+        event_id=original.event_id,
+        content="[mnemosyne-redacted: reasoning-artifact]",
+    )
+
+    first = beam.remember_event(original)
+    replay = beam.remember_event(redacted)
+
+    assert first.status == "stored"
+    assert replay.status == "duplicate"
+    assert _stored_content(beam, original.event_id) == redacted.content
+
+
+def test_atomic_turn_ingest_keeps_mixed_secret_receipts_positional(beam, vec_ready):
+    receipts = remember_turns_atomic(
+        beam,
+        [
+            _turn(
+                event_id="evt-secret",
+                turn_id="secret",
+                content="sk-abcdefghij0123456789",
+            ),
+            _turn(event_id="evt-clean", turn_id="clean", content="safe"),
+        ],
+    )
+
+    assert [receipt.status for receipt in receipts] == ["rejected", "stored"]
+    assert all(receipt is not None for receipt in receipts)
+    assert _table_count(beam, "working_memory") == 1
+
+
+def test_atomic_turn_ingest_admission_runs_before_transaction(
+    beam, vec_ready, monkeypatch
+):
+    """Inverse-ordering: a rejected event must never open a transaction or
+    write any row. Mixed-batch receipts stay positional and the clean turn
+    still stores exactly once."""
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "off")
+    receipts = remember_turns_atomic(
+        beam,
+        [
+            _turn(event_id="evt-clean1", turn_id="clean1", content="safe one"),
+            _turn(
+                event_id="evt-secret",
+                turn_id="secret",
+                content="sk-abcdefghij0123456789",
+            ),
+            _turn(event_id="evt-clean2", turn_id="clean2", content="safe two"),
+        ],
+    )
+
+    assert [r.status for r in receipts] == ["stored", "rejected", "stored"]
+    assert [r.last_error_code for r in receipts] == [
+        None,
+        "admission_rejected",
+        None,
+    ]
+    # Only the two clean turns persisted.
+    assert _table_count(beam, "working_memory") == 2
+    assert _table_count(beam, "ingest_receipts") == 2
+    assert _table_count(beam, "memory_events") == 2
+
+
+def test_strict_mode_rejects_reasoning_artifact(beam, vec_ready, monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "strict")
+    event = _event(content="<analysis>private reasoning trace</analysis>")
+
+    receipt = beam.remember_event(event)
+
+    assert receipt.status == "rejected"
+    assert receipt.index_status == "failed_terminal"
+    assert receipt.last_error_code == "admission_rejected"
+    assert _table_count(beam, "working_memory") == 0
+    assert _table_count(beam, "ingest_receipts") == 0
+
+
+def test_strict_mode_rejects_approval_artifact(beam, vec_ready, monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "strict")
+    event = _event(content="APPROVAL RECEIPT: reviewer=alice verdict=approved note=ok")
+
+    receipt = beam.remember_event(event)
+
+    assert receipt.status == "rejected"
+    assert receipt.last_error_code == "admission_rejected"
+    assert _table_count(beam, "working_memory") == 0
+
+
+def test_off_mode_preserves_compat_for_reasoning_artifact(beam, vec_ready, monkeypatch):
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "off")
+    event = _event(content="<analysis>private reasoning trace</analysis>")
+
+    receipt = beam.remember_event(event)
+
+    assert receipt.status == "stored"
+    assert _table_count(beam, "working_memory") == 1
+
+
+def test_admission_rejection_markers_are_label_only(beam, vec_ready, monkeypatch):
+    """Every rejection marker (error code + metadata) must be content-free:
+    no raw secret, no matched span, no original artifact text."""
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "strict")
+    secret = "sk-abcdefghij0123456789"
+    receipt = beam.remember_event(_event(content=f"key={secret}"))
+
+    assert receipt.status == "rejected"
+    blob = repr(receipt) + json.dumps(receipt.metadata or {}, default=str)
+    assert secret not in blob
+    assert "<analysis>" not in blob
+    # The metadata carries only label/reason codes, never raw content.
+    if receipt.metadata:
+        meta_blob = json.dumps(receipt.metadata, default=str)
+        assert secret not in meta_blob
+
+
+def test_warn_mode_canonicalizes_approval_artifact_before_hashing(
+    beam, vec_ready, monkeypatch
+):
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "warn")
+    original = _event(
+        content="APPROVAL RECEIPT: reviewer=alice verdict=approved note=ok"
+    )
+    redacted = _event(
+        event_id=original.event_id,
+        content="[mnemosyne-redacted: approval-artifact]",
+    )
+
+    first = beam.remember_event(original)
+    replay = beam.remember_event(redacted)
+
+    assert first.status == "stored"
+    assert replay.status == "duplicate"
+    assert _stored_content(beam, original.event_id) == redacted.content
+
+
+def test_warn_mode_metadata_secret_is_rejected_regardless_of_mode(
+    beam, vec_ready, monkeypatch
+):
+    """Native policy is strict on secrets: even in warn/off mode, a secret in
+    metadata is rejected with zero durable writes (independent of classifier
+    mode)."""
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "warn")
+    event = _event(content="clean", metadata={"token": "sk-abcdefghij0123456789"})
+
+    receipt = beam.remember_event(event)
+
+    assert receipt.status == "rejected"
+    assert receipt.last_error_code == "admission_rejected"
+    assert _table_count(beam, "ingest_receipts") == 0
+
+
+def test_warn_mode_persists_label_only_admission_marker_in_stored_metadata(
+    beam, vec_ready, monkeypatch
+):
+    """A warn rewrite persists a content-free admission marker in the existing
+    stored metadata fields (memory + receipt), not in the event payload."""
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "warn")
+    artifact = "<analysis>private reasoning trace</analysis>"
+    receipt = beam.remember_event(_event(content=artifact))
+
+    assert receipt.status == "stored"
+    memory_meta = json.loads(_working_rows(beam.conn)[0]["metadata_json"])
+    receipt_meta = json.loads(_receipt_rows(beam.conn)[0]["metadata_json"])
+    for meta in (memory_meta, receipt_meta):
+        assert meta["_admission"] == {"rewritten": "reasoning_artifact"}
+        blob = json.dumps(meta, sort_keys=True, default=str)
+        assert artifact not in blob
+        assert "<analysis>" not in blob
+
+
+def test_warn_mode_canonicalizes_metadata_reasoning_artifact_before_hashing_and_replay(
+    beam, vec_ready, monkeypatch
+):
+    """A metadata-only reasoning artifact is deterministically redacted in warn
+    mode: the canonical redacted metadata replay dedupes and the original
+    artifact is never retained."""
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "warn")
+    artifact = "<analysis>private reasoning trace</analysis>"
+    original = _event(content="clean", metadata={"trace": artifact})
+    redacted = _event(
+        event_id=original.event_id,
+        content="clean",
+        metadata={"_redacted": "[mnemosyne-redacted: reasoning-artifact]"},
+    )
+
+    first = beam.remember_event(original)
+    replay = beam.remember_event(redacted)
+
+    assert first.status == "stored"
+    assert replay.status == "duplicate"
+    stored_meta = json.loads(_working_rows(beam.conn)[0]["metadata_json"])
+    assert artifact not in json.dumps(stored_meta, sort_keys=True, default=str)
+    assert stored_meta["_redacted"] == "[mnemosyne-redacted: reasoning-artifact]"
+    assert stored_meta["_admission"] == {"rewritten": "reasoning_artifact"}
+
+
+def test_atomic_warn_ingest_redacts_metadata_artifact_and_marks_receipt(
+    beam, vec_ready, monkeypatch
+):
+    """The atomic path applies the same metadata redaction and persists the
+    label-only admission marker in the receipt metadata."""
+    monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "warn")
+    artifact = "<analysis>private reasoning trace</analysis>"
+    receipts = remember_turns_atomic(
+        beam,
+        [
+            _turn(
+                event_id="evt-meta",
+                turn_id="meta",
+                content="clean",
+                metadata={"trace": artifact},
+            ),
+            _turn(event_id="evt-clean", turn_id="clean", content="safe"),
+        ],
+    )
+
+    assert [r.status for r in receipts] == ["stored", "stored"]
+    memory_meta = json.loads(_working_rows(beam.conn)[0]["metadata_json"])
+    receipt_meta = json.loads(_receipt_rows(beam.conn)[0]["metadata_json"])
+    assert artifact not in json.dumps(memory_meta, sort_keys=True, default=str)
+    assert memory_meta["_admission"] == {"rewritten": "reasoning_artifact"}
+    assert receipt_meta["_admission"] == {"rewritten": "reasoning_artifact"}
