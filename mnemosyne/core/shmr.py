@@ -11,13 +11,24 @@ This is Mnemosyne's signature reasoning layer -- no Honcho dreams, no Hindsight
 reflections, no Mem0 static graphs. Memories actively resonate and self-correct.
 """
 
+from __future__ import annotations
+
+import math
 import os
 import time
 import logging
 import json
 from typing import List, Dict, Optional
 
-import numpy as np
+# NumPy is optional: the offline lexical path (_lexical_vector /
+# _cosine_similarity) is reached when embeddings are off (Task 25), and that
+# path now uses only the standard library. Dense-vector code paths
+# (_embed / _compute_harmony_score / recall_beliefs) still require NumPy and
+# are only entered when an embedding backend is configured.
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from mnemosyne.core import embeddings as _embeddings
 
@@ -118,11 +129,25 @@ def _embed(text: str) -> np.ndarray:
     return emb.astype(np.float32)
 
 
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two normalized vectors."""
-    a_norm = a / (np.linalg.norm(a) + 1e-8)
-    b_norm = b / (np.linalg.norm(b) + 1e-8)
-    return float(np.dot(a_norm, b_norm))
+def _cosine_similarity(a, b) -> float:
+    """Cosine similarity between two vectors.
+
+    Works with either Python ``list[float]`` (the offline lexical vector) or
+    NumPy arrays (the dense path). Uses only the standard library so the
+    embeddings-off path stays reachable when NumPy is not installed (Task 25).
+    """
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        xf = float(x)
+        yf = float(y)
+        dot += xf * yf
+        na += xf * xf
+        nb += yf * yf
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
 def _cluster_by_similarity(
@@ -821,7 +846,7 @@ def _normalize_token(tok: str) -> str:
     return tok
 
 
-def _lexical_vector(text: str, subject: str) -> np.ndarray:
+def _lexical_vector(text: str, subject: str) -> List[float]:
     """Deterministic fallback embedding when no model is loaded.
 
     Bags normalized+lightly-stemmed tokens of subject+object into a fixed-size
@@ -829,20 +854,24 @@ def _lexical_vector(text: str, subject: str) -> np.ndarray:
     same cluster so propose_harmony is testable without a network/model. Real
     deployments with a configured embedding backend get dense vectors instead.
 
+    Returns a plain ``list[float]`` built with only the standard library so
+    this path stays reachable on a base install with neither NumPy nor
+    fastembed (Task 25). ``_cosine_similarity`` accepts this list directly.
+
     ponytail: ceiling is lexical overlap -- true semantic paraphrase clusters
     still need a real embedding model. Upgrade path: configure
     MNEMOSYNE_EMBEDDING_MODEL and the dense path in _gather_candidates wins.
     """
-    vec = np.zeros(EMBEDDING_DIM, dtype=np.float32)
+    vec = [0.0] * EMBEDDING_DIM
     for raw in (str(subject) + " " + str(text)).split():
         nt = _normalize_token(raw)
         if not nt:
             continue
         h = int(_hashlib.md5(nt.encode()).hexdigest(), 16)
         vec[h % EMBEDDING_DIM] += 1.0
-    norm = float(np.linalg.norm(vec))
+    norm = math.sqrt(sum(v * v for v in vec))
     if norm > 0:
-        vec /= norm
+        vec = [v / norm for v in vec]
     return vec
 
 
