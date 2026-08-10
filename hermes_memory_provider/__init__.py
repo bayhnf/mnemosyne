@@ -1307,6 +1307,58 @@ ALL_TOOL_SCHEMAS = [
 
 
 # ---------------------------------------------------------------------------
+# Task 7: receipt-aware sync_turn ingest helpers
+# ---------------------------------------------------------------------------
+
+def _sync_turn_content_hash(content: str) -> str:
+    """SHA-256 of the (possibly truncated) content actually being stored."""
+    import hashlib
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _sync_turn_occurred_at() -> str:
+    """Timezone-aware ISO-8601 UTC timestamp for one ingest event."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sync_turn_event_id(producer: str, session_id: str, turn_id: str, role: str) -> str:
+    """Deterministic event id for one (session, turn, role) triple.
+
+    Replaying the same turn content yields the same event id, so a duplicate
+    replay is idempotent under the Inhale receipt contract rather than
+    producing a second memory row.
+    """
+    import hashlib
+    raw = f"{producer}:{session_id}:{turn_id}:{role}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _sync_turn_turn_id(session_id: str, user_content: str, assistant_content: str) -> str:
+    """Deterministic turn id shared by the user and assistant ingests.
+
+    Derived from the session id and both role contents so that replaying the
+    exact same turn yields the same turn id, and therefore the same event ids,
+    making a duplicate replay idempotent under the Inhale receipt contract
+    (dedup by payload_hash) rather than producing a second memory row.
+    """
+    import hashlib
+    raw = f"{session_id}\x1f{user_content}\x1f{assistant_content}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _native_remember_turn(beam: Any):
+    """Return a real native method, never a dynamic mock child."""
+    if not callable(getattr(type(beam), "remember_turn", None)):
+        return None
+    try:
+        remember_turn = beam.remember_turn
+    except AttributeError:
+        return None
+    return remember_turn if callable(remember_turn) else None
+
+
+# ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
@@ -1429,6 +1481,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "max_duration_ms": 0.0,
             "last_error": None,
             "in_flight": 0,
+            # Task 7: structured visible outcome of the last sync_turn.
+            "last_outcome": None,
+            "last_receipts": [],
         }
         self._auto_sleep_threshold = 50
         self._auto_sleep_enabled = _parse_env_bool("MNEMOSYNE_AUTO_SLEEP_ENABLED", True)
@@ -2328,6 +2383,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "max_duration_ms": 0.0,
                 "last_error": None,
                 "in_flight": 0,
+                # Task 7: structured visible outcome of the last sync_turn,
+                # so failures are surfaced (not swallowed to logger.debug).
+                # last_outcome: "stored" | "partial" | "failed" | "skipped".
+                "last_outcome": None,
+                # Content-free receipt summary (event_id + status + index
+                # state) for operator diagnostics. Never includes user text.
+                "last_receipts": [],
             }
 
     def _ensure_beam_access_lock(self):
@@ -2345,13 +2407,51 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         with self._sync_turn_lock:
             return dict(self._sync_turn_telemetry)
 
+    def _dream_active_blocks_sleep(self) -> bool:
+        """True when a verified Dream run owns canonical mutations.
+
+        Dream sets the ``dream_active`` config gate before verified apply and
+        clears it on normal completion / undo. While it is set, the legacy
+        sleep/consolidation path MUST NOT run its own model-refresh auto-apply,
+        because two concurrent canonical mutation owners would race. This gate
+        is read at the top of every sleep surface (auto-sleep, mnemosyne_sleep
+        tool, session-end consolidation).
+        """
+        try:
+            from mnemosyne.core.config import get_config
+            return bool(get_config().get_bool("dream_active", False))
+        except Exception:
+            # If config is unavailable, do not block sleep (fail-open toward
+            # the default behavior). Dream itself fails closed when it cannot
+            # set the gate, so this asymmetry is safe.
+            return False
+
     @staticmethod
     def _sanitize_sync_turn_error(exc: BaseException) -> str:
         """Bound error detail without including user/assistant content."""
         return f"{type(exc).__name__}: <redacted>"
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Persist the turn to Mnemosyne episodic memory."""
+        """Persist the turn to Mnemosyne episodic memory (Task 7: receipt-aware).
+
+        Provenance (session/author/channel) is snapshotted from the Beam BEFORE
+        any ingest, so a session rebind during the call cannot corrupt the
+        receipts. When the native Inhale ``remember_turn`` API is available,
+        each role is ingested with a stable event id and a structured receipt;
+        otherwise the legacy ``remember()`` path is used unchanged. Either both
+        sides ingest successfully (``last_outcome="stored"``) or a structured
+        ``partial`` / ``failed`` outcome is surfaced -- failures are never
+        swallowed.
+
+        Positional caller compatibility is preserved: the two-arg positional
+        form and the keyword-only ``session_id`` both work, and the method
+        continues to return ``None``.
+        """
+        # Integration variant retries transient init failures; the deployed
+        # mirror does not. Guard so both paths work.
+        _retry = getattr(self, "_maybe_retry_init", None)
+        if callable(_retry):
+            _retry()
         if not self._beam or self._agent_context in self._skip_contexts:
             return
         started = time.perf_counter()
@@ -2367,39 +2467,63 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 int(self._sync_turn_telemetry.get("max_queue_length") or 0),
                 in_flight,
             )
+        receipts = []
         try:
             with self._ensure_beam_access_lock():
+                beam = self._beam
+                # Snapshot scope BEFORE any ingest so a rebind during the
+                # call cannot mutate the provenance recorded on the receipts.
+                scope_snapshot = {
+                    "session_id": getattr(beam, "session_id", "") or "",
+                    "actor_id": getattr(beam, "author_id", "") or "",
+                    "producer": getattr(beam, "author_type", "") or "hermes",
+                    "project_id": getattr(beam, "channel_id", "") or "",
+                }
+                # One stable turn id shared by every role ingested in this
+                # call, derived from the snapshotted session id so both
+                # provider mirrors produce identical event ids.
+                turn_id = _sync_turn_turn_id(
+                    scope_snapshot["session_id"], user_content, assistant_content,
+                )
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    self._beam.remember(
-                        content=f"[USER] {uc}",
-                        source="conversation",
-                        importance=0.5,
-                        scope=self._default_scope,
-                        extract_entities=True,
+                    rc = self._sync_turn_ingest_one(
+                        beam, "user", f"[USER] {uc}", scope_snapshot, turn_id,
                     )
+                    if rc is not None:
+                        receipts.append(rc)
                     self._capture_identity_signals(user_content)
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    self._beam.remember(
-                        content=f"[ASSISTANT] {ac}",
-                        source="conversation",
-                        importance=0.15,
-                        scope=self._default_scope,
-                        extract_entities=True,
+                    rc = self._sync_turn_ingest_one(
+                        beam, "assistant", f"[ASSISTANT] {ac}", scope_snapshot, turn_id,
                     )
+                    if rc is not None:
+                        receipts.append(rc)
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
                 self._sync_turn_telemetry["last_error"] = None
+                self._sync_turn_telemetry["last_outcome"] = "stored"
+                self._sync_turn_telemetry["last_receipts"] = [
+                    self._receipt_summary(r) for r in receipts
+                ]
         except Exception as e:
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["failed"] += 1
                 self._sync_turn_telemetry["last_error"] = self._sanitize_sync_turn_error(e)
+                # Structured visible outcome: ``partial`` when at least one
+                # receipt was recorded before the failure, else ``failed``.
+                self._sync_turn_telemetry["last_outcome"] = (
+                    "partial" if receipts else "failed"
+                )
+                self._sync_turn_telemetry["last_receipts"] = [
+                    self._receipt_summary(r) for r in receipts
+                ]
             logger.debug("Mnemosyne sync_turn failed: %s", self._sanitize_sync_turn_error(e))
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
@@ -2423,6 +2547,61 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     snapshot["failed"],
                     snapshot["pending_queue_length"],
                 )
+
+    def _sync_turn_ingest_one(self, beam, role: str, content: str,
+                              scope_snapshot: Dict[str, str], turn_id: str):
+        """Ingest one role of a turn with a stable event id and provenance.
+
+        Uses the native receipt-backed ``remember_turn`` API when the Beam
+        exposes it; otherwise falls back to the legacy ``remember()`` path so
+        older Mnemosyne deployments keep working. Returns the receipt object
+        (or ``None`` for the legacy path, which has no receipt).
+        """
+        event_id = _sync_turn_event_id(
+            scope_snapshot["producer"] or "hermes",
+            scope_snapshot["session_id"],
+            turn_id,
+            role,
+        )
+        remember_turn = _native_remember_turn(beam)
+        if remember_turn is not None:
+            try:
+                from mnemosyne.core.inhale import TurnEvent
+            except Exception:
+                TurnEvent = None
+            if TurnEvent is not None:
+                turn = TurnEvent(
+                    event_id=event_id,
+                    producer=scope_snapshot["producer"] or "hermes",
+                    actor_id=scope_snapshot["actor_id"],
+                    project_id=scope_snapshot["project_id"],
+                    session_id=scope_snapshot["session_id"],
+                    turn_id=turn_id,
+                    role=role,
+                    content=content,
+                    content_hash=_sync_turn_content_hash(content),
+                    occurred_at=_sync_turn_occurred_at(),
+                )
+                return remember_turn(turn)
+        # Legacy fallback: no receipt, preserve the original remember() shape.
+        importance = 0.5 if role == "user" else 0.15
+        beam.remember(
+            content=content,
+            source="conversation",
+            importance=importance,
+            scope=self._default_scope,
+            extract_entities=True,
+        )
+        return None
+
+    @staticmethod
+    def _receipt_summary(receipt) -> Dict[str, Any]:
+        """Content-free summary of one ingest receipt for diagnostics."""
+        return {
+            "event_id": getattr(receipt, "event_id", ""),
+            "status": getattr(receipt, "status", ""),
+            "index_status": getattr(receipt, "index_status", ""),
+        }
 
     # Identity-significant expressions the user may voice about themselves or
     # their relationship to their work. When a match is found, the memory is
@@ -2456,6 +2635,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 break  # One identity memory per turn
 
     def _maybe_auto_sleep(self) -> None:
+        # Task 7: when a verified Dream run owns canonical mutations
+        # (dream_active=True), the legacy sleep/consolidation auto-apply must
+        # not run -- two concurrent canonical mutation owners would race.
+        if self._dream_active_blocks_sleep():
+            logger.info("Mnemosyne sleep gated off: dream_active is set")
+            return
+
         try:
             stats = self._beam.get_working_stats()
             working = stats.get("total", 0)
@@ -2938,6 +3124,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return json.dumps({"provider": "mnemosyne_shared", "shared_db": str(self._shared_surface_path or ""), "working": self._surface_beam.get_working_stats(), "episodic": self._surface_beam.get_episodic_stats()})
 
     def _handle_sleep(self, args: Dict[str, Any]) -> str:
+        # Task 7: when a verified Dream run owns canonical mutations
+        # (dream_active=True), the legacy sleep/consolidation auto-apply must
+        # not run -- two concurrent canonical mutation owners would race.
+        if self._dream_active_blocks_sleep():
+            logger.info("Mnemosyne sleep gated off: dream_active is set")
+            return json.dumps({"status": "skipped", "reason": "dream_active"})
+
         skip = self._reserve_reflection_budget("tool")
         if skip is not None:
             return json.dumps(skip)
@@ -3690,6 +3883,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._turn_count = turn_number
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        # Task 7: when a verified Dream run owns canonical mutations
+        # (dream_active=True), the legacy sleep/consolidation auto-apply must
+        # not run -- two concurrent canonical mutation owners would race.
+        if self._dream_active_blocks_sleep():
+            logger.info("Mnemosyne sleep gated off: dream_active is set")
+            return
+
         # Bound the consolidation call so a slow LLM (e.g., a Hermes-routed
         # network call) cannot block Hermes shutdown indefinitely. Mirrors
         # the daemon-thread pattern already used by _maybe_auto_sleep above:
