@@ -1647,10 +1647,12 @@ def _serialize_dataclass(obj) -> str:
 def _dream_run_projection(run) -> dict:
     """Content-free curated JSON projection of a DreamRun.
 
-    NEVER includes raw manifest, actions, before/after images, content,
-    config audit, or unbounded failure text. Only durable identifiers, state,
-    scope, manifest hash, checkpoint, error code, safe timestamps, and receipt
-    role/status counts.
+    NEVER includes scope, raw manifest, actions, before/after images, content,
+    config audit, or unbounded failure text. Scope values are untyped core
+    input (can be nested/untrusted); omitting the field entirely is the
+    smallest fail-closed public JSON contract. Only durable identifiers,
+    state, manifest hash, checkpoint, error code, safe timestamps, and receipt
+    role/status counts are exposed.
     """
     receipt_counts: dict = {}
     raw_receipts = getattr(run, "receipts", None) or []
@@ -1666,19 +1668,9 @@ def _dream_run_projection(run) -> dict:
     raw_actions = getattr(run, "actions", None)
     if isinstance(raw_actions, list):
         action_count = len(raw_actions)
-    # Whitelist scope to the public provenance contract only. Dream core
-    # preserves unknown scope keys, so an SDK caller could persist
-    # scope={'content':'SECRET',...} — the projection must never echo those.
-    _raw_scope = getattr(run, "scope", {}) or {}
-    _SCOPE_KEYS = ("session_id", "actor_id", "producer", "project_id")
-    safe_scope = {
-        k: _raw_scope[k] for k in _SCOPE_KEYS
-        if _raw_scope.get(k) not in (None, "")
-    }
     return {
         "run_id": run.run_id,
         "state": run.state,
-        "scope": safe_scope,
         "manifest_hash": getattr(run, "manifest_hash", "") or "",
         "checkpoint": getattr(run, "checkpoint", "") or "",
         "error_code": getattr(run, "error_code", None),

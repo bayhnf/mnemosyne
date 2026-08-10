@@ -815,26 +815,23 @@ class TestCLIHelpDiscoverability:
 # ===========================================================================
 
 
-class TestDreamScopeWhitelist:
-    """P2: projection scope must be filtered to public provenance keys only.
+class TestDreamScopeOmitted:
+    """Disclosure boundary: scope is omitted entirely from projection.
 
-    Dream core preserves unknown scope keys, so a run created via SDK with
-    scope={'content':'TOP-SECRET-MEMORY',...} would leak through dream status
-    --json unless the projection whitelists.
+    Scope values — even whitelisted public keys — are untyped core input that
+    can be nested or untrusted. The smallest fail-closed public JSON contract
+    omits the field entirely rather than trying to filter unbounded input.
     """
 
     _MALICIOUS_SCOPE = {
-        "session_id": "scope-test-sess",
+        "session_id": {"api_key": "sk-x"},
         "actor_id": "actor-1",
-        "producer": "codex",
-        "project_id": "proj-1",
         "content": "TOP-SECRET-MEMORY",
-        "query": "secret-query-data",
         "config": {"model": "gpt-4", "api_key": "sk-leaked"},
     }
 
     def _seed_run_with_malicious_scope(self, tmp_path):
-        """Create a Dream run via SDK with extra scope keys, return run_id."""
+        """Create a Dream run via SDK with nested/extra scope, return run_id."""
         data_dir = tmp_path / "mnemosyne-data"
         db_path = data_dir / "mnemosyne.db"
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -846,40 +843,28 @@ class TestDreamScopeWhitelist:
         beam.conn.close()
         return run.run_id
 
-    def test_status_json_filters_scope_to_whitelist(self, tmp_path):
+    def test_status_json_omits_scope_entirely(self, tmp_path):
         run_id = self._seed_run_with_malicious_scope(tmp_path)
         r = run_cli(["dream", "status", "--run-id", run_id, "--json"], tmp_path)
         assert r.returncode == 0, r.stderr
         payload = json.loads(r.stdout)
-        scope = payload.get("scope", {})
-        # Only public provenance keys allowed.
-        allowed = {"session_id", "actor_id", "producer", "project_id"}
-        assert set(scope.keys()) <= allowed, (
-            f"scope has non-whitelisted keys: {set(scope.keys()) - allowed}"
+        assert "scope" not in payload, (
+            f"projection must not include scope: {payload!r}"
         )
-        # Malicious keys must NOT appear anywhere in the output.
+        # Malicious data must not leak anywhere in the output.
         raw = r.stdout
         assert "TOP-SECRET-MEMORY" not in raw
-        assert "secret-query-data" not in raw
         assert "sk-leaked" not in raw
+        assert "sk-x" not in raw
 
-    def test_plan_json_filters_scope_to_whitelist(self, tmp_path):
-        """Even dream plan --json must not echo untrusted scope keys."""
-        # Plan via CLI with a session-id; the projection scope should only
-        # contain whitelisted keys. We verify the session_id is present and
-        # no unexpected keys appear.
+    def test_plan_json_omits_scope_entirely(self, tmp_path):
         r = run_cli(
-            ["dream", "plan", "--session-id", "wl-sess",
-             "--actor-id", "wl-actor", "--json"],
+            ["dream", "plan", "--session-id", "wl-sess", "--json"],
             tmp_path,
         )
         assert r.returncode == 0, r.stderr
         payload = json.loads(r.stdout)
-        scope = payload.get("scope", {})
-        allowed = {"session_id", "actor_id", "producer", "project_id"}
-        assert set(scope.keys()) <= allowed, (
-            f"scope has non-whitelisted keys: {set(scope.keys()) - allowed}"
-        )
+        assert "scope" not in payload
 
 
 class TestDreamPopulatedProjection:
