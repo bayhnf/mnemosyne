@@ -286,7 +286,9 @@ def test_crash_after_commit_before_embedding_leaves_pending_and_retries_once(
     def _flaky_embed(texts):
         raise RuntimeError("embedding service down")
 
+    good_embed = beam_module._embeddings.embed
     monkeypatch.setattr(beam_module._embeddings, "embed", _flaky_embed)
+    real_finalize = inhale._finalize_receipt
     monkeypatch.setattr(
         inhale,
         "_finalize_receipt",
@@ -304,7 +306,8 @@ def test_crash_after_commit_before_embedding_leaves_pending_and_retries_once(
     assert receipts[0]["index_status"] == "pending"
     assert receipts[0]["attempts"] == 1
 
-    monkeypatch.undo()
+    monkeypatch.setattr(beam_module._embeddings, "embed", good_embed)
+    monkeypatch.setattr(inhale, "_finalize_receipt", real_finalize)
     report = retry_pending_ingest(beam)
     assert report.attempted == 1
     assert report.succeeded == 1
@@ -357,6 +360,7 @@ def test_embedding_failure_yields_failed_retryable_then_ready(
     def _flaky_embed(texts):
         raise RuntimeError("embedding service down")
 
+    good_embed = beam_module._embeddings.embed
     monkeypatch.setattr(beam_module._embeddings, "embed", _flaky_embed)
     receipt = beam.remember_event(_event())
     assert receipt.status == "stored"
@@ -364,7 +368,7 @@ def test_embedding_failure_yields_failed_retryable_then_ready(
     assert receipt.last_error_code == "embedding_failure"
     assert len(_working_rows(beam.conn)) == 1
 
-    monkeypatch.undo()
+    monkeypatch.setattr(beam_module._embeddings, "embed", good_embed)
     report = retry_pending_ingest(beam)
     assert report.attempted == 1
     assert report.succeeded == 1
@@ -408,6 +412,7 @@ def test_enrichment_failure_yields_degraded_then_retry_is_idempotent(
 def test_retry_pending_ingest_respects_limit(beam, vec_ready, monkeypatch):
     import mnemosyne.core.inhale as inhale
 
+    real_finalize = inhale._finalize_receipt
     monkeypatch.setattr(
         inhale,
         "_finalize_receipt",
@@ -417,7 +422,7 @@ def test_retry_pending_ingest_respects_limit(beam, vec_ready, monkeypatch):
         with pytest.raises(RuntimeError):
             beam.remember_event(_event(event_id=f"evt-{i}"))
 
-    monkeypatch.undo()
+    monkeypatch.setattr(inhale, "_finalize_receipt", real_finalize)
     assert (
         beam.conn.execute(
             "SELECT COUNT(*) FROM ingest_receipts WHERE index_status = 'pending'"
@@ -634,6 +639,7 @@ def test_pending_original_remains_retryable_after_conflict(
     def _flaky_embed(texts):
         raise RuntimeError("embedding service down")
 
+    good_embed = beam_module._embeddings.embed
     monkeypatch.setattr(beam_module._embeddings, "embed", _flaky_embed)
     r = beam.remember_event(_event(event_id="evt-PR"))
     assert r.status == "stored"
@@ -649,7 +655,7 @@ def test_pending_original_remains_retryable_after_conflict(
     assert persisted["status"] == "stored"
     assert persisted["index_status"] in ("pending", "failed_retryable", "degraded")
 
-    monkeypatch.undo()
+    monkeypatch.setattr(beam_module._embeddings, "embed", good_embed)
     report = retry_pending_ingest(beam)
     assert report.attempted == 1
     assert report.succeeded == 1
@@ -774,6 +780,7 @@ def test_two_retry_workers_do_not_duplicate_enrichment(temp_db, vec_ready, monke
     # Store a receipt, leave it pending.
     import mnemosyne.core.inhale as inhale
 
+    real_finalize = inhale._finalize_receipt
     monkeypatch.setattr(
         inhale,
         "_finalize_receipt",
@@ -781,7 +788,7 @@ def test_two_retry_workers_do_not_duplicate_enrichment(temp_db, vec_ready, monke
     )
     with pytest.raises(RuntimeError):
         b0.remember_event(_event(event_id="evt-2W"))
-    monkeypatch.undo()
+    monkeypatch.setattr(inhale, "_finalize_receipt", real_finalize)
 
     persisted = _receipt_rows(b0.conn)[0]
     assert persisted["index_status"] == "pending"
@@ -831,8 +838,6 @@ def test_two_retry_workers_do_not_duplicate_enrichment(temp_db, vec_ready, monke
         == "ready"
     )
 
-    monkeypatch.undo()
-
 
 def test_stale_retry_claim_is_reclaimed(temp_db, vec_ready, monkeypatch):
     """A claim whose lease has expired (crashed worker) must be reclaimable by
@@ -842,6 +847,7 @@ def test_stale_retry_claim_is_reclaimed(temp_db, vec_ready, monkeypatch):
 
     import mnemosyne.core.inhale as inhale
 
+    real_finalize = inhale._finalize_receipt
     monkeypatch.setattr(
         inhale,
         "_finalize_receipt",
@@ -849,7 +855,7 @@ def test_stale_retry_claim_is_reclaimed(temp_db, vec_ready, monkeypatch):
     )
     with pytest.raises(RuntimeError):
         b.remember_event(_event(event_id="evt-SC"))
-    monkeypatch.undo()
+    monkeypatch.setattr(inhale, "_finalize_receipt", real_finalize)
 
     # Simulate a crashed worker: claim the receipt with an expired lease.
     stale = datetime.now(timezone.utc).timestamp() - 3600
@@ -891,6 +897,7 @@ def test_delayed_worker_cannot_claim_already_finalized_receipt(
     # Store a receipt and leave it pending (crash during indexing).
     import mnemosyne.core.inhale as inhale
 
+    real_finalize = inhale._finalize_receipt
     monkeypatch.setattr(
         inhale,
         "_finalize_receipt",
@@ -898,7 +905,7 @@ def test_delayed_worker_cannot_claim_already_finalized_receipt(
     )
     with pytest.raises(RuntimeError):
         b.remember_event(_event(event_id="evt-TOU"))
-    monkeypatch.undo()
+    monkeypatch.setattr(inhale, "_finalize_receipt", real_finalize)
 
     assert (
         b.conn.execute(
