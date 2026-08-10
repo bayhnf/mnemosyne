@@ -136,15 +136,29 @@ def test_backup_failure_is_static(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_restore_missing_backup_failure_is_static(tmp_path):
+def test_restore_genuinely_missing_backup_is_static(tmp_path):
+    """Unpatched: a genuinely absent path reaches the real FileNotFoundError
+    branch in ``restore_backup``. No seam patch, so this exercises the true
+    operational failure path, not an injected canary.
+    """
     missing = tmp_path / "absent-backup.db.gz"
+    assert not missing.exists()
+    result = _run_cli_script("", tmp_path, argv_tail=["restore", str(missing)])
+    _assert_static_failure(result, "restore_failed", tmp_path)
+
+
+def test_restore_injected_failure_is_static(tmp_path):
+    """Patched: ``restore_backup`` raising RuntimeError(CANARY) is contained
+    with the same static contract as the real missing-path branch.
+    """
+    target = tmp_path / "backup.db.gz"
     script = (
         "import mnemosyne.dr.recovery as _rec\n"
         "def _boom(*a, **k):\n"
         f"    raise RuntimeError('{CANARY}')\n"
         "_rec.restore_backup = _boom\n"
     )
-    result = _run_cli_script(script, tmp_path, argv_tail=["restore", str(missing)])
+    result = _run_cli_script(script, tmp_path, argv_tail=["restore", str(target)])
     _assert_static_failure(result, "restore_failed", tmp_path)
 
 
@@ -181,7 +195,19 @@ def test_verify_quick_path_corrupt_fixture_is_static(tmp_path):
 
 
 def test_hygiene_audit_missing_database_is_static(tmp_path):
-    # Fresh data dir: no mnemosyne.db present.
+    # Fresh data dir: no mnemosyne.db present (preflight "Database not found").
+    result = _run_cli_script("", tmp_path, argv_tail=["hygiene", "audit"])
+    _assert_static_failure(result, "hygiene_audit_failed", tmp_path)
+
+
+def test_hygiene_audit_corrupt_database_is_static(tmp_path):
+    """A corrupt on-disk database (garbage bytes) reaches the real
+    ``open_readonly_doctor_db`` / sqlite failure path during audit and is
+    contained as ``hygiene_audit_failed`` with no path, canary, or traceback.
+    """
+    data_dir = tmp_path / "mnemosyne-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "mnemosyne.db").write_text("not a database - task18 corrupt fixture")
     result = _run_cli_script("", tmp_path, argv_tail=["hygiene", "audit"])
     _assert_static_failure(result, "hygiene_audit_failed", tmp_path)
 
