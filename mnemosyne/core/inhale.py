@@ -1071,12 +1071,7 @@ def _index_memory(beam, memory_id: str, content: str, source: str, timestamp: st
             _beam_mod._store_working_embedding(conn, memory_id, vec[0], strict_vec=True)
         except Exception as exc:
             error_code = _classify_embedding_error(exc)
-            logger.warning(
-                "inhale: embedding failed for %s (%s): %s",
-                memory_id,
-                type(exc).__name__,
-                exc,
-            )
+            logger.warning("inhale: embedding failed (%s)", type(exc).__name__)
             try:
                 conn.rollback()
             except sqlite3.Error:
@@ -1097,12 +1092,7 @@ def _index_memory(beam, memory_id: str, content: str, source: str, timestamp: st
         beam._ingest_graph_and_veracity(memory_id, content, source, "unknown")
     except Exception as exc:
         error_code = error_code or "enrichment_failed"
-        logger.warning(
-            "inhale: enrichment failed for %s (%s): %s",
-            memory_id,
-            type(exc).__name__,
-            exc,
-        )
+        logger.warning("inhale: enrichment failed (%s)", type(exc).__name__)
 
     if error_code is None:
         return "ready", None

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import tempfile
 import threading
@@ -376,6 +377,27 @@ def test_embedding_failure_yields_failed_retryable_then_ready(
     assert len(_receipt_rows(beam.conn)) == 1
 
 
+def test_embedding_failure_log_is_content_free(beam, vec_ready, monkeypatch, caplog):
+    """P1 log privacy: embedding failure warnings must not surface content,
+    memory IDs, exception text, or tracebacks."""
+    marker = "INHALE_EMBED_MARKER_x7Q2"
+
+    def _flaky_embed(texts):
+        raise RuntimeError(f"embedding service down: {marker}")
+
+    monkeypatch.setattr(beam_module._embeddings, "embed", _flaky_embed)
+    caplog.set_level(logging.WARNING, logger="mnemosyne.core.inhale")
+    receipt = beam.remember_event(_event(content=f"top-secret trial content {marker}"))
+
+    assert receipt.index_status == "failed_retryable"
+    assert receipt.last_error_code == "embedding_failure"
+    assert marker not in caplog.text
+    assert receipt.memory_ids[0] not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "inhale: embedding failed" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
 def test_enrichment_failure_yields_degraded_then_retry_is_idempotent(
     beam, vec_ready, monkeypatch
 ):
@@ -402,6 +424,27 @@ def test_enrichment_failure_yields_degraded_then_retry_is_idempotent(
         (receipt.memory_ids[0],),
     ).fetchone()[0]
     assert expected_facts > 0
+
+
+def test_enrichment_failure_log_is_content_free(beam, vec_ready, monkeypatch, caplog):
+    """P1 log privacy: enrichment failure warnings must not surface content,
+    memory IDs, exception text, or tracebacks."""
+    marker = "INHALE_ENRICH_MARKER_y9P4"
+
+    def _flaky_extract(content, message_idx=0, source_memory_id=None):
+        raise RuntimeError(f"regex extraction exploded: {marker}")
+
+    monkeypatch.setattr(beam, "extract_and_store_facts", _flaky_extract)
+    caplog.set_level(logging.WARNING, logger="mnemosyne.core.inhale")
+    receipt = beam.remember_event(_event(content=f"top-secret trial content {marker}"))
+
+    assert receipt.index_status == "degraded"
+    assert receipt.last_error_code == "enrichment_failed"
+    assert marker not in caplog.text
+    assert receipt.memory_ids[0] not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "inhale: enrichment failed" in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 # ---------------------------------------------------------------------------
