@@ -42,13 +42,19 @@ class SnapshotError(RuntimeError):
 
 
 def _assert_mode(path: Path, expected: int) -> None:
+    """Verify on-disk mode bits match ``expected``; fail closed otherwise.
+
+    Uses an explicit raise rather than ``assert`` (which ``python -O`` strips,
+    silently disabling the fail-closed check). The message is content-free
+    (no path fragment) so private paths never leak via this error path.
+    """
     import stat
 
     actual = stat.S_IMODE(path.stat().st_mode)
-    assert actual == expected, (
-        f"mode assertion failed for {path.name}: "
-        f"expected {oct(expected)} got {oct(actual)}"
-    )
+    if actual != expected:
+        raise SnapshotError(
+            f"file mode check failed: expected {oct(expected)} got {oct(actual)}"
+        )
 
 
 def _open_ro_source(db_path: Path) -> sqlite3.Connection:
@@ -237,21 +243,38 @@ def restore_isolated_snapshot(
         raise SnapshotError("checksum sidecar not found")
 
     # --- 1. Verify sidecar BEFORE any target mutation --------------------
+    # The sidecar must contain exactly one whitespace-separated token: the
+    # 64-char lowercase hex SHA-256. Extra tokens (trailing junk) are rejected
+    # so a tampered sidecar cannot pass merely by prefixing the correct hash.
     try:
-        expected = checksum_path.read_text().split()[0].strip()
-    except (OSError, IndexError) as exc:
+        raw = checksum_path.read_text()
+    except OSError as exc:
         raise SnapshotError("checksum sidecar unreadable") from exc
-    if len(expected) != 64:
+    tokens = raw.split()
+    if len(tokens) != 1:
+        raise SnapshotError("checksum sidecar malformed")
+    expected = tokens[0].strip()
+    if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
         raise SnapshotError("checksum sidecar malformed")
     actual = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
     if actual != expected:
         raise SnapshotError("checksum mismatch")
 
     # --- 2. Reject active target sidecars --------------------------------
-    recovery._reject_active_sidecars(target_path)
+    # recovery's helpers raise RuntimeError with the full target path embedded;
+    # convert to a content-free SnapshotError so no raw private path escapes.
+    try:
+        recovery._reject_active_sidecars(target_path)
+    except Exception as exc:
+        raise SnapshotError(
+            "active target sidecar present; quiesce writers first"
+        ) from exc
 
     # --- 3. Acquire + hold the writer lock through replace ---------------
-    lock_conn = recovery._acquire_writer_lock(target_path)
+    try:
+        lock_conn = recovery._acquire_writer_lock(target_path)
+    except Exception as exc:
+        raise SnapshotError("could not acquire exclusive writer lock") from exc
     staged_path = recovery._unique_staged_path(target_path)
     preserved_path = target_path.with_name(target_path.name + ".restore_preserved")
     preserved_existed = target_path.exists()
@@ -297,10 +320,19 @@ def restore_isolated_snapshot(
 
         # --- 6. Post-replace integrity; rollback on failure --------------
         if not recovery.verify_integrity(target_path):
+            # Rollback: copy the preserved original back over the target. If
+            # THIS copy fails (disk full, I/O error), we must NOT delete the
+            # preserved copy --- it is the only remaining original. Remove it
+            # from the cleanup list so the failure handler cannot unlink it.
             if preserved_existed and preserved_path.exists():
-                shutil.copy2(preserved_path, target_path)
-                recovery._fsync_path(target_path)
-                recovery._fsync_dir(target_path.parent)
+                try:
+                    shutil.copy2(preserved_path, target_path)
+                    recovery._fsync_path(target_path)
+                    recovery._fsync_dir(target_path.parent)
+                except OSError:
+                    # Protect the only surviving copy of the original.
+                    if preserved_path in created:
+                        created.remove(preserved_path)
             raise SnapshotError("post-replace integrity_check failed")
     except Exception as exc:
         _cleanup(created)

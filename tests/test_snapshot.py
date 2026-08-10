@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import os
+import shutil
 import stat
 from pathlib import Path
 
@@ -313,6 +315,9 @@ def test_restore_rejects_tampered_snapshot_bytes_and_preserves_target(tmp_path):
 
 
 def test_restore_rejects_active_target_wal_sidecar(tmp_path):
+    """Active -wal sidecar must be rejected as a SnapshotError with no raw
+    target path in the message (not a recovery RuntimeError leaking paths).
+    """
     source = _seed_database(tmp_path / "source.db")
     snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
     snap = Path(snap_result["snapshot_path"])
@@ -321,11 +326,17 @@ def test_restore_rejects_active_target_wal_sidecar(tmp_path):
     _seed_database(target)
     target.with_name(target.name + "-wal").write_bytes(b"\x00" * 64)
 
-    with pytest.raises((snapshot.SnapshotError, RuntimeError), match="sidecar"):
+    with pytest.raises(snapshot.SnapshotError) as ei:
         snapshot.restore_isolated_snapshot(snap, target)
+
+    msg = str(ei.value)
+    assert str(target) not in msg, f"raw path leaked: {msg!r}"
 
 
 def test_restore_rejects_active_target_shm_sidecar(tmp_path):
+    """Active -shm sidecar must be rejected as a SnapshotError with no raw
+    target path in the message.
+    """
     source = _seed_database(tmp_path / "source.db")
     snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
     snap = Path(snap_result["snapshot_path"])
@@ -334,8 +345,11 @@ def test_restore_rejects_active_target_shm_sidecar(tmp_path):
     _seed_database(target)
     target.with_name(target.name + "-shm").write_bytes(b"\x00" * 64)
 
-    with pytest.raises((snapshot.SnapshotError, RuntimeError), match="sidecar"):
+    with pytest.raises(snapshot.SnapshotError) as ei:
         snapshot.restore_isolated_snapshot(snap, target)
+
+    msg = str(ei.value)
+    assert str(target) not in msg, f"raw path leaked: {msg!r}"
 
 
 def test_restore_missing_snapshot_raises(tmp_path):
@@ -469,3 +483,182 @@ def test_restore_does_not_mutate_snapshot_source(tmp_path):
     # No sidecars should be created beside the snapshot either.
     assert not snap.with_name(snap.name + "-wal").exists()
     assert not snap.with_name(snap.name + "-shm").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task 5 fix round 1: reviewer-driven regressions
+# ---------------------------------------------------------------------------
+
+
+def test_restore_active_sidecar_failure_is_content_free_snapshoterror(tmp_path):
+    """Important 1: recovery._reject_active_sidecars raises RuntimeError with
+    the full target path; snapshot must convert every such failure to a
+    content-free SnapshotError whose message contains no raw path.
+    """
+    source = _seed_database(tmp_path / "source.db")
+    snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+    snap = Path(snap_result["snapshot_path"])
+
+    target = tmp_path / "target.db"
+    _seed_database(target)
+    target.with_name(target.name + "-wal").write_bytes(b"\x00" * 64)
+
+    with pytest.raises(snapshot.SnapshotError) as ei:
+        snapshot.restore_isolated_snapshot(snap, target)
+
+    msg = str(ei.value)
+    assert str(target) not in msg, (
+        f"raw target path leaked into SnapshotError message: {msg!r}"
+    )
+    assert target.name not in msg, (
+        f"target name leaked into SnapshotError message: {msg!r}"
+    )
+    # -wal sidecar path components must not appear either.
+    assert "wal" not in msg.lower() or "sidecar" in msg.lower()
+
+
+def test_restore_writer_lock_failure_is_content_free_snapshoterror(
+    tmp_path, monkeypatch
+):
+    """Important 1: recovery._acquire_writer_lock raises RuntimeError with the
+    full target path when a writer holds the lock; snapshot must surface this
+    as a content-free SnapshotError with no raw path.
+    """
+    source = _seed_database(tmp_path / "source.db")
+    snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+    snap = Path(snap_result["snapshot_path"])
+
+    target = tmp_path / "target.db"
+    _seed_database(target)
+
+    def _always_locked(db_path):
+        raise RuntimeError(
+            f"Refusing to restore: a live writer appears to hold {db_path} "
+            f"(forced). Stop all Mnemosyne processes before restoring."
+        )
+
+    monkeypatch.setattr(snapshot_mod.recovery, "_acquire_writer_lock", _always_locked)
+
+    with pytest.raises(snapshot.SnapshotError) as ei:
+        snapshot.restore_isolated_snapshot(snap, target)
+
+    msg = str(ei.value)
+    assert str(target) not in msg, (
+        f"raw target path leaked into SnapshotError message: {msg!r}"
+    )
+    assert target.name not in msg, (
+        f"target name leaked into SnapshotError message: {msg!r}"
+    )
+
+
+def test_restore_rollback_copy_failure_preserves_original_bytes(tmp_path, monkeypatch):
+    """Important 2: when the post-replace integrity check fails AND the
+    rollback copy of the preserved original also fails, the preserved
+    `.restore_preserved` file must NOT be deleted/overwritten. It is the only
+    remaining copy of the original.
+    """
+    source = _seed_database(tmp_path / "source.db")
+    snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+    snap = Path(snap_result["snapshot_path"])
+
+    target = tmp_path / "target.db"
+    _seed_database(target)
+    conn = sqlite3.connect(str(target))
+    conn.execute("INSERT INTO t VALUES (77, 'preserved-me')")
+    conn.commit()
+    conn.close()
+    original_bytes = target.read_bytes()
+
+    # Force post-replace integrity failure.
+    monkeypatch.setattr(snapshot_mod.recovery, "verify_integrity", lambda p: False)
+    # Break only the ROLLBACK copy (preserved -> target direction). The
+    # preserve copy (target -> preserved) must succeed so that the preserved
+    # file exists to test the protection on the rollback-failure path.
+    real_copy2 = shutil.copy2
+
+    def rollback_broken(src, dst, *a, **kw):
+        if str(src).endswith(".restore_preserved"):
+            raise OSError("forced rollback copy failure")
+        return real_copy2(src, dst, *a, **kw)
+
+    monkeypatch.setattr(snapshot_mod.shutil, "copy2", rollback_broken)
+
+    with pytest.raises(snapshot.SnapshotError):
+        snapshot.restore_isolated_snapshot(snap, target)
+
+    monkeypatch.setattr(snapshot_mod.shutil, "copy2", real_copy2)
+
+    preserved = target.with_name(target.name + ".restore_preserved")
+    assert preserved.exists(), (
+        "preserved original was deleted when rollback copy failed; the only "
+        "copy of the original is gone"
+    )
+    assert preserved.read_bytes() == original_bytes, (
+        "preserved original bytes changed; rollback-failure path corrupted it"
+    )
+
+
+def test_restore_rejects_sidecar_with_trailing_content(tmp_path):
+    """Minor 1: the sidecar must contain exactly one whitespace-separated
+    token (the 64-char hex hash). A sidecar with the correct hash plus extra
+    junk must be rejected.
+    """
+    source = _seed_database(tmp_path / "source.db")
+    snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+    snap = Path(snap_result["snapshot_path"])
+
+    checksum_path = Path(snap_result["checksum_path"])
+    correct_hash = snap_result["sha256"]
+    checksum_path.write_text(correct_hash + " extra-junk-token")
+
+    target = tmp_path / "target.db"
+    _seed_database(target)
+
+    with pytest.raises(snapshot.SnapshotError, match="sidecar"):
+        snapshot.restore_isolated_snapshot(snap, target)
+
+
+def test_restore_rejects_non_hex_sidecar_as_malformed(tmp_path):
+    """A 64-char token that is not hexadecimal must be a malformed sidecar,
+    not a checksum mismatch.
+    """
+    source = _seed_database(tmp_path / "source.db")
+    snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+    snap = Path(snap_result["snapshot_path"])
+
+    Path(snap_result["checksum_path"]).write_text("x" * 64)
+
+    target = tmp_path / "target.db"
+    _seed_database(target)
+
+    with pytest.raises(snapshot.SnapshotError, match="sidecar"):
+        snapshot.restore_isolated_snapshot(snap, target)
+
+
+def test_mode_check_raises_content_free_error_without_assert(tmp_path, monkeypatch):
+    """Minor 2: mode enforcement must not rely on `assert` (stripped under
+    -O) and must emit a content-free error (no path fragment).
+    """
+    source = _seed_database(tmp_path / "source.db")
+
+    # Force _assert_mode to detect a mismatch by chmod'ing the snapshot to a
+    # wrong mode right after creation. We patch os.chmod applied to the
+    # snapshot_path so the on-disk mode disagrees with the expected 0600.
+    real_chmod = os.chmod
+
+    def weakening_chmod(path, mode, *a, **kw):
+        real_chmod(path, mode, *a, **kw)
+        # If this looks like our snapshot data file, weaken it.
+        if str(path).endswith(".pristine.sqlite"):
+            real_chmod(path, 0o644)
+
+    monkeypatch.setattr(snapshot_mod.os, "chmod", weakening_chmod)
+
+    with pytest.raises(snapshot.SnapshotError) as ei:
+        snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+
+    msg = str(ei.value)
+    assert str(source) not in msg
+    # No path basename should leak either.
+    assert ".pristine.sqlite" not in msg
+    assert "source.db" not in msg
