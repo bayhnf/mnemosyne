@@ -322,9 +322,22 @@ def _safe_source_db(source_db: Path, trial_root: Path) -> Path | None:
 def _safe_report_path(report_path: Path, trial_root: Path) -> Path | None:
     """Return the report path only if it is a strict descendant of
     ``<trial_root>/reports/`` (R1 evidence boundary). Rejects the reports
-    root itself, paths outside it, and symlink escapes."""
-    reports_root = Path(trial_root) / "reports"
+    root itself, paths outside it, and an existing reports root that is a
+    symlink, a non-directory, or resolves outside trial_root. A missing
+    reports root is allowed because ``_ensure_report_tree`` creates it later."""
+    trial_root = Path(trial_root)
+    reports_root = trial_root / "reports"
     report_path = Path(report_path)
+    # Reject a poisoned existing reports/ root before any containment check.
+    try:
+        if reports_root.is_symlink():
+            return None
+        if reports_root.exists() and (
+            not reports_root.is_dir() or not _contained_under(reports_root, trial_root)
+        ):
+            return None
+    except OSError:
+        return None
     if not _contained_under(report_path, reports_root):
         return None
     if _resolve(report_path) == _resolve(reports_root):
@@ -1354,25 +1367,31 @@ def _self_scan(trial_root: Path) -> tuple[str, str]:
     tree is empty evidence (ok); fail closed on a symlinked/non-dir root, any
     symlink in the tree, or stat/read errors (R1, High 3)."""
     root = Path(trial_root) / "reports"
-    # Fail closed if the evidence root is itself a symlink or a non-directory.
-    # A missing reports/ tree is simply empty evidence (scan ok).
+    # A missing reports/ tree is empty evidence (scan ok). Fail closed if the
+    # root is a symlink, a non-directory, or has the wrong (non-0700) mode.
     try:
-        if root.is_symlink() or (root.exists() and not root.is_dir()):
+        if root.is_symlink():
             return FAIL, "scan_read_error"
+        if root.exists():
+            if not root.is_dir():
+                return FAIL, "scan_read_error"
+            if stat.S_IMODE(root.stat().st_mode) != _DIR_MODE:
+                return FAIL, "bad_directory_mode"
     except OSError:
         return FAIL, "scan_read_error"
     bad_modes: list[str] = []
     canary_hits: list[str] = []
 
     for path in root.rglob("*"):
-        if not path.is_file() and not path.is_dir():
-            continue
-        # R1: every symlink in the evidence tree fails closed.
+        # R1: every symlink in the evidence tree fails closed. Check this BEFORE
+        # the is_file/is_dir filter so dangling links are not silently skipped.
         try:
             if path.is_symlink():
                 return FAIL, "scan_read_error"
         except OSError:
             return FAIL, "scan_read_error"
+        if not path.is_file() and not path.is_dir():
+            continue
         try:
             mode = stat.S_IMODE(path.stat().st_mode)
         except OSError:

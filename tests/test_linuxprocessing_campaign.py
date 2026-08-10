@@ -1122,3 +1122,51 @@ class TestG6CheckpointsAndScan:
         exit_code, report = _run_stage("g6", trial, monkeypatch, *_ack_all())
         assert exit_code == lpc.EXIT_FAIL
         assert _read_report(report)["checks"]["self_scan"]["reason_code"] == "scan_read_error"
+
+    def test_g6_rejects_dangling_symlink_in_reports_tree(self, tmp_path, monkeypatch):
+        """A dangling symlink in reports/ must fail closed, not be skipped as a
+        non-file/non-dir entry (R1 fix round 1)."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        reports = trial / "reports"
+        reports.mkdir()
+        reports.chmod(0o700)
+        (reports / "dangling.json").symlink_to(trial / "missing.json")
+        exit_code, report = _run_stage("g6", trial, monkeypatch, *_ack_all())
+        assert exit_code == lpc.EXIT_FAIL
+        assert _read_report(report)["checks"]["self_scan"]["reason_code"] == "scan_read_error"
+
+    def test_g0_rejects_report_when_reports_root_is_symlink_to_outside(self, tmp_path, monkeypatch):
+        """If <trial>/reports is a symlink to a directory outside the trial
+        root, the report path must be rejected and nothing written outside."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        outside_dir = tmp_path / "outside-evidence"
+        outside_dir.mkdir()
+        (trial / "reports").symlink_to(outside_dir)
+        outside_report = outside_dir / "report.json"
+        exit_code, _ = _run_stage("g0", trial, monkeypatch, *_ack_all())
+        assert exit_code == lpc.EXIT_FAIL
+        assert not outside_report.exists()
+
+    def test_report_path_equal_to_reports_root_is_rejected(self, tmp_path, monkeypatch):
+        """--report <trial>/reports must be rejected: the evidence root is not
+        itself a report file (R1 fix round 1)."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        exit_code, _ = _run_stage_custom(
+            "g0", trial, "reports", monkeypatch, *_ack_all()
+        )
+        assert exit_code == lpc.EXIT_FAIL
+
+    def test_self_scan_rejects_bad_mode_on_reports_root(self, tmp_path, monkeypatch):
+        """_self_scan must validate the reports/ root directory's own 0700 mode,
+        not only the modes of entries beneath it (R1 fix round 1)."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        reports = trial / "reports"
+        reports.mkdir()
+        reports.chmod(0o755)  # too-open evidence root
+        verdict, reason = lpc._self_scan(trial)
+        assert verdict == FAIL
+        assert reason == "bad_directory_mode"
