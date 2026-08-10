@@ -11,6 +11,7 @@ seven commits. Helpers are inlined per the brief's helper policy.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 import subprocess
@@ -336,5 +337,162 @@ class TestG1Checkout:
             "deadbeef" * 8,
             "--trial-interpreter",
             "/nonexistent/interpreter/bin/python",
+        )
+        assert code == 1
+
+
+# ===========================================================================
+# Commit 3: G2/G3/G8 snapshot, dry-run migration, restore + rollback rehearsal
+# ===========================================================================
+
+
+def _make_trial_db(path: Path) -> Path:
+    """Seed a small trial DB via the real init_db; returns its path."""
+    from mnemosyne.core.memory import init_db
+
+    init_db(path)
+    return path
+
+
+class TestG2Snapshot:
+    def test_g2_snapshots_trial_clone_and_verifies_integrity(
+        self, tmp_path, monkeypatch
+    ):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        code, report_path = _run_stage(
+            "g2",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        assert checks["snapshot"]["verdict"] == PASS
+        assert checks["integrity"]["verdict"] == PASS
+        assert checks["fingerprint"]["verdict"] == PASS
+        assert checks["mode_bits"]["verdict"] == PASS
+        assert checks["sidecar"]["verdict"] == PASS
+        assert checks["user_version"]["verdict"] == PASS
+
+    def test_g2_gates_without_snapshot_approval(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        # The writer-quiesce + snapshot-approved acks are the G2 gate.
+        code, report_path = _run_stage(
+            "g2",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+        )
+        report = _read_report(report_path)
+        assert report["checks"]["writer_quiesce_ack"]["verdict"] == "PENDING"
+        assert report["checks"]["snapshot_approved_ack"]["verdict"] == "PENDING"
+
+    def test_g2_fails_when_source_db_missing(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g2",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(trial / "nope.db"),
+        )
+        assert code == 1
+        report = _read_report(report_path)
+        assert report["checks"]["snapshot"]["verdict"] == FAIL
+
+    def test_g2_clones_are_0600_with_0700_dir(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        _run_stage("g2", trial, monkeypatch, "--source-db", str(source))
+        snaps_dir = trial / "snapshots"
+        assert snaps_dir.exists()
+        assert stat.S_IMODE(snaps_dir.stat().st_mode) == 0o700
+        for child in snaps_dir.iterdir():
+            assert stat.S_IMODE(child.stat().st_mode) == 0o600
+
+
+class TestG3MigrationDryRun:
+    def test_g3_dry_run_is_report_only_no_mutation(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        # Baseline hash before dry-run.
+        before = hashlib.sha256(source.read_bytes()).hexdigest()
+        code, report_path = _run_stage(
+            "g3",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+        )
+        assert code == 0
+        after = hashlib.sha256(source.read_bytes()).hexdigest()
+        # Dry-run must not mutate the source clone.
+        assert before == after
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        assert report["checks"]["dry_run"]["verdict"] == PASS
+        assert report["checks"]["no_mutation"]["verdict"] == PASS
+
+    def test_g3_content_free(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        _, report_path = _run_stage(
+            "g3", trial, monkeypatch, "--source-db", str(source)
+        )
+        report = _read_report(report_path)
+        _assert_content_free(json.dumps(report))
+        _assert_allowlist(report)
+
+
+class TestG8RollbackRehearsal:
+    def test_g8_rehearsal_restores_clone_and_verifies_pristine(
+        self, tmp_path, monkeypatch
+    ):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        code, report_path = _run_stage(
+            "g8",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        assert checks["restore"]["verdict"] == PASS
+        assert checks["post_restore_integrity"]["verdict"] == PASS
+        # Pristine fingerprint: the snapshot's sidecar SHA matches the
+        # snapshot file on disk (tamper detection of the pristine image).
+        assert checks["pristine_intact"]["verdict"] == PASS
+        # Logical equivalence between source and restored target.
+        assert checks["table_equivalence"]["verdict"] == PASS
+        assert checks["sidecar_absence"]["verdict"] == PASS
+        assert checks["user_version_match"]["verdict"] == PASS
+        assert checks["dream_undo"]["verdict"] == PASS
+
+    def test_g8_fails_when_source_missing(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, _ = _run_stage(
+            "g8",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(trial / "nope.db"),
         )
         assert code == 1

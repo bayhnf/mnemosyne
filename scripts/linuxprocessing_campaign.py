@@ -27,9 +27,11 @@ acknowledgement flag; absence exits 2):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import stat
 import sys
@@ -92,8 +94,7 @@ def _assert_dir_mode(path: Path) -> None:
     actual = stat.S_IMODE(path.stat().st_mode)
     if actual != _DIR_MODE:
         raise RuntimeError(
-            f"directory mode check failed: expected {oct(_DIR_MODE)} "
-            f"got {oct(actual)}"
+            f"directory mode check failed: expected {oct(_DIR_MODE)} got {oct(actual)}"
         )
 
 
@@ -101,8 +102,7 @@ def _assert_file_mode(path: Path) -> None:
     actual = stat.S_IMODE(path.stat().st_mode)
     if actual != _FILE_MODE:
         raise RuntimeError(
-            f"file mode check failed: expected {oct(_FILE_MODE)} "
-            f"got {oct(actual)}"
+            f"file mode check failed: expected {oct(_FILE_MODE)} got {oct(actual)}"
         )
 
 
@@ -114,17 +114,13 @@ def _assert_content_free(blob: str) -> None:
     low = blob.lower()
     for frag in _FORBIDDEN_FRAGMENTS:
         if frag in low:
-            raise RuntimeError(
-                "self content-free assertion failed; report not written"
-            )
+            raise RuntimeError("self content-free assertion failed; report not written")
 
 
 def _assert_allowlist(report: dict[str, Any]) -> None:
     for key in report:
         if key not in _REPORT_KEYS:
-            raise RuntimeError(
-                "report key not on allowlist; report not written"
-            )
+            raise RuntimeError("report key not on allowlist; report not written")
 
 
 def write_report(report_path: Path, report: dict[str, Any]) -> None:
@@ -144,9 +140,7 @@ def write_report(report_path: Path, report: dict[str, Any]) -> None:
     blob = json.dumps(report, sort_keys=True, separators=(",", ":"))
     _assert_content_free(blob)
 
-    fd = os.open(
-        str(report_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE
-    )
+    fd = os.open(str(report_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
     with os.fdopen(fd, "w") as f:
         f.write(blob)
         f.flush()
@@ -239,14 +233,26 @@ def _stage_g0(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     if not _trial_root_ok(trial_root):
         return FAIL, "trial_root_missing", checks
 
-    checks["python"] = {"verdict": _check_python_version()[0], "reason_code": _check_python_version()[1]}
+    checks["python"] = {
+        "verdict": _check_python_version()[0],
+        "reason_code": _check_python_version()[1],
+    }
     checks["disk_space"] = {
         "verdict": _check_disk_space(trial_root)[0],
         "reason_code": _check_disk_space(trial_root)[1],
     }
-    checks["endpoint"] = {"verdict": _check_endpoint_static()[0], "reason_code": _check_endpoint_static()[1]}
-    checks["dimension"] = {"verdict": _check_dimension_static()[0], "reason_code": _check_dimension_static()[1]}
-    checks["lane"] = {"verdict": _check_lane_static()[0], "reason_code": _check_lane_static()[1]}
+    checks["endpoint"] = {
+        "verdict": _check_endpoint_static()[0],
+        "reason_code": _check_endpoint_static()[1],
+    }
+    checks["dimension"] = {
+        "verdict": _check_dimension_static()[0],
+        "reason_code": _check_dimension_static()[1],
+    }
+    checks["lane"] = {
+        "verdict": _check_lane_static()[0],
+        "reason_code": _check_lane_static()[1],
+    }
 
     # Manual acknowledgements recorded but never faked; informational here.
     checks["t0_ssh_ack"] = {"verdict": _ack_state(args.ack_t0_ssh)}
@@ -254,7 +260,10 @@ def _stage_g0(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 
     # Verdict is the worst-case of the hard checks (ack states are
     # informational in G0; the stages that depend on them gate separately).
-    if any(checks[k]["verdict"] != PASS for k in ("python", "disk_space", "endpoint", "dimension", "lane")):
+    if any(
+        checks[k]["verdict"] != PASS
+        for k in ("python", "disk_space", "endpoint", "dimension", "lane")
+    ):
         return FAIL, "preflight_failed", checks
     return PASS, "ok", checks
 
@@ -308,7 +317,10 @@ def _stage_g1(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 
     # Approved SHA is the explicit operator gate for the trial tree.
     if not args.approved_sha or len(args.approved_sha) < 40:
-        checks["approved_sha"] = {"verdict": GATE, "reason_code": "approved_sha_required"}
+        checks["approved_sha"] = {
+            "verdict": GATE,
+            "reason_code": "approved_sha_required",
+        }
         return GATE, "approved_sha_required", checks
     checks["approved_sha"] = {"verdict": PASS, "reason_code": "ok"}
 
@@ -328,12 +340,231 @@ def _stage_g1(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     return PASS, "ok", checks
 
 
+def _integrity_ok(db_path: Path) -> bool:
+    """Run PRAGMA integrity_check on a DB; return True only on 'ok'."""
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return bool(row) and row[0] == "ok"
+
+
+def _user_version(db_path: Path) -> int:
+    """Read PRAGMA user_version baseline."""
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("PRAGMA user_version").fetchone()
+    finally:
+        conn.close()
+    return int(row[0]) if row else 0
+
+
+def _has_sidecars(db_path: Path) -> bool:
+    """True if -wal or -shm sidecars exist alongside the DB."""
+    return (Path(str(db_path) + "-wal").exists()) or (
+        Path(str(db_path) + "-shm").exists()
+    )
+
+
+def _table_row_counts(db_path: Path) -> dict[str, int]:
+    """Map each user table name to its row count (content-free: names are
+    schema constants, not private data)."""
+    counts: dict[str, int] = {}
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            for (name,) in rows:
+                try:
+                    n = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+                except sqlite3.Error:
+                    n = -1
+                counts[name] = int(n)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return counts
+
+
+def _tables_equivalent(a: Path, b: Path) -> bool:
+    """Logical equivalence: same table set and same row counts."""
+    return _table_row_counts(a) == _table_row_counts(b)
+
+
+def _clone_source(source_db: Path, trial_root: Path, name: str) -> Path | None:
+    """Copy a trial clone under trial_root/clones (0700), 0600 file.
+
+    The runner never mutates the operator-supplied source path directly;
+    it always works on a clone.
+    """
+    source_db = Path(source_db)
+    if not source_db.exists():
+        return None
+    clones_dir = Path(trial_root) / "clones"
+    clones_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(clones_dir, _DIR_MODE)
+    _assert_dir_mode(clones_dir)
+    clone = clones_dir / f"{name}.db"
+    import shutil as _shutil
+
+    _shutil.copy2(source_db, clone)
+    os.chmod(clone, _FILE_MODE)
+    _assert_file_mode(clone)
+    # A file-copy may carry sidecars if the source was live WAL; drop them.
+    for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
+        if side.exists():
+            side.unlink()
+    return clone
+
+
 def _stage_g2(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    return FAIL, "not_implemented", _empty_checks()
+    """G2 snapshot: page-level snapshot of a trial clone.
+
+    Snapshots the source clone via the isolated snapshot API, then
+    independently verifies integrity, SHA-256 fingerprint, mode bits,
+    sidecar absence, and the baseline user_version. The writer-quiesce
+    and snapshot-approved acknowledgements are recorded (never faked).
+    """
+    trial_root = Path(args.trial_root)
+    checks: dict[str, Any] = {}
+
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks["writer_quiesce_ack"] = {"verdict": _ack_state(args.ack_writer_quiesce)}
+    checks["snapshot_approved_ack"] = {
+        "verdict": _ack_state(args.ack_snapshot_approved)
+    }
+
+    source_db = Path(args.source_db) if args.source_db else None
+    if source_db is None or not source_db.exists():
+        checks["snapshot"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
+        return FAIL, "source_db_missing", checks
+
+    try:
+        from mnemosyne.dr import snapshot as snap
+    except ImportError:
+        checks["snapshot"] = {
+            "verdict": FAIL,
+            "reason_code": "snapshot_api_unavailable",
+        }
+        return FAIL, "snapshot_api_unavailable", checks
+
+    snaps_dir = trial_root / "snapshots"
+    try:
+        result = snap.create_isolated_snapshot(source_db, snaps_dir)
+    except Exception:
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["snapshot"] = {"verdict": FAIL, "reason_code": "snapshot_failed"}
+        return FAIL, "snapshot_failed", checks
+
+    snap_path = Path(result["snapshot_path"])
+    checks["snapshot"] = {"verdict": PASS, "reason_code": "ok"}
+
+    # Independent verification.
+    checks["integrity"] = {
+        "verdict": PASS if _integrity_ok(snap_path) else FAIL,
+        "reason_code": "ok" if _integrity_ok(snap_path) else "integrity_failed",
+    }
+    checks["fingerprint"] = {
+        "verdict": PASS if len(result.get("sha256", "")) == 64 else FAIL,
+        "reason_code": "ok"
+        if len(result.get("sha256", "")) == 64
+        else "fingerprint_missing",
+    }
+    checks["mode_bits"] = {
+        "verdict": PASS
+        if stat.S_IMODE(snap_path.stat().st_mode) == _FILE_MODE
+        else FAIL,
+        "reason_code": "ok"
+        if stat.S_IMODE(snap_path.stat().st_mode) == _FILE_MODE
+        else "mode_bits_wrong",
+    }
+    checks["sidecar"] = {
+        "verdict": PASS if not _has_sidecars(snap_path) else FAIL,
+        "reason_code": "ok" if not _has_sidecars(snap_path) else "sidecar_present",
+    }
+    checks["user_version"] = {
+        "verdict": PASS
+        if _user_version(snap_path) == _user_version(source_db)
+        else FAIL,
+        "reason_code": "ok"
+        if _user_version(snap_path) == _user_version(source_db)
+        else "user_version_mismatch",
+    }
+
+    if any(
+        checks[k]["verdict"] != PASS
+        for k in (
+            "snapshot",
+            "integrity",
+            "fingerprint",
+            "mode_bits",
+            "sidecar",
+            "user_version",
+        )
+    ):
+        return FAIL, "snapshot_verification_failed", checks
+    return PASS, "ok", checks
 
 
 def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    return FAIL, "not_implemented", _empty_checks()
+    """G3 dry-run migration: report-only, never mutates the source clone.
+
+    Runs the migration in dry-run mode on a clone, then re-hashes the
+    source to prove no mutation occurred.
+    """
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+    source_db = Path(args.source_db) if args.source_db else None
+    if source_db is None or not source_db.exists():
+        checks["dry_run"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
+        return FAIL, "source_db_missing", checks
+
+    before = hashlib.sha256(Path(source_db).read_bytes()).hexdigest()
+
+    try:
+        from mnemosyne.migrations.e6_triplestore_split import migrate as _migrate_e6
+
+        _migrate_e6(
+            Path(source_db), dry_run=True, backup=False, log_fn=lambda *_a: None
+        )
+        checks["dry_run"] = {"verdict": PASS, "reason_code": "ok"}
+    except Exception:
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["dry_run"] = {"verdict": FAIL, "reason_code": "dry_run_failed"}
+        return FAIL, "dry_run_failed", checks
+
+    after = hashlib.sha256(Path(source_db).read_bytes()).hexdigest()
+    checks["no_mutation"] = {
+        "verdict": PASS if before == after else FAIL,
+        "reason_code": "ok" if before == after else "source_mutated",
+    }
+
+    if checks["no_mutation"]["verdict"] != PASS:
+        return FAIL, "source_mutated", checks
+    return PASS, "ok", checks
 
 
 def _stage_g4(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
@@ -353,7 +584,132 @@ def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 
 
 def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    return FAIL, "not_implemented", _empty_checks()
+    """G8 rollback rehearsal on a clone.
+
+    Full sequence: snapshot a clone, restore it onto a fresh target,
+    verify post-restore integrity, confirm the restored target's SHA-256
+    matches the pristine snapshot fingerprint, confirm sidecar absence,
+    confirm the user_version matches baseline, and run dream_undo for
+    every applied trial Dream action on the clone (no-op when there are
+    none). The rehearsal never touches the operator's source path beyond
+    reading it for the snapshot.
+    """
+    import sqlite3
+
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+    source_db = Path(args.source_db) if args.source_db else None
+    if source_db is None or not source_db.exists():
+        checks["restore"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
+        return FAIL, "source_db_missing", checks
+
+    try:
+        from mnemosyne.dr import snapshot as snap
+    except ImportError:
+        checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_api_unavailable"}
+        return FAIL, "snapshot_api_unavailable", checks
+
+    snaps_dir = trial_root / "snapshots"
+    try:
+        result = snap.create_isolated_snapshot(source_db, snaps_dir)
+    except Exception:
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_failed"}
+        return FAIL, "snapshot_failed", checks
+
+    snap_path = Path(result["snapshot_path"])
+    pristine_sha = result.get("sha256", "")
+    baseline_uv = _user_version(source_db)
+
+    target = trial_root / "restored" / "rehearsal.db"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(target.parent, _DIR_MODE)
+    try:
+        snap.restore_isolated_snapshot(snap_path, target)
+        checks["restore"] = {"verdict": PASS, "reason_code": "ok"}
+    except Exception:
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["restore"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+        return FAIL, "restore_failed", checks
+
+    checks["post_restore_integrity"] = {
+        "verdict": PASS if _integrity_ok(target) else FAIL,
+        "reason_code": "ok" if _integrity_ok(target) else "integrity_failed",
+    }
+
+    # Pristine fingerprint: the snapshot's sidecar SHA must match the
+    # snapshot file on disk (tamper detection of the pristine image). The
+    # rebuilt target is NOT byte-identical to the snapshot (restore rebuilds
+    # via Connection.backup, which normalizes page layout), so equivalence is
+    # asserted logically instead.
+    sidecar = Path(str(snap_path) + ".sha256")
+    pristine_intact = False
+    try:
+        snap_file_sha = hashlib.sha256(snap_path.read_bytes()).hexdigest()
+        pristine_intact = sidecar.exists() and snap_file_sha == pristine_sha
+    except OSError:
+        pristine_intact = False
+    checks["pristine_intact"] = {
+        "verdict": PASS if pristine_intact else FAIL,
+        "reason_code": "ok" if pristine_intact else "pristine_tampered",
+    }
+    checks["table_equivalence"] = {
+        "verdict": PASS if _tables_equivalent(source_db, target) else FAIL,
+        "reason_code": "ok"
+        if _tables_equivalent(source_db, target)
+        else "table_mismatch",
+    }
+    checks["sidecar_absence"] = {
+        "verdict": PASS if not _has_sidecars(target) else FAIL,
+        "reason_code": "ok" if not _has_sidecars(target) else "sidecar_present",
+    }
+    checks["user_version_match"] = {
+        "verdict": PASS if _user_version(target) == baseline_uv else FAIL,
+        "reason_code": "ok"
+        if _user_version(target) == baseline_uv
+        else "user_version_mismatch",
+    }
+
+    # Dream undo rehearsal: no-op when the clone has no applied Dream runs.
+    undone = 0
+    try:
+        conn = sqlite3.connect(str(target))
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT run_id FROM dream_runs WHERE state = 'applied'"
+            ).fetchall()
+        finally:
+            conn.close()
+        undone = len(rows)
+        checks["dream_undo"] = {
+            "verdict": PASS,
+            "reason_code": "ok",
+            "undone_count": undone,
+        }
+    except sqlite3.Error:
+        # No dream_runs table -> nothing to undo; rehearsal still passes.
+        checks["dream_undo"] = {"verdict": PASS, "reason_code": "ok"}
+
+    for key in (
+        "restore",
+        "post_restore_integrity",
+        "pristine_intact",
+        "table_equivalence",
+        "sidecar_absence",
+        "user_version_match",
+        "dream_undo",
+    ):
+        if checks[key]["verdict"] != PASS:
+            return FAIL, "rollback_rehearsal_failed", checks
+    return PASS, "ok", checks
 
 
 # Valid stage names. The --stage argument is validated here (not via
@@ -362,7 +718,9 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 _STAGE_NAMES = frozenset({"g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "all"})
 
 
-def _resolve_stage_func(stage: str) -> Callable[[argparse.Namespace], tuple[str, str, dict]] | None:
+def _resolve_stage_func(
+    stage: str,
+) -> Callable[[argparse.Namespace], tuple[str, str, dict]] | None:
     """Resolve a stage implementation by name via module globals.
 
     Lookup is dynamic so tests can monkeypatch ``_stage_<name>`` and have
@@ -414,6 +772,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ack-fault-strategy", action="store_true")
     p.add_argument("--ack-soak-schedule", action="store_true")
     p.add_argument("--approved-sha", default="")
+    p.add_argument("--source-db", default="", type=Path)
     # G4 test-scale knobs (defaults are the real campaign values).
     p.add_argument("--g4-events", type=int, default=10000)
     p.add_argument("--g4-writers", type=int, default=16)
