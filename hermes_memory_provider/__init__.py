@@ -2099,7 +2099,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # this, an operator misconfiguration (corrupt DB, missing extras,
             # permissions, schema mismatch) silently masquerades as "the agent
             # doesn't remember anything" with no signal to the user.
-            logger.warning("Mnemosyne init failed: %s", e)
+            logger.warning("Mnemosyne init failed: %s", type(e).__name__)
             self._beam = None
             self._init_error = e
 
@@ -3129,7 +3129,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         shared_path.parent.mkdir(parents=True, exist_ok=True)
         self._shared_surface_path = shared_path
         self._surface_beam = BeamMemory(session_id="hermes_shared_surface", db_path=shared_path)
-        logger.info("Mnemosyne shared surface initialized: db=%s", shared_path)
+        logger.info("Mnemosyne shared surface initialized")
 
     def _require_surface_beam(self) -> Optional[str]:
         try:
