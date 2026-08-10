@@ -1528,3 +1528,92 @@ class TestI6ConcurrentClaimCAS:
         assert claimed == 1, (
             f"expected exactly 1 dream_claimed proposal, got {claimed}"
         )
+
+
+# ===========================================================================
+# Fix round 3 — strict scope provenance: fail closed in both directions
+# ===========================================================================
+
+
+class TestI6StrictScopeFailsClosedBothDirections:
+    """Round-2 left a bare-session exception: a session-only plan could still
+    select a proposal that declares author_id/author_type/channel_id. The
+    strict contract requires: if EITHER side declares a logical provenance
+    field the other does not declare and match, the proposal is excluded.
+    No exception for bare-session plans."""
+
+    def _seed_proposal_with_scope(self, beam, proposal_scope_json):
+        shmr._init_proposal_schema(beam.conn)
+        _seed_facts(beam, [
+            {"fact_id": "fr3", "subject": "r", "predicate": "p",
+             "object": "round three value", "confidence": 0.9},
+        ])
+        beam.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "shmr_r3", "cr3", beam.session_id,
+                json.dumps(proposal_scope_json),
+                json.dumps(["fr3"]), "r", "p", "round3", 0.9,
+                "create", None, "r", "proposed",
+            ),
+        )
+        beam.conn.commit()
+
+    def test_session_only_plan_rejects_proposal_declaring_provenance(self, beam):
+        """A plan with only session_id must NOT select a proposal whose
+        scope_json declares author_id/author_type/channel_id. The proposal
+        must remain eligible (unclaimed)."""
+        self._seed_proposal_with_scope(beam, {
+            "session_id": beam.session_id,
+            "author_id": "private-actor",
+            "author_type": "hermes",
+            "channel_id": "private-project",
+        })
+        run = dream.dream_plan(
+            beam, scope={"session_id": beam.session_id},
+        )
+        assert run.state == "rejected"
+        assert run.error_code == "no_candidates"
+        # Proposal must not be claimed.
+        status = beam.conn.execute(
+            "SELECT status FROM shmr_proposals WHERE proposal_id = 1"
+        ).fetchone()
+        assert status["status"] == "proposed"
+
+    def test_selective_plan_rejects_proposal_with_no_provenance(self, beam):
+        """A plan that declares actor_id must NOT select a proposal whose
+        scope_json has only session_id (no provenance at all)."""
+        self._seed_proposal_with_scope(
+            beam, {"session_id": beam.session_id}
+        )
+        run = dream.dream_plan(
+            beam,
+            scope={"session_id": beam.session_id, "actor_id": "my-actor"},
+        )
+        assert run.state == "rejected"
+        assert run.error_code == "no_candidates"
+
+    def test_matching_alias_fields_remain_eligible(self, beam):
+        """When both sides declare matching provenance (via aliases), the
+        proposal is eligible. Proves the strict check is not a blanket
+        rejector."""
+        self._seed_proposal_with_scope(beam, {
+            "session_id": beam.session_id,
+            "author_id": "my-actor",
+            "author_type": "codex",
+            "channel_id": "proj-a",
+        })
+        run = dream.dream_plan(
+            beam,
+            scope={
+                "session_id": beam.session_id,
+                "actor_id": "my-actor",
+                "producer": "codex",
+                "project_id": "proj-a",
+            },
+        )
+        assert run.state == "awaiting_approval"
+        assert len(run.actions) == 1

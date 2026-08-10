@@ -691,30 +691,12 @@ def _scope_matches(proposal_scope_raw: Dict[str, Any],
         plan_val = plan.get(canonical)
         if p_val is not None and plan_val is not None and p_val != plan_val:
             return False
-        # If EITHER side declares this field and the other does not, reject.
-        # This is stricter than the old "both-declared" check: a proposal
-        # that declares author_id='x' must not be planned under a scope that
-        # asserts no actor_id (and vice versa).
+        # Fail closed in both directions: if EITHER side declares this
+        # logical provenance field and the other does not, reject. No
+        # bare-session exception -- a session-only plan must not select a
+        # proposal that declares actor/producer/project, and vice versa.
         if (p_val is None) != (plan_val is None):
-            # Exception: if the plan asserts NO provenance at all (a bare
-            # session-only scope), allow proposals that declare provenance --
-            # the plan is non-selective. This preserves the common path where
-            # a plan does not filter by actor/producer/project.
-            plan_is_selective = any(
-                plan.get(c) is not None for c in _SCOPE_ALIASES
-            )
-            proposal_is_selective = any(
-                proposal.get(c) is not None for c in _SCOPE_ALIASES
-            )
-            if plan_is_selective or proposal_is_selective:
-                # Only reject if the SELECTIVE side declares this specific
-                # field and the other does not. A non-selective plan with a
-                # selective proposal field is allowed only when the plan
-                # asserts nothing at all.
-                if plan_is_selective and p_val is not None:
-                    return False
-                if proposal_is_selective and plan_val is not None:
-                    return False
+            return False
     return True
 
 
