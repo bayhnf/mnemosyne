@@ -96,6 +96,29 @@ def _read_report(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+_MISSING_STATE = object()
+
+
+def _campaign_process_state() -> tuple[Any, ...]:
+    """Snapshot campaign-mutable process state (callable identity).
+
+    Distinguishes an absent MNEMOSYNE_DATA_DIR from an empty value.
+    """
+    from mnemosyne.core import beam, embeddings, inhale, shmr
+    from mnemosyne.core.config import MnemosyneConfig
+
+    return (
+        os.environ.get("MNEMOSYNE_DATA_DIR", _MISSING_STATE),
+        MnemosyneConfig._instance,
+        shmr._embedding_fn,
+        embeddings.embed,
+        embeddings.available,
+        beam._wm_vec_available,
+        beam._store_working_embedding,
+        inhale._finalize_receipt,
+    )
+
+
 def _assert_content_free(blob: str) -> None:
     low = blob.lower()
     for forbidden in FORBIDDEN_FRAGMENTS:
@@ -668,10 +691,12 @@ class TestFaultMatrixAndAll:
 
     def test_fault_matrix_independent_mutation_check(self, tmp_path):
         """Each fault case must independently prove no partial mutation, not
-        trust a reported boolean."""
+        trust a reported boolean. Runs inside the campaign process-state
+        context so the matrix's direct hook writes are isolated (R2)."""
         trial = tmp_path / "trial"
         trial.mkdir()
-        result = lpc._run_fault_matrix(trial)
+        with lpc._campaign_process_state():
+            result = lpc._run_fault_matrix(trial)
         for name, outcome in result["cases"].items():
             assert outcome["no_partial_mutation"] is True, f"{name} leaked mutation"
 
@@ -1170,3 +1195,46 @@ class TestG6CheckpointsAndScan:
         verdict, reason = lpc._self_scan(trial)
         assert verdict == FAIL
         assert reason == "bad_directory_mode"
+
+
+# ===========================================================================
+# R2: campaign process-state isolation (same-process + failure path)
+# ===========================================================================
+
+
+class TestCampaignProcessStateIsolation:
+    def test_g4_restores_campaign_process_state(self, tmp_path, monkeypatch):
+        before = _campaign_process_state()
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        exit_code, _ = _run_stage(
+            "g4", trial, monkeypatch, *_ack_all(), "--g4-events", "1", "--g4-writers", "2"
+        )
+        assert exit_code == lpc.EXIT_PASS
+        assert _campaign_process_state() == before
+
+    def test_campaign_state_restores_when_g4_fails(self, tmp_path, monkeypatch):
+        before = _campaign_process_state()
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        monkeypatch.setattr(lpc, "_run_exactly_once", lambda *_: (_ for _ in ()).throw(RuntimeError("test failure")))
+        exit_code, _ = _run_stage(
+            "g4", trial, monkeypatch, *_ack_all(), "--g4-events", "1", "--g4-writers", "2"
+        )
+        assert exit_code == lpc.EXIT_FAIL
+        assert _campaign_process_state() == before
+
+    def test_campaign_then_sync_embedding_hooks_restored(self, tmp_path, monkeypatch):
+        """Sync-facing hooks must be the real functions after a campaign stage,
+        in the same-process campaign-then-sync order (no subprocess)."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        exit_code, _ = _run_stage(
+            "g4", trial, monkeypatch, *_ack_all(), "--g4-events", "1", "--g4-writers", "2"
+        )
+        assert exit_code == lpc.EXIT_PASS
+        from mnemosyne.core import embeddings
+        from mnemosyne.core.beam import _embeddings
+
+        assert _embeddings.embed is embeddings.embed
+        assert _embeddings.available is embeddings.available

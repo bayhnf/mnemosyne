@@ -38,6 +38,7 @@ to exit 2 and no code path can set PASS for an unacknowledged prerequisite.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -746,6 +747,46 @@ def _canonical_content_hash(db_path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _campaign_process_state():
+    """Restore campaign-mutated process state after the stage exits.
+
+    Snapshots callable identity plus the env/singleton values before yield
+    and restores them in finally, so in-process G4/G7/G8 runs never leak
+    hooks into other subsystems (e.g. sync) in the same process.
+    """
+    import mnemosyne.core.beam as beam_module
+    import mnemosyne.core.config as config_module
+    import mnemosyne.core.embeddings as embeddings_module
+    import mnemosyne.core.inhale as inhale_module
+    import mnemosyne.core.shmr as shmr_module
+
+    env_value = os.environ.get("MNEMOSYNE_DATA_DIR")
+    env_present = "MNEMOSYNE_DATA_DIR" in os.environ
+    config_instance = config_module.MnemosyneConfig._instance
+    shmr_fn = shmr_module._embedding_fn
+    embeddings_embed = embeddings_module.embed
+    embeddings_available = embeddings_module.available
+    wm_vec_available = beam_module._wm_vec_available
+    store_working_embedding = beam_module._store_working_embedding
+    finalize_receipt = inhale_module._finalize_receipt
+    try:
+        yield
+    finally:
+        if env_present:
+            os.environ["MNEMOSYNE_DATA_DIR"] = env_value
+        else:
+            os.environ.pop("MNEMOSYNE_DATA_DIR", None)
+        with config_module.MnemosyneConfig._lock:
+            config_module.MnemosyneConfig._instance = config_instance
+        shmr_module._embedding_fn = shmr_fn
+        embeddings_module.embed = embeddings_embed
+        embeddings_module.available = embeddings_available
+        beam_module._wm_vec_available = wm_vec_available
+        beam_module._store_working_embedding = store_working_embedding
+        inhale_module._finalize_receipt = finalize_receipt
+
+
 def _g4_isolate_config(trial_root: Path) -> None:
     os.environ["MNEMOSYNE_DATA_DIR"] = str(trial_root)
     import mnemosyne.core.config as config_module
@@ -937,52 +978,53 @@ def _run_dream_lifecycle(trial_root: Path) -> str | None:
 
 
 def _stage_g4(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    trial_root = Path(args.trial_root)
-    if not _trial_root_ok(trial_root):
-        return (
-            FAIL,
-            "trial_root_missing",
-            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
-        )
+    with _campaign_process_state():
+        trial_root = Path(args.trial_root)
+        if not _trial_root_ok(trial_root):
+            return (
+                FAIL,
+                "trial_root_missing",
+                {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+            )
 
-    checks: dict[str, Any] = {}
-    work_dir = trial_root / "g4"
-    work_dir.mkdir(exist_ok=True)
-    os.chmod(work_dir, _DIR_MODE)
+        checks: dict[str, Any] = {}
+        work_dir = trial_root / "g4"
+        work_dir.mkdir(exist_ok=True)
+        os.chmod(work_dir, _DIR_MODE)
 
-    # Critical 2: fault strategy ack gates G4.
-    if not args.ack_fault_strategy:
-        checks["fault_strategy_ack"] = {"verdict": _ack_state(args.ack_fault_strategy)}
-        return GATE, "fault_strategy_ack_required", checks
+        # Critical 2: fault strategy ack gates G4.
+        if not args.ack_fault_strategy:
+            checks["fault_strategy_ack"] = {"verdict": _ack_state(args.ack_fault_strategy)}
+            return GATE, "fault_strategy_ack_required", checks
 
-    n_events = max(1, int(args.g4_events))
-    n_writers = max(1, int(args.g4_writers))
+        n_events = max(1, int(args.g4_events))
+        n_writers = max(1, int(args.g4_writers))
 
-    # High 1: `all` exercises BOTH core and matrix. When invoked directly
-    # with --fault-matrix, run matrix only. Otherwise run core. The `all`
-    # orchestrator calls this stage in a mode that runs both.
-    run_matrix_too = bool(getattr(args, "_all_core_and_matrix", False))
+        # High 1: `all` exercises BOTH core and matrix. When invoked directly
+        # with --fault-matrix, run matrix only. Otherwise run core. The `all`
+        # orchestrator calls this stage in a mode that runs both.
+        run_matrix_too = bool(getattr(args, "_all_core_and_matrix", False))
 
-    if not getattr(args, "fault_matrix", False) and not run_matrix_too:
-        # Core lifecycle only.
-        return _g4_core(work_dir, n_events, n_writers, checks)
-    if getattr(args, "fault_matrix", False) and not run_matrix_too:
-        # Matrix only.
+        if not getattr(args, "fault_matrix", False) and not run_matrix_too:
+            # Core lifecycle only.
+            return _g4_core(work_dir, n_events, n_writers, checks)
+        if getattr(args, "fault_matrix", False) and not run_matrix_too:
+            # Matrix only.
+            matrix = _run_fault_matrix(work_dir)
+            checks["fault_matrix"] = matrix
+            if matrix["verdict"] != PASS:
+                return FAIL, "fault_matrix_failed", checks
+            return PASS, "ok", checks
+        # Both (called by `all`).
+        core_v, core_r, _ = _g4_core(work_dir, n_events, n_writers, {})
+        checks["core_verdict"] = core_v
         matrix = _run_fault_matrix(work_dir)
-        checks["fault_matrix"] = matrix
+        checks["matrix_verdict"] = matrix["verdict"]
+        if core_v != PASS:
+            return FAIL, "g4_core_failed", checks
         if matrix["verdict"] != PASS:
             return FAIL, "fault_matrix_failed", checks
         return PASS, "ok", checks
-    # Both (called by `all`).
-    core_v, core_r, _ = _g4_core(work_dir, n_events, n_writers, {})
-    checks["core_verdict"] = core_v
-    matrix = _run_fault_matrix(work_dir)
-    checks["matrix_verdict"] = matrix["verdict"]
-    if core_v != PASS:
-        return FAIL, "g4_core_failed", checks
-    if matrix["verdict"] != PASS:
-        return FAIL, "fault_matrix_failed", checks
-    return PASS, "ok", checks
 
 
 def _g4_core(
@@ -1479,131 +1521,132 @@ def _resource_snapshot() -> dict[str, int]:
 def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     """G7 soak. Measures ACTUAL elapsed duration and real ingest receipts.
     Fails on any degraded period (Critical 5). Requires soak-schedule ack."""
-    trial_root = Path(args.trial_root)
-    if not _trial_root_ok(trial_root):
-        return (
-            FAIL,
-            "trial_root_missing",
-            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
-        )
+    with _campaign_process_state():
+        trial_root = Path(args.trial_root)
+        if not _trial_root_ok(trial_root):
+            return (
+                FAIL,
+                "trial_root_missing",
+                {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+            )
 
-    checks: dict[str, Any] = {}
+        checks: dict[str, Any] = {}
 
-    # Critical 2/5: soak schedule ack gates G7.
-    if not args.ack_soak_schedule:
-        checks["soak_schedule_ack"] = {"verdict": _ack_state(args.ack_soak_schedule)}
-        return GATE, "soak_schedule_ack_required", checks
+        # Critical 2/5: soak schedule ack gates G7.
+        if not args.ack_soak_schedule:
+            checks["soak_schedule_ack"] = {"verdict": _ack_state(args.ack_soak_schedule)}
+            return GATE, "soak_schedule_ack_required", checks
 
-    soak_seconds = max(0, int(args.soak_seconds))
-    work_dir = trial_root / "g7"
-    work_dir.mkdir(exist_ok=True)
-    os.chmod(work_dir, _DIR_MODE)
+        soak_seconds = max(0, int(args.soak_seconds))
+        work_dir = trial_root / "g7"
+        work_dir.mkdir(exist_ok=True)
+        os.chmod(work_dir, _DIR_MODE)
 
-    before = _resource_snapshot()
-    _g4_isolate_config(work_dir)
-    from mnemosyne.core.beam import BeamMemory
+        before = _resource_snapshot()
+        _g4_isolate_config(work_dir)
+        from mnemosyne.core.beam import BeamMemory
 
-    clone = work_dir / "soak.db"
-    beam = BeamMemory(session_id="soak-sess", db_path=clone)
+        clone = work_dir / "soak.db"
+        beam = BeamMemory(session_id="soak-sess", db_path=clone)
 
-    timestamps: list[float] = []
-    receipt_count = 0
-    degraded = 0
-    recall_depth_bound = 0
+        timestamps: list[float] = []
+        receipt_count = 0
+        degraded = 0
+        recall_depth_bound = 0
 
-    # For soak_seconds==0: one iteration (test mode). For nonzero: ingest for
-    # the requested duration using a real clock. Tests MUST inject 0/small.
-    start_monotonic = time.monotonic()
-    deadline = start_monotonic + soak_seconds
-    i = 0
-    while True:
-        if soak_seconds == 0 and i >= 1:
-            break
-        if soak_seconds > 0 and time.monotonic() >= deadline:
-            break
-        ts = float(_utcnow_ms())
-        try:
-            result = beam.remember_event(_g4_event(8000 + i))
-            if result.status == "stored":
-                timestamps.append(ts)
-                receipt_count += 1
-                recall_depth_bound = max(recall_depth_bound, receipt_count)
-            else:
+        # For soak_seconds==0: one iteration (test mode). For nonzero: ingest for
+        # the requested duration using a real clock. Tests MUST inject 0/small.
+        start_monotonic = time.monotonic()
+        deadline = start_monotonic + soak_seconds
+        i = 0
+        while True:
+            if soak_seconds == 0 and i >= 1:
+                break
+            if soak_seconds > 0 and time.monotonic() >= deadline:
+                break
+            ts = float(_utcnow_ms())
+            try:
+                result = beam.remember_event(_g4_event(8000 + i))
+                if result.status == "stored":
+                    timestamps.append(ts)
+                    receipt_count += 1
+                    recall_depth_bound = max(recall_depth_bound, receipt_count)
+                else:
+                    degraded += 1
+            except Exception:
+                # Critical 5: degraded period is a FAILURE, not silently passed.
                 degraded += 1
-        except Exception:
-            # Critical 5: degraded period is a FAILURE, not silently passed.
-            degraded += 1
-        i += 1
-        # Safety cap to avoid runaway in case of a clock bug.
-        if i > 100000:
-            break
+            i += 1
+            # Safety cap to avoid runaway in case of a clock bug.
+            if i > 100000:
+                break
 
-    elapsed = time.monotonic() - start_monotonic
-    after = _resource_snapshot()
+        elapsed = time.monotonic() - start_monotonic
+        after = _resource_snapshot()
 
-    # Critical 5: fail on any degraded period.
-    if degraded > 0:
-        checks["soak"] = {
-            "verdict": FAIL,
-            "reason_code": "degraded_period",
-            "degraded_periods": degraded,
+        # Critical 5: fail on any degraded period.
+        if degraded > 0:
+            checks["soak"] = {
+                "verdict": FAIL,
+                "reason_code": "degraded_period",
+                "degraded_periods": degraded,
+                "receipt_count": receipt_count,
+                "elapsed_seconds": round(elapsed, 3),
+                "default_duration_seconds": _DEFAULT_SOAK_SECONDS,
+                "actual_duration_seconds": soak_seconds,
+            }
+            return FAIL, "soak_failed", checks
+
+        mono_ok = timestamps == sorted(timestamps) and len(timestamps) == len(
+            set(timestamps)
+        )
+        checks["monotonic_receipts"] = {
+            "verdict": PASS if mono_ok else FAIL,
+            "reason_code": "ok" if mono_ok else "non_monotonic",
+            "timestamps": [round(t, 3) for t in timestamps],
             "receipt_count": receipt_count,
-            "elapsed_seconds": round(elapsed, 3),
+        }
+        bounded_ok = recall_depth_bound <= receipt_count + 1
+        checks["bounded_recall"] = {
+            "verdict": PASS if bounded_ok else FAIL,
+            "reason_code": "ok" if bounded_ok else "recall_unbounded",
+            "recall_depth_bound": recall_depth_bound,
+        }
+        fd_growth = after["open_fds"] - before["open_fds"]
+        rss_growth = after["rss_kb"] - before["rss_kb"]
+        fd_ok = fd_growth <= 64
+        rss_ok = rss_growth <= (512 * 1024)
+        checks["budgets"] = {
+            "verdict": PASS if (fd_ok and rss_ok) else FAIL,
+            "reason_code": "ok" if (fd_ok and rss_ok) else "budget_exceeded",
+            "open_fds": after["open_fds"],
+            "rss_kb": after["rss_kb"],
+            "log_lines": after["log_lines"],
+        }
+        checks["final_integrity"] = {
+            "verdict": PASS if _integrity_ok(clone) else FAIL,
+            "reason_code": "ok" if _integrity_ok(clone) else "integrity_failed",
+        }
+        checks["soak"] = {
+            "verdict": PASS,
+            "reason_code": "ok",
+            "iterations": receipt_count,
+            "degraded_periods": degraded,
             "default_duration_seconds": _DEFAULT_SOAK_SECONDS,
             "actual_duration_seconds": soak_seconds,
+            "elapsed_seconds": round(elapsed, 3),
         }
-        return FAIL, "soak_failed", checks
 
-    mono_ok = timestamps == sorted(timestamps) and len(timestamps) == len(
-        set(timestamps)
-    )
-    checks["monotonic_receipts"] = {
-        "verdict": PASS if mono_ok else FAIL,
-        "reason_code": "ok" if mono_ok else "non_monotonic",
-        "timestamps": [round(t, 3) for t in timestamps],
-        "receipt_count": receipt_count,
-    }
-    bounded_ok = recall_depth_bound <= receipt_count + 1
-    checks["bounded_recall"] = {
-        "verdict": PASS if bounded_ok else FAIL,
-        "reason_code": "ok" if bounded_ok else "recall_unbounded",
-        "recall_depth_bound": recall_depth_bound,
-    }
-    fd_growth = after["open_fds"] - before["open_fds"]
-    rss_growth = after["rss_kb"] - before["rss_kb"]
-    fd_ok = fd_growth <= 64
-    rss_ok = rss_growth <= (512 * 1024)
-    checks["budgets"] = {
-        "verdict": PASS if (fd_ok and rss_ok) else FAIL,
-        "reason_code": "ok" if (fd_ok and rss_ok) else "budget_exceeded",
-        "open_fds": after["open_fds"],
-        "rss_kb": after["rss_kb"],
-        "log_lines": after["log_lines"],
-    }
-    checks["final_integrity"] = {
-        "verdict": PASS if _integrity_ok(clone) else FAIL,
-        "reason_code": "ok" if _integrity_ok(clone) else "integrity_failed",
-    }
-    checks["soak"] = {
-        "verdict": PASS,
-        "reason_code": "ok",
-        "iterations": receipt_count,
-        "degraded_periods": degraded,
-        "default_duration_seconds": _DEFAULT_SOAK_SECONDS,
-        "actual_duration_seconds": soak_seconds,
-        "elapsed_seconds": round(elapsed, 3),
-    }
-
-    for key in (
-        "monotonic_receipts",
-        "bounded_recall",
-        "budgets",
-        "final_integrity",
-        "soak",
-    ):
-        if checks[key]["verdict"] != PASS:
-            return FAIL, "soak_failed", checks
-    return PASS, "ok", checks
+        for key in (
+            "monotonic_receipts",
+            "bounded_recall",
+            "budgets",
+            "final_integrity",
+            "soak",
+        ):
+            if checks[key]["verdict"] != PASS:
+                return FAIL, "soak_failed", checks
+        return PASS, "ok", checks
 
 
 # ---------------------------------------------------------------------------
@@ -1771,185 +1814,186 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     applied Dream action on the clone, snapshots, calls dream_undo via the
     real native API, and verifies canonical_facts content is reverted via
     row hashing (not counts). sqlite errors fail closed."""
-    trial_root = Path(args.trial_root)
-    if not _trial_root_ok(trial_root):
-        return (
-            FAIL,
-            "trial_root_missing",
-            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
-        )
+    with _campaign_process_state():
+        trial_root = Path(args.trial_root)
+        if not _trial_root_ok(trial_root):
+            return (
+                FAIL,
+                "trial_root_missing",
+                {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+            )
 
-    checks: dict[str, Any] = {}
-    source_db = Path(args.source_db) if args.source_db else None
-    if source_db is None or not source_db.exists():
-        checks["restore"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
-        return FAIL, "source_db_missing", checks
-    if not _contained_under(source_db, trial_root):
-        checks["restore"] = {
-            "verdict": FAIL,
-            "reason_code": "source_db_outside_trial_root",
-        }
-        return FAIL, "source_db_outside_trial_root", checks
+        checks: dict[str, Any] = {}
+        source_db = Path(args.source_db) if args.source_db else None
+        if source_db is None or not source_db.exists():
+            checks["restore"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
+            return FAIL, "source_db_missing", checks
+        if not _contained_under(source_db, trial_root):
+            checks["restore"] = {
+                "verdict": FAIL,
+                "reason_code": "source_db_outside_trial_root",
+            }
+            return FAIL, "source_db_outside_trial_root", checks
 
-    # Fail closed if source is not a valid DB (Critical 4: sqlite errors fail).
-    if not _integrity_ok(source_db):
-        checks["restore"] = {"verdict": FAIL, "reason_code": "integrity_failed"}
-        return FAIL, "integrity_failed", checks
+        # Fail closed if source is not a valid DB (Critical 4: sqlite errors fail).
+        if not _integrity_ok(source_db):
+            checks["restore"] = {"verdict": FAIL, "reason_code": "integrity_failed"}
+            return FAIL, "integrity_failed", checks
 
-    try:
-        from mnemosyne.dr import snapshot as snap
-    except ImportError:
-        checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_api_unavailable"}
-        return FAIL, "snapshot_api_unavailable", checks
-
-    # Critical 4: create an applied Dream action on a clone, then undo it.
-    work_dir = trial_root / "g8"
-    work_dir.mkdir(exist_ok=True)
-    os.chmod(work_dir, _DIR_MODE)
-    clone = work_dir / "rehearsal.db"
-    shutil.copy2(source_db, clone)
-    os.chmod(clone, _FILE_MODE)
-    for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
-        if side.exists():
-            side.unlink()
-
-    # Snapshot the clone BEFORE Dream apply (baseline for revert comparison).
-    snaps_dir = trial_root / "snapshots"
-    try:
-        result = snap.create_isolated_snapshot(clone, snaps_dir)
-    except Exception:
-        traceback.clear_frames(sys.exc_info()[2])
-        checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_failed"}
-        return FAIL, "snapshot_failed", checks
-    snap_path = Path(result["snapshot_path"])
-    pristine_sha = result.get("sha256", "")
-
-    # Init canonical_facts on the clone so the baseline hash is stable, then
-    # record the baseline (pre-apply) content hash.
-    try:
-        from mnemosyne.core.canonical import init_canonical
-
-        init_canonical(clone)
-    except Exception:
-        traceback.clear_frames(sys.exc_info()[2])
-    baseline_hash = _canonical_content_hash(clone)
-
-    # Drive a real Dream apply on the clone.
-    undone_count = 0
-    content_reverted = False
-    applied_existed = False
-    try:
-        import mnemosyne.core.config as config_module
-        from mnemosyne.core import dream, shmr
-        from mnemosyne.core.beam import BeamMemory
-
-        dream_dir = work_dir / "dream"
-        dream_dir.mkdir(exist_ok=True)
-        os.environ["MNEMOSYNE_DATA_DIR"] = str(dream_dir)
-        config_module.MnemosyneConfig.reset_instance()
-        _g4_isolate_config(dream_dir)
-        beam = BeamMemory(session_id="g8-sess", db_path=clone)
-        _seed_facts_for_dream(beam)
-        shmr._init_proposal_schema(beam.conn)
-        _inject_shmr_proposal(beam.conn, "g8-sess", "g8-run")
-        run = dream.dream_plan(
-            beam, scope={"session_id": "g8-sess"}, request_id="g8-req"
-        )
-        receipt = _pass_receipt("reviewer", "g8-rev", run.run_id, run.manifest_hash)
-        run = dream.dream_submit_receipt(beam, run.run_id, receipt)
-        receipt["role"] = "verifier"
-        receipt["actor_id"] = "g8-ver"
-        run = dream.dream_submit_receipt(beam, run.run_id, receipt)
-        applied = dream.dream_apply(beam, run.run_id)
-        applied_existed = applied.state == "applied"
-
-        # Record post-apply content hash.
-        post_apply_hash = _canonical_content_hash(clone)
-
-        # Critical 4: actually call dream_undo via the real native API.
-        undone_run = dream.dream_undo(beam, run.run_id)
-        undone_count = 1 if undone_run.state == "undone" else 0
         try:
-            beam.conn.close()
+            from mnemosyne.dr import snapshot as snap
+        except ImportError:
+            checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_api_unavailable"}
+            return FAIL, "snapshot_api_unavailable", checks
+
+        # Critical 4: create an applied Dream action on a clone, then undo it.
+        work_dir = trial_root / "g8"
+        work_dir.mkdir(exist_ok=True)
+        os.chmod(work_dir, _DIR_MODE)
+        clone = work_dir / "rehearsal.db"
+        shutil.copy2(source_db, clone)
+        os.chmod(clone, _FILE_MODE)
+        for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
+            if side.exists():
+                side.unlink()
+
+        # Snapshot the clone BEFORE Dream apply (baseline for revert comparison).
+        snaps_dir = trial_root / "snapshots"
+        try:
+            result = snap.create_isolated_snapshot(clone, snaps_dir)
+        except Exception:
+            traceback.clear_frames(sys.exc_info()[2])
+            checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_failed"}
+            return FAIL, "snapshot_failed", checks
+        snap_path = Path(result["snapshot_path"])
+        pristine_sha = result.get("sha256", "")
+
+        # Init canonical_facts on the clone so the baseline hash is stable, then
+        # record the baseline (pre-apply) content hash.
+        try:
+            from mnemosyne.core.canonical import init_canonical
+
+            init_canonical(clone)
+        except Exception:
+            traceback.clear_frames(sys.exc_info()[2])
+        baseline_hash = _canonical_content_hash(clone)
+
+        # Drive a real Dream apply on the clone.
+        undone_count = 0
+        content_reverted = False
+        applied_existed = False
+        try:
+            import mnemosyne.core.config as config_module
+            from mnemosyne.core import dream, shmr
+            from mnemosyne.core.beam import BeamMemory
+
+            dream_dir = work_dir / "dream"
+            dream_dir.mkdir(exist_ok=True)
+            os.environ["MNEMOSYNE_DATA_DIR"] = str(dream_dir)
+            config_module.MnemosyneConfig.reset_instance()
+            _g4_isolate_config(dream_dir)
+            beam = BeamMemory(session_id="g8-sess", db_path=clone)
+            _seed_facts_for_dream(beam)
+            shmr._init_proposal_schema(beam.conn)
+            _inject_shmr_proposal(beam.conn, "g8-sess", "g8-run")
+            run = dream.dream_plan(
+                beam, scope={"session_id": "g8-sess"}, request_id="g8-req"
+            )
+            receipt = _pass_receipt("reviewer", "g8-rev", run.run_id, run.manifest_hash)
+            run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+            receipt["role"] = "verifier"
+            receipt["actor_id"] = "g8-ver"
+            run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+            applied = dream.dream_apply(beam, run.run_id)
+            applied_existed = applied.state == "applied"
+
+            # Record post-apply content hash.
+            post_apply_hash = _canonical_content_hash(clone)
+
+            # Critical 4: actually call dream_undo via the real native API.
+            undone_run = dream.dream_undo(beam, run.run_id)
+            undone_count = 1 if undone_run.state == "undone" else 0
+            try:
+                beam.conn.close()
+            except sqlite3.Error:
+                pass
+            config_module.MnemosyneConfig.reset_instance()
+        except sqlite3.Error:
+            # Critical 4: sqlite errors MUST fail closed.
+            traceback.clear_frames(sys.exc_info()[2])
+            checks["dream_undo"] = {"verdict": FAIL, "reason_code": "dream_undo_failed"}
+            return FAIL, "dream_undo_failed", checks
+        except Exception:
+            traceback.clear_frames(sys.exc_info()[2])
+            checks["dream_undo"] = {"verdict": FAIL, "reason_code": "dream_undo_failed"}
+            return FAIL, "dream_undo_failed", checks
+
+        # Verify content reverted: post-undo canonical hash == baseline hash.
+        post_undo_hash = _canonical_content_hash(clone)
+        content_reverted = (
+            applied_existed
+            and undone_count >= 1
+            and post_undo_hash == baseline_hash
+            and post_undo_hash != post_apply_hash
+        )
+
+        # Flush any WAL into the main DB so sidecar_absence is checked on a
+        # quiesced clone (Dream apply may run in WAL mode).
+        try:
+            conn = sqlite3.connect(str(clone))
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("PRAGMA journal_mode=DELETE")
+                conn.commit()
+            finally:
+                conn.close()
         except sqlite3.Error:
             pass
-        config_module.MnemosyneConfig.reset_instance()
-    except sqlite3.Error:
-        # Critical 4: sqlite errors MUST fail closed.
-        traceback.clear_frames(sys.exc_info()[2])
-        checks["dream_undo"] = {"verdict": FAIL, "reason_code": "dream_undo_failed"}
-        return FAIL, "dream_undo_failed", checks
-    except Exception:
-        traceback.clear_frames(sys.exc_info()[2])
-        checks["dream_undo"] = {"verdict": FAIL, "reason_code": "dream_undo_failed"}
-        return FAIL, "dream_undo_failed", checks
+        for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
+            if side.exists():
+                side.unlink()
 
-    # Verify content reverted: post-undo canonical hash == baseline hash.
-    post_undo_hash = _canonical_content_hash(clone)
-    content_reverted = (
-        applied_existed
-        and undone_count >= 1
-        and post_undo_hash == baseline_hash
-        and post_undo_hash != post_apply_hash
-    )
-
-    # Flush any WAL into the main DB so sidecar_absence is checked on a
-    # quiesced clone (Dream apply may run in WAL mode).
-    try:
-        conn = sqlite3.connect(str(clone))
-        try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.execute("PRAGMA journal_mode=DELETE")
-            conn.commit()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        pass
-    for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
-        if side.exists():
-            side.unlink()
-
-    checks["restore"] = {"verdict": PASS, "reason_code": "ok"}
-    checks["post_restore_integrity"] = {
-        "verdict": PASS if _integrity_ok(clone) else FAIL,
-        "reason_code": "ok" if _integrity_ok(clone) else "integrity_failed",
-    }
-    sidecar = Path(str(snap_path) + ".sha256")
-    pristine_intact = False
-    try:
-        snap_file_sha = hashlib.sha256(snap_path.read_bytes()).hexdigest()
-        pristine_intact = sidecar.exists() and snap_file_sha == pristine_sha
-    except OSError:
+        checks["restore"] = {"verdict": PASS, "reason_code": "ok"}
+        checks["post_restore_integrity"] = {
+            "verdict": PASS if _integrity_ok(clone) else FAIL,
+            "reason_code": "ok" if _integrity_ok(clone) else "integrity_failed",
+        }
+        sidecar = Path(str(snap_path) + ".sha256")
         pristine_intact = False
-    checks["pristine_intact"] = {
-        "verdict": PASS if pristine_intact else FAIL,
-        "reason_code": "ok" if pristine_intact else "pristine_tampered",
-    }
-    checks["sidecar_absence"] = {
-        "verdict": PASS if not _has_sidecars(clone) else FAIL,
-        "reason_code": "ok" if not _has_sidecars(clone) else "sidecar_present",
-    }
-    checks["dream_undo"] = {
-        "verdict": PASS if undone_count >= 1 else FAIL,
-        "reason_code": "ok" if undone_count >= 1 else "dream_undo_not_invoked",
-        "undone_count": undone_count,
-    }
-    checks["content_reverted"] = {
-        "verdict": PASS if content_reverted else FAIL,
-        "reason_code": "ok" if content_reverted else "content_not_reverted",
-    }
+        try:
+            snap_file_sha = hashlib.sha256(snap_path.read_bytes()).hexdigest()
+            pristine_intact = sidecar.exists() and snap_file_sha == pristine_sha
+        except OSError:
+            pristine_intact = False
+        checks["pristine_intact"] = {
+            "verdict": PASS if pristine_intact else FAIL,
+            "reason_code": "ok" if pristine_intact else "pristine_tampered",
+        }
+        checks["sidecar_absence"] = {
+            "verdict": PASS if not _has_sidecars(clone) else FAIL,
+            "reason_code": "ok" if not _has_sidecars(clone) else "sidecar_present",
+        }
+        checks["dream_undo"] = {
+            "verdict": PASS if undone_count >= 1 else FAIL,
+            "reason_code": "ok" if undone_count >= 1 else "dream_undo_not_invoked",
+            "undone_count": undone_count,
+        }
+        checks["content_reverted"] = {
+            "verdict": PASS if content_reverted else FAIL,
+            "reason_code": "ok" if content_reverted else "content_not_reverted",
+        }
 
-    for key in (
-        "restore",
-        "post_restore_integrity",
-        "pristine_intact",
-        "sidecar_absence",
-        "dream_undo",
-        "content_reverted",
-    ):
-        if checks[key]["verdict"] != PASS:
-            return FAIL, "rollback_rehearsal_failed", checks
-    return PASS, "ok", checks
+        for key in (
+            "restore",
+            "post_restore_integrity",
+            "pristine_intact",
+            "sidecar_absence",
+            "dream_undo",
+            "content_reverted",
+        ):
+            if checks[key]["verdict"] != PASS:
+                return FAIL, "rollback_rehearsal_failed", checks
+        return PASS, "ok", checks
 
 
 # ---------------------------------------------------------------------------
