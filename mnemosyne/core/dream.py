@@ -505,8 +505,8 @@ def _config_snapshot() -> Dict[str, Any]:
                 cfg.get_bool("sleep_model_refresh_auto_apply", True)
             ),
         }
-    except Exception as exc:
-        logger.warning("config audit snapshot failed: %s", exc)
+    except Exception:
+        logger.warning("config audit snapshot failed")
         return {"config_unavailable": True}
 
 
@@ -530,9 +530,9 @@ def _set_dream_active(value: bool) -> Optional[str]:
     try:
         from mnemosyne.core.config import get_config
         get_config().set_many({"dream_active": bool(value)})
-    except Exception as exc:
+    except Exception:
         if value:
-            logger.warning("dream_active gate could not be set: %s", exc)
+            logger.warning("dream_active gate could not be set")
             return "validation_failed"
         # Clearing is best-effort; fail-safe direction.
         return None
@@ -921,8 +921,8 @@ def dream_plan(beam, scope: Dict[str, Any], limits: Optional[Dict[str, Any]] = N
             "manifest_hash, semantic_hash, checkpoint, error_code, "
             "failure_reason, enrichment_pending, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, '{}', '', '', '', ?, ?, 0, ?, ?)",
-            (run_id, request_id, _canonical_json(scope), state, code,
-             str(exc), now, _now_iso()),
+            (run_id, request_id, state, _canonical_json(scope), code,
+             code, now, _now_iso()),
         )
         conn.commit()
         return _load_run(beam, run_id)  # type: ignore[return-value]
@@ -1321,21 +1321,23 @@ def dream_apply(beam, run_id: str) -> DreamRun:
         else:
             code = "integrity_failure"
         _set_state(conn, run_id, "failed_retryable", error_code=code,
-                   failure_reason=str(exc))
+                   failure_reason=code)
         conn.commit()
         _reconcile_gate_from_durable_state(beam)
         return _load_run(beam, run_id)  # type: ignore[return-value]
-    except sqlite3.IntegrityError as exc:
+    except sqlite3.IntegrityError:
         # A constraint violation is not safely retryable without operator
         # intervention (e.g. a duplicate key from a logic bug).
         _set_state(conn, run_id, "failed_terminal",
-                   error_code="integrity_failure", failure_reason=str(exc))
+                   error_code="integrity_failure",
+                   failure_reason="integrity_failure")
         conn.commit()
         _reconcile_gate_from_durable_state(beam)
         return _load_run(beam, run_id)  # type: ignore[return-value]
-    except Exception as exc:
+    except Exception:
         _set_state(conn, run_id, "failed_terminal",
-                   error_code="integrity_failure", failure_reason=str(exc))
+                   error_code="integrity_failure",
+                   failure_reason="integrity_failure")
         conn.commit()
         _reconcile_gate_from_durable_state(beam)
         return _load_run(beam, run_id)  # type: ignore[return-value]
@@ -1448,13 +1450,14 @@ def dream_undo(beam, run_id: str) -> DreamRun:
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
         code = "database_busy" if ("locked" in msg or "busy" in msg) else "integrity_failure"
-        _set_state(conn, run_id, "applied", error_code=code, failure_reason=str(exc))
+        _set_state(conn, run_id, "applied", error_code=code,
+                   failure_reason=code)
         conn.commit()
         _reconcile_gate_from_durable_state(beam)
         return _load_run(beam, run_id)  # type: ignore[return-value]
-    except Exception as exc:
+    except Exception:
         _set_state(conn, run_id, "applied", error_code="integrity_failure",
-                   failure_reason=str(exc))
+                   failure_reason="integrity_failure")
         conn.commit()
         _reconcile_gate_from_durable_state(beam)
         return _load_run(beam, run_id)  # type: ignore[return-value]
