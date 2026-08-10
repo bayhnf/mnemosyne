@@ -556,6 +556,47 @@ class TestFlushAdmissionDrop(_Base):
         self.assertEqual(mod.spool_count(self.spool_path), 0)
         self.assertEqual(result.terminal_dropped, 1)
 
+    def test_flush_drops_row_native_validation_rejection(self) -> None:
+        """Fix round 1 (S1/Q2): a legacy row that native Inhale rejects at
+        validation (status="rejected", not admission) must be deleted and
+        counted as terminal_dropped, never retried or retained."""
+        import importlib
+
+        sys.path.insert(0, HOOKS_DIR)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_t3_flush_common2", os.path.join(HOOKS_DIR, "common.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path.remove(HOOKS_DIR)
+
+        # Passes the classifier gate (string metadata serializes fine) but
+        # native validation rejects it: metadata must be a dict or None.
+        event = {
+            "event_id": "cx-legacy-invalid-meta",
+            "producer": "codex",
+            "actor_id": "alice",
+            "project_id": "projX",
+            "scope": "mem-legacy",
+            "turn_id": "t1",
+            "role": "user",
+            "content": "clean content",
+            "metadata": "not-a-dict",
+            "occurred_at": "2026-08-10T00:00:00+00:00",
+        }
+        self.assertEqual(mod.spool_put(self.spool_path, event), "stored")
+
+        env = self._env(
+            MNEMOSYNE_CODEX_ACTOR_ID="alice",
+            MNEMOSYNE_CODEX_PROJECT_ID="projX",
+        )
+        result = mod.flush_spool(self.spool_path, env=env)
+
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+        self.assertEqual(result.terminal_dropped, 1)
+
 
 # Contract 3: README states real SessionEnd behavior + desktop manual sequence
 #             (restart desktop, marketplace, install/enable, /hooks trust,

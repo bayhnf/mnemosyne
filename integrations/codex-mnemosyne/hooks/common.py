@@ -339,19 +339,19 @@ def native_ingest(event_dict: Dict[str, Any]) -> Outcome:
         status = getattr(receipt, "status", "")
         if status in ("stored", "duplicate"):
             return Outcome(True)
-        if (
-            status == "rejected"
-            and getattr(receipt, "last_error_code", "") == "admission_rejected"
-        ):
-            # Terminal: never enqueue an event the native admission policy
-            # rejected. The receipt carries labels only, never the content.
+        if status == "rejected":
+            # Any rejected native receipt (validation or admission) is
+            # terminal: never enqueue, retry, or retain it. The receipt
+            # carries labels/errors only, never the content.
             return Outcome(False, "admission_rejected", "")
         return Outcome(False, f"ingest_{status}", "")
     except Exception:
         return Outcome(False, "ingest_exception", "")
 
 
-def _admission_reject_reason(event_dict: Dict[str, Any]) -> str:
+def _admission_reject_reason(
+    event_dict: Dict[str, Any], fail_closed: bool = True
+) -> str:
     """Shared-classifier admission gate for spool persistence.
 
     Mirrors native Inhale admission using Task 1's public
@@ -359,6 +359,13 @@ def _admission_reject_reason(event_dict: Dict[str, Any]) -> str:
     always terminal; reasoning/approval artifacts are terminal in strict
     mode. Returns the static reason ``admission_rejected`` or "". Never
     echoes content, matched values, or metadata.
+
+    With ``fail_closed`` (default; the spool-acceptance gate), any import,
+    canonical-serialization, or classification failure returns the same
+    static terminal reason so an unanalyzed event is never spooled. The
+    flush path passes ``fail_closed=False``: those rows were admitted when
+    spooled, and a transiently unavailable classifier must not destroy
+    them (SessionEnd retention contract).
     """
     try:
         from mnemosyne.core.filters import (
@@ -366,7 +373,7 @@ def _admission_reject_reason(event_dict: Dict[str, Any]) -> str:
             get_write_classifier_mode,
         )
     except Exception:
-        return ""
+        return "admission_rejected" if fail_closed else ""
     try:
         mode = get_write_classifier_mode()
         candidates = [str(event_dict.get("content", ""))]
@@ -385,7 +392,7 @@ def _admission_reject_reason(event_dict: Dict[str, Any]) -> str:
             ):
                 return "admission_rejected"
     except Exception:
-        return ""
+        return "admission_rejected" if fail_closed else ""
     return ""
 
 
@@ -695,7 +702,7 @@ def _flush_spool_inner(path: str, budget_s: float) -> FlushResult:
             except (json.JSONDecodeError, TypeError, ValueError):
                 retained_pending += 1
                 continue
-            if _admission_reject_reason(event_dict):
+            if _admission_reject_reason(event_dict, fail_closed=False):
                 # Legacy row that now fails admission: terminal drop, no
                 # retry counter increment, no delivery attempt.
                 conn.execute("DELETE FROM spooled_events WHERE rowid = ?", (rowid,))

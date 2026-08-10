@@ -411,7 +411,7 @@ class TestAdmissionTerminalDrop(unittest.TestCase):
         finally:
             sys.path.remove(HOOKS_DIR)
 
-    def _event(self, content: str, metadata: dict | None = None) -> dict:
+    def _event(self, content: str, metadata: object | None = None) -> dict:
         return {
             "event_id": "cx-t3-secret",
             "producer": "codex",
@@ -470,6 +470,77 @@ class TestAdmissionTerminalDrop(unittest.TestCase):
         self.assertEqual(outcome.error_code, "admission_rejected")
         self.assertEqual(spool_status, "")
         self.assertEqual(mod.spool_count(self.spool_path), 0)
+
+    def test_validation_rejected_native_receipt_is_terminal_not_spooled(self) -> None:
+        """Fix round 1 (S1/Q1): ANY native rejected receipt (e.g. validation
+        failure, not admission) must terminal-drop and never spool."""
+        mod = self._load_common()
+        # metadata="not-a-dict" passes the classifier gate but native Inhale
+        # rejects it at validation (status="rejected",
+        # last_error_code="validation_failed").
+        event = self._event("clean content", metadata="not-a-dict")
+        with mod._scoped_env(self.base_env):
+            outcome, spool_status = mod.ingest_or_spool(event)
+        self.assertEqual(outcome.error_code, "admission_rejected")
+        self.assertEqual(spool_status, "")
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+
+    def test_classifier_import_failure_fails_closed_not_spooled(self) -> None:
+        """Fix round 1 (S2): filters import failure must fail closed with the
+        static terminal reason and never spool an unanalyzed event."""
+        from unittest import mock
+
+        mod = self._load_common()
+        env = dict(self.base_env)
+        env["MNEMOSYNE_CODEX_FORCE_SPOOL"] = "1"
+        with mock.patch.dict(sys.modules, {"mnemosyne.core.filters": None}):
+            with mod._scoped_env(env):
+                outcome, spool_status = mod.ingest_or_spool(
+                    self._event("clean content")
+                )
+        self.assertEqual(outcome.error_code, "admission_rejected")
+        self.assertEqual(spool_status, "")
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+        self.assertEqual(self._spool_bytes(), b"")
+
+    def test_classifier_serialization_failure_fails_closed_not_spooled(self) -> None:
+        """Fix round 1 (S2): canonical-metadata serialization failure must
+        fail closed, never attempting to spool the unanalyzed event."""
+        mod = self._load_common()
+        env = dict(self.base_env)
+        env["MNEMOSYNE_CODEX_FORCE_SPOOL"] = "1"
+
+        class _RaisingStr:
+            def __str__(self) -> str:
+                raise RuntimeError("boom")
+
+        event = self._event("clean content", metadata={"token": _RaisingStr()})
+        with mod._scoped_env(env):
+            outcome, spool_status = mod.ingest_or_spool(event)
+        self.assertEqual(outcome.error_code, "admission_rejected")
+        self.assertEqual(spool_status, "")
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+
+    def test_classifier_exception_fails_closed_not_spooled(self) -> None:
+        """Fix round 1 (S2): a classify_memory_write exception must fail
+        closed with the static terminal reason and never spool."""
+        from unittest import mock
+
+        mod = self._load_common()
+        env = dict(self.base_env)
+        env["MNEMOSYNE_CODEX_FORCE_SPOOL"] = "1"
+        with mock.patch(
+            "mnemosyne.core.filters.classify_memory_write",
+            side_effect=RuntimeError("boom"),
+        ):
+            with mod._scoped_env(env):
+                outcome, spool_status = mod.ingest_or_spool(
+                    self._event("clean content")
+                )
+        self.assertEqual(outcome.error_code, "admission_rejected")
+        self.assertEqual(spool_status, "")
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+        self.assertEqual(self._spool_bytes(), b"")
 
     def test_safe_transient_failure_still_spools_under_admission_gate(self) -> None:
         """Admission must not turn safe transient failures into data loss."""
