@@ -172,14 +172,23 @@ def _single_cluster_replies():
 
 
 @pytest.fixture(autouse=True)
-def _pin_offline(monkeypatch):
+def _isolate_config_and_offline(tmp_path, monkeypatch):
+    """Module-wide isolation for EVERY Dream test.
+
+    Points the central config at a throwaway data dir and resets the singleton
+    so no test ever touches /home/bell/.hermes/mnemosyne/config.yaml. Also pins
+    SHMR's embedding path to the deterministic lexical fallback.
+    """
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+    config_module.MnemosyneConfig.reset_instance()
     _force_offline_embeddings(monkeypatch)
+    yield
+    config_module.MnemosyneConfig.reset_instance()
 
 
 @pytest.fixture
 def beam(tmp_path):
     """A BeamMemory seeded with two SHMR-synthesizable fact clusters."""
-    config_module.MnemosyneConfig.reset_instance()
     b = BeamMemory(session_id="dream-sess", db_path=tmp_path / "dream.db")
     _seed_facts(b, _two_cluster_facts())
     yield b
@@ -789,13 +798,6 @@ class TestResumeAndCheckpoint:
 
 
 class TestDreamActiveGate:
-    @pytest.fixture(autouse=True)
-    def _isolated_config(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
-        config_module.MnemosyneConfig.reset_instance()
-        yield
-        config_module.MnemosyneConfig.reset_instance()
-
     def test_gate_set_true_while_applied_then_cleared_on_undo(self, beam):
         _force_proposals(beam)
         run = _plan(beam)
@@ -902,3 +904,387 @@ class TestTransactionOwnership:
                 beam.conn.rollback()
             except Exception:
                 pass
+
+
+# ===========================================================================
+# Fix round 1 — DeepSeek review binding findings (C1 + I1-I8)
+# ===========================================================================
+
+
+class TestC1ExactCanonicalBeforeImage:
+    """C1: undo must restore the exact pre-apply canonical slot, including
+    valid_until=NULL on a pre-existing current row."""
+
+    def test_undo_restores_pre_existing_canonical_slot(self, beam):
+        # Seed a pre-existing canonical slot for the same owner/category/name
+        # that Dream's action will target.
+        from mnemosyne.core.canonical import CanonicalStore
+        store = CanonicalStore(conn=beam.conn)
+        owner = beam.session_id
+        store.remember(owner, "dream", "alice::prefers", "OLD ORIGINAL BODY",
+                       source="seed", confidence=0.42)
+        beam.conn.commit()
+
+        _force_proposals(beam)
+        run = _plan(beam)
+        dream.dream_submit_receipt(beam, run.run_id,
+                                   _pass_receipt("reviewer", "r1",
+                                                 run.run_id, run.manifest_hash))
+        run = dream.dream_submit_receipt(beam, run.run_id,
+                                         _pass_receipt("verifier", "v1",
+                                                       run.run_id, run.manifest_hash))
+        dream.dream_apply(beam, run.run_id)
+
+        # After apply, the pre-existing row must be superseded (valid_until
+        # set) and a new current row exists.
+        pre_existing = beam.conn.execute(
+            "SELECT * FROM canonical_facts WHERE body = ? "
+            "AND owner_id = ?", ("OLD ORIGINAL BODY", owner)
+        ).fetchone()
+        assert pre_existing is not None
+        assert pre_existing["valid_until"] is not None
+
+        # Undo.
+        dream.dream_undo(beam, run.run_id)
+
+        # C1 contract: the pre-existing row must be current again
+        # (valid_until restored to NULL), with the exact prior body/version.
+        restored = beam.conn.execute(
+            "SELECT * FROM canonical_facts WHERE body = ? "
+            "AND owner_id = ?", ("OLD ORIGINAL BODY", owner)
+        ).fetchone()
+        assert restored is not None
+        assert restored["valid_until"] is None, (
+            "pre-existing canonical row was left superseded after undo; "
+            "exact before-image was not restored"
+        )
+        assert restored["version"] == pre_existing["version"]
+        assert restored["source"] == "seed"
+        assert restored["confidence"] == 0.42
+
+        # And the run's own after-row must be gone.
+        dream_after = beam.conn.execute(
+            "SELECT * FROM canonical_facts WHERE source = 'dream_apply' "
+            "AND owner_id = ?", (owner,)
+        ).fetchall()
+        assert len(dream_after) == 0
+
+
+class TestI1ApprovalTTLAtApply:
+    """I1: a ready run whose receipts are older than 24h must not apply.
+
+    Receipts are planted directly as fresh at submission time, then aged past
+    the 24h TTL so we exercise the apply-time re-check (not the submission-
+    time check, which already rejects >24h receipts).
+    """
+
+    def test_apply_rejects_expired_approvals(self, beam):
+        _force_proposals(beam)
+        run = _plan(beam)
+        # Submit with fresh timestamps so the run reaches ready.
+        dream.dream_submit_receipt(beam, run.run_id,
+                                   _pass_receipt("reviewer", "r1",
+                                                 run.run_id, run.manifest_hash))
+        run = dream.dream_submit_receipt(beam, run.run_id,
+                                         _pass_receipt("verifier", "v1",
+                                                       run.run_id, run.manifest_hash))
+        assert run.state == "ready"
+
+        # Now age both PASS receipts past the 24h approval TTL directly in the
+        # durable store, simulating wall-clock elapsing after submission.
+        old_ts = _ago(25)
+        beam.conn.execute(
+            "UPDATE dream_receipts SET timestamp = ? WHERE run_id = ?",
+            (old_ts, run.run_id),
+        )
+        beam.conn.commit()
+
+        out = dream.dream_apply(beam, run.run_id)
+        assert out.state != "applied", (
+            "apply succeeded with expired (>24h) approval receipts"
+        )
+        assert out.error_code == "stale_manifest"
+        # No canonical_facts row was written.
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM canonical_facts WHERE source = 'dream_apply'"
+        ).fetchone()[0] == 0
+
+
+class TestI2NaiveTimestampReceipt:
+    """I2: a timezone-naive receipt timestamp must produce validation_failed,
+    never a TypeError."""
+
+    def test_naive_timestamp_yields_structured_validation_failed(self, beam):
+        _force_proposals(beam)
+        run = _plan(beam)
+        receipt = _pass_receipt("reviewer", "r1", run.run_id, run.manifest_hash)
+        receipt["timestamp"] = "2026-08-10T00:00:00"  # no tz offset
+        out = dream.dream_submit_receipt(beam, run.run_id, receipt)
+        assert out.state == "rejected"
+        assert out.error_code == "validation_failed"
+
+
+class TestI3ManifestHashConfigIndependent:
+    """I3: identical inputs must produce identical manifest_hash regardless of
+    the runtime dream_active config gate."""
+
+    def test_manifest_hash_identical_under_differing_dream_active(
+        self, tmp_path, monkeypatch
+    ):
+        def plan_under(dream_active: bool):
+            data_dir = tmp_path / ("on" if dream_active else "off")
+            data_dir.mkdir()
+            monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+            config_module.MnemosyneConfig.reset_instance()
+            from mnemosyne.core.config import get_config
+            get_config().set_many({"dream_active": dream_active})
+            b = BeamMemory(session_id="det", db_path=data_dir / "d.db")
+            _seed_facts(b, _two_cluster_facts())
+            _force_proposals(b)
+            return _plan(b)
+
+        run_off = plan_under(False)
+        run_on = plan_under(True)
+        assert run_off.manifest_hash == run_on.manifest_hash, (
+            "manifest_hash depends on runtime dream_active gate; semantic "
+            "projection must exclude runtime config"
+        )
+
+
+class TestI4RevalidationUnderImmediateLock:
+    """I4: Dream's owned apply must acquire BEGIN IMMEDIATE (or equivalent)
+    BEFORE source revalidation so a concurrent writer cannot race the check.
+
+    We verify the invariant: immediately after dream_apply opens its
+    transaction, the connection must report an active IMMEDIATE transaction
+    that a second connection would block on.
+    """
+
+    def test_apply_acquires_write_lock_before_revalidation(self, beam, monkeypatch):
+        _force_proposals(beam)
+        run = _plan(beam)
+        dream.dream_submit_receipt(beam, run.run_id,
+                                   _pass_receipt("reviewer", "r1",
+                                                 run.run_id, run.manifest_hash))
+        run = dream.dream_submit_receipt(beam, run.run_id,
+                                         _pass_receipt("verifier", "v1",
+                                                       run.run_id, run.manifest_hash))
+
+        observed = {"in_txn_at_revalidate": None}
+
+        real_execute = beam.conn.execute
+
+        def observing_execute(sql, *params):
+            up = str(sql).strip().upper()
+            if "BEGIN" in up and "IMMEDIATE" in up:
+                # The apply path opened a write transaction.
+                observed["began_immediate"] = True
+            return real_execute(sql, *params)
+
+        monkeypatch.setattr(beam.conn, "execute", observing_execute)
+        out = dream.dream_apply(beam, run.run_id)
+        assert out.state == "applied"
+        assert observed.get("began_immediate") is True, (
+            "dream_apply did not acquire BEGIN IMMEDIATE before revalidation; "
+            "the TOCTOU window remains open"
+        )
+
+
+class TestI6ProposalEligibilityAndClaim:
+    """I6: _gather_actions must select only eligible proposals (status, scope
+    provenance) and atomically claim them so re-planning cannot reuse them."""
+
+    def test_rolled_back_proposals_excluded(self, beam):
+        shmr._init_proposal_schema(beam.conn)
+        _seed_facts(beam, [
+            {"fact_id": "fa", "subject": "x", "predicate": "p",
+             "object": "alpha value one", "confidence": 0.9},
+            {"fact_id": "fb", "subject": "x", "predicate": "p",
+             "object": "alpha value two", "confidence": 0.9},
+        ])
+        beam.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("shmr_bad", "c0", beam.session_id,
+             json.dumps({"session_id": beam.session_id}),
+             json.dumps(["fa"]), "x", "p", "alpha", 0.9, "create", None,
+             "r", "rolled_back"),
+        )
+        beam.conn.commit()
+        run = _plan(beam)
+        # A rolled_back proposal must not be planned.
+        assert run.state == "rejected"
+        assert run.error_code == "no_candidates"
+
+    def test_mismatched_actor_scope_excluded(self, beam):
+        shmr._init_proposal_schema(beam.conn)
+        _seed_facts(beam, [
+            {"fact_id": "fc", "subject": "y", "predicate": "p",
+             "object": "beta value one", "confidence": 0.9},
+            {"fact_id": "fd", "subject": "y", "predicate": "p",
+             "object": "beta value two", "confidence": 0.9},
+        ])
+        # Proposal whose scope_json declares a different actor_id.
+        beam.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("shmr_other", "c1", beam.session_id,
+             json.dumps({"session_id": beam.session_id, "actor_id": "other-actor"}),
+             json.dumps(["fc"]), "y", "p", "beta", 0.9, "create", None,
+             "r", "proposed"),
+        )
+        beam.conn.commit()
+        # Plan with a scope that asserts a different actor.
+        run = dream.dream_plan(
+            beam, scope={"session_id": beam.session_id, "actor_id": "my-actor"}
+        )
+        assert run.state == "rejected"
+        assert run.error_code == "no_candidates"
+
+    def test_repeated_plan_does_not_reuse_consumed_proposals(self, beam):
+        _force_proposals(beam)
+        first = _plan(beam)
+        assert first.state == "awaiting_approval"
+        # A second plan (new request_id) must not consume the same proposals.
+        second = dream.dream_plan(
+            beam, scope=_scope(beam), request_id="req-second"
+        )
+        # No eligible proposals left -> no_candidates.
+        assert second.state == "rejected"
+        assert second.error_code == "no_candidates"
+
+
+class TestI7EveryEntrypointGuardsTransaction:
+    """I7: every public Dream entrypoint must reject a caller-open transaction
+    BEFORE schema DDL/executescript, preserving the caller's transaction + row."""
+
+    def test_plan_rejects_caller_open_transaction(self, beam):
+        beam.conn.execute("BEGIN")
+        beam.conn.execute(
+            "INSERT INTO facts (fact_id, session_id, subject, predicate, object) "
+            "VALUES ('caller-row', ?, 'c', 'd', 'e')",
+            (beam.session_id,),
+        )
+        try:
+            out = dream.dream_plan(beam, scope=_scope(beam))
+            assert out.error_code in ("validation_failed", "database_busy")
+            # The caller's uncommitted row must still be in the transaction.
+            assert beam.conn.in_transaction
+            row = beam.conn.execute(
+                "SELECT fact_id FROM facts WHERE fact_id = 'caller-row'"
+            ).fetchone()
+            assert row is not None
+        finally:
+            beam.conn.rollback()
+
+    def test_submit_receipt_rejects_caller_open_transaction(self, beam):
+        _force_proposals(beam)
+        run = _plan(beam)
+        beam.conn.execute("BEGIN")
+        try:
+            out = dream.dream_submit_receipt(
+                beam, run.run_id,
+                _pass_receipt("reviewer", "r1", run.run_id, run.manifest_hash)
+            )
+            assert out.error_code in ("validation_failed", "database_busy")
+            assert beam.conn.in_transaction
+        finally:
+            beam.conn.rollback()
+
+    def test_status_rejects_caller_open_transaction(self, beam):
+        _force_proposals(beam)
+        run = _plan(beam)
+        beam.conn.execute("BEGIN")
+        try:
+            out = dream.dream_status(beam, run.run_id)
+            assert out.error_code in ("validation_failed", "database_busy")
+            assert beam.conn.in_transaction
+        finally:
+            beam.conn.rollback()
+
+    def test_resume_rejects_caller_open_transaction(self, beam):
+        _force_proposals(beam)
+        run = _plan(beam)
+        beam.conn.execute("BEGIN")
+        try:
+            out = dream.dream_resume(beam, run.run_id)
+            assert out.error_code in ("validation_failed", "database_busy")
+            assert beam.conn.in_transaction
+        finally:
+            beam.conn.rollback()
+
+    def test_undo_rejects_caller_open_transaction(self, beam):
+        _force_proposals(beam)
+        run = _plan(beam)
+        dream.dream_submit_receipt(beam, run.run_id,
+                                   _pass_receipt("reviewer", "r1",
+                                                 run.run_id, run.manifest_hash))
+        run = dream.dream_submit_receipt(beam, run.run_id,
+                                         _pass_receipt("verifier", "v1",
+                                                       run.run_id, run.manifest_hash))
+        dream.dream_apply(beam, run.run_id)
+        beam.conn.execute("BEGIN")
+        try:
+            out = dream.dream_undo(beam, run.run_id)
+            assert out.error_code in ("validation_failed", "database_busy")
+            assert beam.conn.in_transaction
+        finally:
+            beam.conn.rollback()
+
+
+class TestI8AlreadyUndoneSignal:
+    """I8: a second undo must explicitly signal already_undone while retaining
+    the undone state."""
+
+    def test_second_undo_signals_already_undone(self, beam):
+        _force_proposals(beam)
+        run = _plan(beam)
+        dream.dream_submit_receipt(beam, run.run_id,
+                                   _pass_receipt("reviewer", "r1",
+                                                 run.run_id, run.manifest_hash))
+        run = dream.dream_submit_receipt(beam, run.run_id,
+                                         _pass_receipt("verifier", "v1",
+                                                       run.run_id, run.manifest_hash))
+        dream.dream_apply(beam, run.run_id)
+        first = dream.dream_undo(beam, run.run_id)
+        assert first.state == "undone"
+        second = dream.dream_undo(beam, run.run_id)
+        assert second.state == "undone"
+        # Explicit non-silent signal: failure_reason (or a dedicated field)
+        # must indicate already_undone.
+        signal = (second.failure_reason or "") + " " + (second.checkpoint or "")
+        assert "already_undone" in signal, (
+            "second undo returned no already_undone signal"
+        )
+
+
+class TestResumeDoesNotLoopOnStaleManifest:
+    """If dream_apply fails with stale_manifest, dream_resume must not endlessly
+    retry the same stale source; it must surface the structured failure."""
+
+    def test_resume_after_stale_manifest_does_not_loop(self, beam, monkeypatch):
+        _force_proposals(beam)
+        run = _plan(beam)
+        dream.dream_submit_receipt(beam, run.run_id,
+                                   _pass_receipt("reviewer", "r1",
+                                                 run.run_id, run.manifest_hash))
+        run = dream.dream_submit_receipt(beam, run.run_id,
+                                         _pass_receipt("verifier", "v1",
+                                                       run.run_id, run.manifest_hash))
+        # Mutate the source so revalidation always fails.
+        beam.conn.execute(
+            "UPDATE facts SET object = ? WHERE fact_id = ?",
+            ("the rust language [MUTATED]", "f1"),
+        )
+        beam.conn.commit()
+        applied = dream.dream_apply(beam, run.run_id)
+        assert applied.error_code == "stale_manifest"
+
+        # Resume must NOT silently retry; it must surface the stale failure.
+        resumed = dream.dream_resume(beam, run.run_id)
+        assert resumed.error_code == "stale_manifest"
+        assert resumed.state != "applied"

@@ -331,6 +331,27 @@ def _assert_dream_transaction_context(conn: sqlite3.Connection) -> None:
         )
 
 
+def _reject_if_caller_holds_transaction(beam, run_id: str = "") -> Optional[DreamRun]:
+    """Every public Dream entrypoint must call this BEFORE any schema DDL.
+
+    ``_init_dream_schema`` calls ``executescript``, which implicitly COMMITs
+    any pending transaction on the connection. That would destroy a caller's
+    open transaction and commit its uncommitted rows. Detect the caller-owned
+    context up front and return a structured rejection instead.
+
+    Returns a ``DreamRun`` rejection if the caller holds a transaction, else
+    ``None`` and the caller may proceed.
+    """
+    try:
+        _assert_dream_transaction_context(beam.conn)
+    except _DreamTransactionError as exc:
+        return DreamRun(
+            run_id=run_id, state="failed_retryable",
+            error_code="validation_failed", failure_reason=str(exc),
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Loaders (DB row -> DreamRun)
 # ---------------------------------------------------------------------------
@@ -405,13 +426,13 @@ def _set_state(
 
 def _semantic_projection(
     scope: Dict[str, Any], actions: List[Dict[str, Any]],
-    config_snapshot: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Build the deterministic manifest projection for hashing.
 
-    Excludes volatile fields (run_id, timestamps) so equivalent planning
-    inputs hash to the same ``manifest_hash``. The full manifest (with
-    run_id) is persisted separately on the run.
+    Excludes volatile fields (run_id, timestamps) AND runtime config gates
+    (``dream_active``, which Dream itself toggles) so equivalent planning
+    inputs hash to the same ``manifest_hash`` regardless of runtime state.
+    The full manifest persists an audit-only config snapshot separately.
     """
     return {
         "scope": {k: scope[k] for k in sorted(scope)},
@@ -428,7 +449,6 @@ def _semantic_projection(
             }
             for i, a in enumerate(actions)
         ],
-        "config": {k: config_snapshot[k] for k in sorted(config_snapshot)},
     }
 
 
@@ -436,8 +456,14 @@ def _build_manifest(
     run_id: str, scope: Dict[str, Any], actions: List[Dict[str, Any]],
     config_snapshot: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Full manifest including the stable UUID4 run_id and bookkeeping."""
-    projection = _semantic_projection(scope, actions, config_snapshot)
+    """Full manifest including the stable UUID4 run_id and bookkeeping.
+
+    ``manifest_hash`` covers only the semantic projection (scope + actions +
+    sources); the ``config`` snapshot is persisted audit-only and does NOT
+    enter the hash, so toggling ``dream_active`` does not change the hash for
+    identical planning inputs.
+    """
+    projection = _semantic_projection(scope, actions)
     input_bytes = sum(
         len((a.get("target") or {}).get("object", "").encode("utf-8", "ignore"))
         + len((a.get("source_snapshot") or {}).get("object", "").encode("utf-8", "ignore"))
@@ -452,7 +478,8 @@ def _build_manifest(
         "run_id": run_id,
         "scope": projection["scope"],
         "actions": projection["actions"],
-        "config": projection["config"],
+        # Audit-only: runtime config snapshot, NOT part of manifest_hash.
+        "config_audit": {k: config_snapshot[k] for k in sorted(config_snapshot)},
         "input_bytes": input_bytes,
         "output_bytes": output_bytes,
         "compaction_ratio": round(ratio, 6),
@@ -462,7 +489,13 @@ def _build_manifest(
 
 
 def _config_snapshot() -> Dict[str, Any]:
-    """Capture the small set of config keys Dream's correctness depends on."""
+    """Capture the small set of config keys Dream depends on, for audit only.
+
+    This snapshot is persisted on the manifest for audit/reproducibility but
+    does NOT enter the manifest_hash (see :func:`_semantic_projection`). A
+    failure to read config yields an empty snapshot + a warning, not a silent
+    swallow -- the caller still proceeds because config is audit-only.
+    """
     try:
         from mnemosyne.core.config import get_config
         cfg = get_config()
@@ -472,9 +505,9 @@ def _config_snapshot() -> Dict[str, Any]:
                 cfg.get_bool("sleep_model_refresh_auto_apply", True)
             ),
         }
-    except Exception:
-        # Tests with isolated config; fall back to empty snapshot.
-        return {}
+    except Exception as exc:
+        logger.warning("config audit snapshot failed: %s", exc)
+        return {"config_unavailable": True}
 
 
 # ---------------------------------------------------------------------------
@@ -482,20 +515,28 @@ def _config_snapshot() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _set_dream_active(value: bool) -> None:
+def _set_dream_active(value: bool) -> Optional[str]:
     """Set/clear the dream_active config gate.
 
     Single-writer assumption (documented in the preflight): all processes
     share one config.yaml and Dream is the only writer of this key.
+
+    Returns an error_code string on failure (the caller surfaces a structured
+    failure rather than silently proceeding fail-open), or ``None`` on
+    success. Clearing (``value=False``) is best-effort and returns ``None``
+    even on failure because the failure direction is fail-safe (auto-apply
+    stays off); only setting (``value=True``) must not fail silently.
     """
     try:
         from mnemosyne.core.config import get_config
         get_config().set_many({"dream_active": bool(value)})
-    except Exception:
-        # Config may be unavailable in exotic test setups; fail-safe by
-        # ignoring -- the gate is an optimization, the transactional backstop
-        # is source-hash revalidation.
-        pass
+    except Exception as exc:
+        if value:
+            logger.warning("dream_active gate could not be set: %s", exc)
+            return "validation_failed"
+        # Clearing is best-effort; fail-safe direction.
+        return None
+    return None
 
 
 def _reconcile_gate_from_durable_state(beam) -> None:
@@ -583,29 +624,78 @@ def _validate_and_snapshot_action(
     }
 
 
-def _gather_actions(beam, scope: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Read SHMR proposals for this scope and validate them into actions.
+# Proposal statuses eligible for Dream planning. ``proposed`` is the fresh
+# status shmr writes; ``rolled_back`` proposals must never be planned.
+ELIGIBLE_PROPOSAL_STATUSES = ("proposed",)
 
-    SHMR ``run_id`` values are arbitrary strings; we pull the most recent set
-    matching the session scope. Proposals remain invisible to recall (they
-    live only in ``shmr_proposals``).
+
+def _scope_matches(proposal_scope: Dict[str, Any], plan_scope: Dict[str, Any]) -> bool:
+    """Strict scope-provenance match.
+
+    A proposal is eligible only if its explicit provenance fields (actor_id,
+    author_type, channel_id) match the plan scope, OR the proposal carries no
+    explicit provenance and the plan asserts none either. This prevents
+    cross-actor/project leakage: a proposal whose ``scope_json.actor_id`` is
+    ``"other"`` is never planned under a scope that asserts ``"my-actor"``.
+    """
+    for key in ("actor_id", "author_type", "channel_id"):
+        p_val = proposal_scope.get(key)
+        plan_val = plan_scope.get(key)
+        if p_val is not None and plan_val is not None and p_val != plan_val:
+            return False
+        # If the proposal declares a provenance field the plan does not, and
+        # the plan is selective (asserts some provenance), treat as mismatch.
+        if p_val is not None and plan_val is None:
+            # The plan did not assert this field; only mismatch if the plan
+            # asserts any provenance at all (selective plan).
+            if any(plan_scope.get(k) is not None
+                   for k in ("actor_id", "author_type", "channel_id")):
+                return False
+    return True
+
+
+def _gather_actions(
+    beam, scope: Dict[str, Any],
+) -> tuple:  # (actions, consumed_proposal_ids)
+    """Read ELIGIBLE SHMR proposals for this scope and validate them.
+
+    Filters:
+      * ``status`` must be in ELIGIBLE_PROPOSAL_STATUSES (excludes
+        ``rolled_back`` and already-claimed proposals).
+      * ``scope_json`` provenance must match the plan scope (no cross-actor
+        / cross-project leakage).
+    Returns the validated actions AND the list of ``proposal_id``s consumed,
+    so :func:`dream_plan` can mark them claimed atomically (mutating the
+    proposal queue status, never source memory).
     """
     conn = beam.conn
     session_id = scope.get("session_id") or beam.session_id
     try:
         rows = conn.execute(
             "SELECT * FROM shmr_proposals WHERE session_id = ? "
-            "ORDER BY proposal_id", (session_id,)
+            "AND status IN (" + ",".join("?" for _ in ELIGIBLE_PROPOSAL_STATUSES) + ") "
+            "ORDER BY proposal_id",
+            (session_id, *ELIGIBLE_PROPOSAL_STATUSES),
         ).fetchall()
     except sqlite3.OperationalError:
-        return []
+        return [], []
     actions: List[Dict[str, Any]] = []
+    consumed: List[int] = []
     for row in rows:
         proposal = dict(row)
+        # Scope-provenance filter.
+        try:
+            proposal_scope = json.loads(proposal.get("scope_json") or "{}")
+        except (TypeError, ValueError):
+            proposal_scope = {}
+        if not _scope_matches(proposal_scope, scope):
+            continue
         action = _validate_and_snapshot_action(conn, proposal)
         if action is not None:
+            action["proposal_id"] = proposal["proposal_id"]
             actions.append(action)
-    return actions
+            consumed.append(proposal["proposal_id"])
+    return actions, consumed
 
 
 def _enforce_bounds(
@@ -643,6 +733,9 @@ def dream_plan(beam, scope: Dict[str, Any], limits: Optional[Dict[str, Any]] = N
     recallable. Persists a DreamRun with a canonical manifest whose hash is
     stable across equivalent inputs.
     """
+    rejection = _reject_if_caller_holds_transaction(beam)
+    if rejection is not None:
+        return rejection
     _init_dream_schema(beam.conn)
     conn = beam.conn
 
@@ -671,7 +764,7 @@ def dream_plan(beam, scope: Dict[str, Any], limits: Optional[Dict[str, Any]] = N
     )
     conn.commit()
 
-    actions = _gather_actions(beam, scope)
+    actions, consumed_ids = _gather_actions(beam, scope)
 
     if not actions:
         err = "no_candidates"
@@ -696,6 +789,19 @@ def dream_plan(beam, scope: Dict[str, Any], limits: Optional[Dict[str, Any]] = N
     config_snap = _config_snapshot()
     manifest = _build_manifest(run_id, scope, actions, config_snap)
     manifest_hash = manifest["manifest_hash"]
+
+    # I6: atomically claim the consumed proposals so a later plan (even under
+    # a different request_id) cannot reuse them. This mutates the proposal
+    # queue status only -- never source memory. The claim is in the SAME
+    # transaction as the run/actions insert, so a failure rolls both back and
+    # the proposals remain eligible.
+    placeholders = ",".join("?" for _ in consumed_ids)
+    if consumed_ids:
+        conn.execute(
+            f"UPDATE shmr_proposals SET status = 'dream_claimed' "
+            f"WHERE proposal_id IN ({placeholders})",
+            tuple(consumed_ids),
+        )
 
     # Persist actions (without the bulky source_snapshot column, which lives
     # only in the manifest JSON to bound row size).
@@ -755,6 +861,11 @@ def _validate_receipt(
         when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return "validation_failed"
+    # Reject timezone-naive timestamps: a naive datetime would crash the
+    # comparison below with TypeError (can't compare offset-naive and
+    # offset-aware). Treat as malformed, not a crash.
+    if when.tzinfo is None:
+        return "validation_failed"
     now = datetime.now(timezone.utc)
     if when < now - RECEIPT_TTL:
         return "stale_manifest"
@@ -771,6 +882,9 @@ def dream_submit_receipt(beam, run_id: str, receipt: Any) -> DreamRun:
     verifier with a different ``actor_id``. Any validation failure or non-PASS
     verdict transitions the run to ``rejected``.
     """
+    rejection = _reject_if_caller_holds_transaction(beam, run_id)
+    if rejection is not None:
+        return rejection
     _init_dream_schema(beam.conn)
     conn = beam.conn
     run = _load_run(beam, run_id)
@@ -857,35 +971,21 @@ def _apply_one_action(
 ) -> None:
     """Apply one Dream action inside the owning transaction.
 
-    ``create`` / ``update`` / ``dampen`` affect ``canonical_facts`` only. A
-    non-fact target is rejected with ``validation_failed`` before mutation
-    (the standard ``facts`` table has no supersession columns; supersession is
-    a canonical_facts concept). For ``facts`` source rows that need to track
-    an update, we use DELETE+INSERT on ``facts`` so the existing AFTER
-    DELETE / AFTER INSERT FTS triggers keep ``fts_facts`` in sync (there is no
-    AFTER UPDATE trigger -- beam.py:1198-1209).
+    ``create`` / ``update`` / ``dampen`` affect ``canonical_facts`` only. The
+    standard ``facts`` table has no supersession columns, so supersession is a
+    canonical_facts concept. ``canonical_facts`` has no FTS/vector index
+    (canonical.py:109-143), so there is no trigger or vector write to keep in
+    sync -- Dream writes canonical_facts directly via supersede-by-
+    ``valid_until`` + INSERT.
+
+    C1 (exact undo): the before-image persisted on the action is the EXACT
+    canonical slot row that existed immediately before this action (or ``None``
+    if no prior current row existed). Undo uses that to restore the prior row
+    to its exact prior state (``valid_until=NULL``, prior body/version/source/
+    confidence), so a pre-existing value is never left superseded.
     """
-    table = action["source_table"]
-    source_id = action["source_id"]
     target = action["target"]
     kind = action["action"]
-
-    # Capture before-image for undo (full row snapshot). This must happen
-    # before any mutation.
-    if table == "facts":
-        before = conn.execute(
-            "SELECT * FROM facts WHERE fact_id = ?", (source_id,)
-        ).fetchone()
-        before_image = dict(before) if before is not None else None
-    else:
-        before = conn.execute(
-            "SELECT * FROM episodic_memory WHERE id = ?", (source_id,)
-        ).fetchone()
-        if before is None:
-            before = conn.execute(
-                "SELECT * FROM working_memory WHERE id = ?", (source_id,)
-            ).fetchone()
-        before_image = dict(before) if before is not None else None
 
     # The semantic output is a canonical_facts slot for this scope.
     category = "dream"
@@ -898,22 +998,26 @@ def _apply_one_action(
         # record a canonical_facts row marking the dampened state.
         confidence = max(0.0, confidence * 0.5)
 
-    # Use direct INSERT into canonical_facts (not CanonicalStore.remember,
-    # which opens its own BEGIN IMMEDIATE). We are already inside the Dream-
-    # owned deferred-commit transaction; supersede manually.
-    now = _now_iso()
-    current = conn.execute(
-        "SELECT id, version FROM canonical_facts "
+    # Capture the EXACT canonical before-image BEFORE any mutation. This is
+    # what undo restores. ``None`` means no prior current row existed.
+    prior_row = conn.execute(
+        "SELECT * FROM canonical_facts "
         "WHERE owner_id = ? AND category = ? AND name = ? "
         "AND valid_until IS NULL",
         (owner_id, category, name),
     ).fetchone()
-    if current is not None:
+    canonical_before = dict(prior_row) if prior_row is not None else None
+
+    # Use direct INSERT into canonical_facts (not CanonicalStore.remember,
+    # which opens its own BEGIN IMMEDIATE). We are already inside the Dream-
+    # owned deferred-commit transaction; supersede manually.
+    now = _now_iso()
+    if canonical_before is not None:
         conn.execute(
             "UPDATE canonical_facts SET valid_until = ? WHERE id = ?",
-            (now, current["id"]),
+            (now, canonical_before["id"]),
         )
-        version = (current["version"] or 0) + 1
+        version = (canonical_before["version"] or 0) + 1
     else:
         version = 1
     conn.execute(
@@ -942,10 +1046,38 @@ def _apply_one_action(
         "after_image = ?, applied = 1 WHERE run_id = ? AND seq = ?",
         (
             _canonical_json(target),
-            _canonical_json(before_image) if before_image is not None else None,
+            _canonical_json(canonical_before) if canonical_before is not None else None,
             _canonical_json(after_image), run_id, seq,
         ),
     )
+
+
+def _check_approval_freshness(
+    conn: sqlite3.Connection, run_id: str,
+) -> Optional[str]:
+    """Re-check that the run's PASS receipts are still within the approval TTL.
+
+    Called from :func:`dream_apply` immediately before mutation, inside the
+    apply transaction. Returns ``stale_manifest`` if any PASS receipt is now
+    older than APPROVAL_TTL_HOURS, else ``None``.
+    """
+    rows = conn.execute(
+        "SELECT timestamp FROM dream_receipts "
+        "WHERE run_id = ? AND verdict = 'PASS'", (run_id,)
+    ).fetchall()
+    if not rows:
+        return "stale_manifest"
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        try:
+            when = datetime.fromisoformat(
+                r["timestamp"].replace("Z", "+00:00")
+            )
+        except (ValueError, AttributeError):
+            return "stale_manifest"
+        if when.tzinfo is None or when < now - RECEIPT_TTL:
+            return "stale_manifest"
+    return None
 
 
 def _revalidate_sources(
@@ -982,19 +1114,10 @@ def dream_apply(beam, run_id: str) -> DreamRun:
     normal completion. On any failure the run moves to a structured failure
     state with no partial semantic state.
     """
+    rejection = _reject_if_caller_holds_transaction(beam, run_id)
+    if rejection is not None:
+        return rejection
     conn = beam.conn
-
-    # Reject a caller-open / deferred transaction BEFORE any schema work:
-    # executescript() would otherwise commit the caller's transaction. Dream
-    # must own its apply transaction.
-    try:
-        _assert_dream_transaction_context(conn)
-    except _DreamTransactionError as exc:
-        # No schema init, no state mutation -- surface the rejection.
-        return DreamRun(run_id=run_id, state="failed_retryable",
-                        error_code="validation_failed",
-                        failure_reason=str(exc))
-
     _init_dream_schema(conn)
     run = _load_run(beam, run_id)
     if run is None:
@@ -1016,17 +1139,37 @@ def dream_apply(beam, run_id: str) -> DreamRun:
 
     # Activate the gate BEFORE the transaction so a concurrent sleep pass sees
     # it. This is an operational gate; source-hash revalidation remains the
-    # correctness backstop.
-    _set_dream_active(True)
+    # correctness backstop. If the gate cannot be set, surface a structured
+    # failure rather than proceeding fail-open (sleep would race Dream).
+    gate_err = _set_dream_active(True)
+    if gate_err is not None:
+        _set_state(conn, run_id, "failed_retryable", error_code=gate_err,
+                   failure_reason="dream_active gate could not be set")
+        conn.commit()
+        return _load_run(beam, run_id)  # type: ignore[return-value]
 
     owner_id = run.scope.get("session_id") or beam.session_id
 
     try:
         with _deferred_commits(conn):
+            # I4: acquire a write lock (BEGIN IMMEDIATE) BEFORE source
+            # revalidation so a concurrent writer cannot mutate a source
+            # between the check and the semantic write. _deferred_commits
+            # suppresses the inner commit() that BEGIN IMMEDIATE would
+            # otherwise trigger via the autocommit boundary; the transaction
+            # is committed once at the end of the block.
+            conn.execute("BEGIN IMMEDIATE")
             stale = _revalidate_sources(conn, run_id)
             if stale is not None:
                 # Roll back via the context manager by raising.
                 raise _ApplyAborted(stale)
+            # I1: re-check approval TTL at apply time. A ready run whose
+            # newest receipt is now older than the approval TTL must not
+            # apply, even if it was valid at submission. Surface as
+            # stale_manifest (approval window expired).
+            ttl_err = _check_approval_freshness(conn, run_id)
+            if ttl_err is not None:
+                raise _ApplyAborted(ttl_err)
 
             _set_state(conn, run_id, "applying", checkpoint="applying")
             actions = conn.execute(
@@ -1121,15 +1264,10 @@ def dream_undo(beam, run_id: str) -> DreamRun:
     Idempotent: a second undo returns the run unchanged in ``undone`` state.
     Never touches another run's output.
     """
+    rejection = _reject_if_caller_holds_transaction(beam, run_id)
+    if rejection is not None:
+        return rejection
     conn = beam.conn
-
-    try:
-        _assert_dream_transaction_context(conn)
-    except _DreamTransactionError as exc:
-        return DreamRun(run_id=run_id, state="failed_retryable",
-                        error_code="validation_failed",
-                        failure_reason=str(exc))
-
     _init_dream_schema(conn)
     run = _load_run(beam, run_id)
     if run is None:
@@ -1138,7 +1276,14 @@ def dream_undo(beam, run_id: str) -> DreamRun:
                         failure_reason="run not found")
 
     if run.state == "undone":
-        return run
+        # Idempotent: explicit non-silent signal that the run is already
+        # undone. Brief item 5 requires a second undo to return
+        # ``already_undone``; we surface it via failure_reason + checkpoint
+        # rather than inventing a new state or error-taxonomy code.
+        return DreamRun(
+            run_id=run_id, state="undone", checkpoint="undone",
+            failure_reason="already_undone",
+        )
     if run.state != "applied":
         return DreamRun(
             run_id=run_id, state=run.state,
@@ -1146,10 +1291,18 @@ def dream_undo(beam, run_id: str) -> DreamRun:
             failure_reason=f"cannot undo from state {run.state}",
         )
 
-    _set_dream_active(True)
+    gate_err = _set_dream_active(True)
+    if gate_err is not None:
+        _set_state(conn, run_id, "failed_retryable", error_code=gate_err,
+                   failure_reason="dream_active gate could not be set")
+        conn.commit()
+        return _load_run(beam, run_id)  # type: ignore[return-value]
 
     try:
         with _deferred_commits(conn):
+            # I4: hold the write lock across undo so the before-image restore
+            # is atomic against concurrent writers.
+            conn.execute("BEGIN IMMEDIATE")
             _set_state(conn, run_id, "undoing", checkpoint="undoing")
             actions = conn.execute(
                 "SELECT seq, after_image, before_image, source_table, "
@@ -1166,6 +1319,18 @@ def dream_undo(beam, run_id: str) -> DreamRun:
                 if cid is not None:
                     conn.execute(
                         "DELETE FROM canonical_facts WHERE id = ?", (cid,)
+                    )
+                # C1: restore the EXACT canonical before-image. If a prior
+                # current row was superseded by this action, make it current
+                # again by clearing valid_until. If no prior row existed
+                # (before_image is None), there is nothing to restore -- the
+                # slot was brand-new and the DELETE above fully reverses it.
+                before = json.loads(a["before_image"]) if a["before_image"] else None
+                if before is not None:
+                    conn.execute(
+                        "UPDATE canonical_facts SET valid_until = NULL "
+                        "WHERE id = ?",
+                        (before["id"],),
                     )
                 conn.execute(
                     "UPDATE dream_actions SET undone = 1 "
@@ -1208,12 +1373,20 @@ def dream_resume(beam, run_id: str) -> DreamRun:
     Resolves the rollback/retry and after-commit-before-response crash window
     without double apply. Idempotent: a run already at ``applied`` is a no-op.
     """
+    rejection = _reject_if_caller_holds_transaction(beam, run_id)
+    if rejection is not None:
+        return rejection
     _init_dream_schema(beam.conn)
     run = dream_status(beam, run_id)
     if run.state in ("applied", "undone"):
         return run
     if run.state == "failed_retryable":
-        # Clear the prior failure and re-attempt from ready.
+        # M7: do not endlessly retry stale_manifest. A stale source will not
+        # heal on retry; the operator must re-plan after fixing the source.
+        # Other failed_retryable codes (database_busy, transient) are safe to
+        # retry once.
+        if run.error_code == "stale_manifest":
+            return run
         beam.conn.execute(
             "UPDATE dream_runs SET state = 'ready', error_code = NULL, "
             "failure_reason = NULL WHERE run_id = ?",
@@ -1251,6 +1424,9 @@ def dream_status(beam, run_id: str) -> DreamRun:
     Also reconciles a stale ``dream_active`` gate from durable run state: if
     no run is in an active-ownership state, the gate is cleared.
     """
+    rejection = _reject_if_caller_holds_transaction(beam, run_id)
+    if rejection is not None:
+        return rejection
     _init_dream_schema(beam.conn)
     _reconcile_gate_from_durable_state(beam)
     run = _load_run(beam, run_id)
