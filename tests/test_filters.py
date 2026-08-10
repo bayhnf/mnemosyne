@@ -9,16 +9,12 @@ Covers:
 - Backward compat: classifier off = only regex patterns apply
 """
 
-import os
-import pytest
-
 from mnemosyne.core.filters import (
-    DEFAULT_NOISE_PATTERNS,
-    SECRET_PATTERNS,
-    WriteDecision,
     classify_memory_write,
     detect_secrets,
+    get_write_classifier_mode,
     matches_patterns,
+    redact_memory_artifact,
     should_remember,
 )
 
@@ -26,6 +22,7 @@ from mnemosyne.core.filters import (
 # ---------------------------------------------------------------------------
 # matches_patterns
 # ---------------------------------------------------------------------------
+
 
 class TestMatchesPatterns:
     def test_empty_patterns_returns_false(self):
@@ -50,6 +47,7 @@ class TestMatchesPatterns:
 # ---------------------------------------------------------------------------
 # detect_secrets
 # ---------------------------------------------------------------------------
+
 
 class TestDetectSecrets:
     def test_openai_key(self):
@@ -123,6 +121,7 @@ class TestDetectSecrets:
 # classify_memory_write
 # ---------------------------------------------------------------------------
 
+
 class TestClassifyMemoryWrite:
     def test_allows_valuable_content(self):
         decision = classify_memory_write("User prefers concise responses in English.")
@@ -140,13 +139,17 @@ class TestClassifyMemoryWrite:
         assert decision.reason == "empty_content"
 
     def test_rejects_secret(self):
-        decision = classify_memory_write("My API key is sk-abc123def456ghi789jkl012mno345pqr678")
+        decision = classify_memory_write(
+            "My API key is sk-abc123def456ghi789jkl012mno345pqr678"
+        )
         assert decision.action == "reject"
         assert decision.reason == "secret_detected"
         assert decision.confidence >= 0.9
 
     def test_rejects_terminal_output(self):
-        decision = classify_memory_write("$ pip install foo\nCollecting foo\nSuccessfully installed foo")
+        decision = classify_memory_write(
+            "$ pip install foo\nCollecting foo\nSuccessfully installed foo"
+        )
         assert decision.action == "reject"
         assert "noise_pattern_match" in decision.reason
 
@@ -177,7 +180,9 @@ class TestClassifyMemoryWrite:
 
     def test_custom_ignore_patterns(self):
         # Custom pattern that's not in defaults
-        decision = classify_memory_write("weather forecast: rain today", ignore_patterns=[r"weather\s+forecast"])
+        decision = classify_memory_write(
+            "weather forecast: rain today", ignore_patterns=[r"weather\s+forecast"]
+        )
         assert decision.action == "reject"
 
     def test_decision_is_json_serializable(self):
@@ -193,6 +198,7 @@ class TestClassifyMemoryWrite:
 # ---------------------------------------------------------------------------
 # should_remember
 # ---------------------------------------------------------------------------
+
 
 class TestShouldRemember:
     def test_classifier_off_allows_normal_content(self, monkeypatch):
@@ -261,7 +267,101 @@ class TestShouldRemember:
         monkeypatch.delenv("MNEMOSYNE_WRITE_CLASSIFIER", raising=False)
         monkeypatch.setenv("MNEMOSYNE_IGNORE_PATTERNS", r"^should_match")
         # Use content that matches the env pattern but no default noise patterns
-        should, decision = should_remember("should_match this content here", ignore_patterns=[])
+        should, decision = should_remember(
+            "should_match this content here", ignore_patterns=[]
+        )
         # With empty list override, env patterns are NOT loaded
         assert should is True
         assert decision.action == "allow"
+
+
+# ---------------------------------------------------------------------------
+# Classifier artifact boundaries (Task 1: CoT / approval detection)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifierArtifactBoundaries:
+    """Establishes the four policy modes for the shared classifier.
+
+    Secrets must reject independent of the legacy ``off`` gate, while
+    explicit CoT/approval artifacts reject and ordinary conversational
+    text mentioning those concepts must still allow.
+    """
+
+    def test_classifier_detects_secret_independently_of_legacy_mode_gate(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MNEMOSYNE_WRITE_CLASSIFIER", raising=False)
+        # nosec - test fixture, not a real secret
+        decision = classify_memory_write("api_key=sk-test-secret-value")
+        assert decision.action == "reject"
+        assert "secret" in decision.reason.lower()
+
+    def test_classifier_labels_explicit_reasoning_artifact(self):
+        decision = classify_memory_write("<analysis>private reasoning trace</analysis>")
+        assert decision.action == "reject"
+        assert decision.reason == "reasoning_artifact"
+
+    def test_classifier_labels_explicit_approval_receipt(self):
+        decision = classify_memory_write("APPROVAL RECEIPT: reviewer=glm verdict=PASS")
+        assert decision.action == "reject"
+        assert decision.reason == "approval_artifact"
+
+    def test_classifier_keeps_conversational_approval_and_thought_text(self):
+        for content in (
+            "The user approved the plan.",
+            "I thought about the migration before writing code.",
+        ):
+            assert classify_memory_write(content).action == "allow"
+
+
+class TestGetWriteClassifierMode:
+    """Public wrapper around the mode lookup, reused by legacy + native paths."""
+
+    def test_defaults_to_off_when_unset(self, monkeypatch):
+        monkeypatch.delenv("MNEMOSYNE_WRITE_CLASSIFIER", raising=False)
+        assert get_write_classifier_mode() == "off"
+
+    def test_reads_warn_mode(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "warn")
+        assert get_write_classifier_mode() == "warn"
+
+    def test_reads_strict_mode(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "strict")
+        assert get_write_classifier_mode() == "strict"
+
+    def test_unknown_mode_defaults_to_off(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "bogus")
+        assert get_write_classifier_mode() == "off"
+
+    def test_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_WRITE_CLASSIFIER", "STRICT")
+        assert get_write_classifier_mode() == "strict"
+
+
+class TestRedactMemoryArtifact:
+    """Stable redaction text that never echoes the matched artifact."""
+
+    def test_reasoning_artifact_redaction(self):
+        content = "<analysis>private reasoning trace</analysis>"
+        redacted = redact_memory_artifact(content, "reasoning_artifact")
+        assert "private reasoning trace" not in redacted
+        assert "<analysis>" not in redacted
+        assert "reasoning-artifact" in redacted
+
+    def test_approval_artifact_redaction(self):
+        content = "APPROVAL RECEIPT: reviewer=glm verdict=PASS"
+        redacted = redact_memory_artifact(content, "approval_artifact")
+        assert "PASS" not in redacted
+        assert "reviewer=glm" not in redacted
+        assert "approval-artifact" in redacted
+
+    def test_unknown_reason_returns_generic_redaction(self):
+        redacted = redact_memory_artifact("something", "some_other_reason")
+        assert "something" not in redacted
+        assert "redacted" in redacted.lower()
+
+    def test_never_returns_original_content(self):
+        content = "<analysis>super secret inner monologue</analysis>"
+        redacted = redact_memory_artifact(content, "reasoning_artifact")
+        assert redacted != content

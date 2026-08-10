@@ -99,11 +99,39 @@ SECRET_LABELED_PATTERNS: List[tuple] = [
     ("slack_token", r"xox[baprs]-[A-Za-z0-9-]+"),
     ("google_api_key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("jwt_token", r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
-    ("secret_assignment", r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
-                          r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}"),
-    ("private_key_block", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----"),
-    ("connection_string_with_credentials", r"(?:postgres|mysql|mongodb|redis)://[^:]+:[^@]+@"),
-    ("env_secret_assignment", r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*="),
+    (
+        "secret_assignment",
+        r"(?i)(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
+        r"\s*[=:]\s*['\"]?[^\s'\"<>{}]{8,}",
+    ),
+    (
+        "private_key_block",
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----",
+    ),
+    (
+        "connection_string_with_credentials",
+        r"(?:postgres|mysql|mongodb|redis)://[^:]+:[^@]+@",
+    ),
+    (
+        "env_secret_assignment",
+        r"(?i)^\s*(?:DB_PASS|SECRET_KEY|AUTH_TOKEN|API_SECRET)\s*=",
+    ),
+]
+
+# Narrowly-anchored artifact patterns — explicit envelopes/headers only.
+# Matches the complete ``<analysis>...</analysis>`` envelope (non-greedy,
+# multiline) or a literal CoT header. Does NOT match ordinary sentences
+# containing "reasoning"/"thought".
+REASONING_ARTIFACT_PATTERNS: List[str] = [
+    r"<analysis>[\s\S]*?</analysis>",
+    r"(?m)^\s*CHAIN OF THOUGHT:.*",
+    r"(?m)^\s*REASONING TRACE:.*",
+]
+
+# Machine-style approval/review receipts with a verdict field. Does NOT
+# match conversational "the user approved the plan".
+APPROVAL_ARTIFACT_PATTERNS: List[str] = [
+    r"(?m)^\s*(?:APPROVAL|REVIEWER|VERIFIER)\s+RECEIPT:.*verdict\s*=.*",
 ]
 
 # Compiled pattern cache
@@ -142,9 +170,38 @@ def _get_compiled_secrets() -> List[tuple]:
     return _compiled_secrets
 
 
+_compiled_reasoning_artifacts: Optional[List[re.Pattern]] = None
+_compiled_approval_artifacts: Optional[List[re.Pattern]] = None
+
+
+def _get_compiled_reasoning_artifacts() -> List[re.Pattern]:
+    global _compiled_reasoning_artifacts
+    if _compiled_reasoning_artifacts is None:
+        _compiled_reasoning_artifacts = _compile_patterns(REASONING_ARTIFACT_PATTERNS)
+    return _compiled_reasoning_artifacts
+
+
+def _get_compiled_approval_artifacts() -> List[re.Pattern]:
+    global _compiled_approval_artifacts
+    if _compiled_approval_artifacts is None:
+        _compiled_approval_artifacts = _compile_patterns(APPROVAL_ARTIFACT_PATTERNS)
+    return _compiled_approval_artifacts
+
+
+def _detect_reasoning_artifact(content: str) -> bool:
+    """True when content carries an explicit reasoning-trace artifact envelope/header."""
+    return any(pat.search(content) for pat in _get_compiled_reasoning_artifacts())
+
+
+def _detect_approval_artifact(content: str) -> bool:
+    """True when content carries a machine-style approval/review receipt with a verdict field."""
+    return any(pat.search(content) for pat in _get_compiled_approval_artifacts())
+
+
 # ---------------------------------------------------------------------------
 # Write decision
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class WriteDecision:
@@ -152,6 +209,7 @@ class WriteDecision:
 
     Mirrors the shape proposed in issue #406.
     """
+
     action: str  # "allow" | "reject" | "rewrite"
     target: str = "memory"  # where to route ("memory" | "none" | "scratchpad")
     reason: str = ""
@@ -173,6 +231,7 @@ class WriteDecision:
 # ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------
+
 
 def _parse_patterns(raw: str) -> List[str]:
     """Parse a newline-separated pattern string into a list.
@@ -196,14 +255,27 @@ def _load_classifier_mode() -> str:
     """Read MNEMOSYNE_WRITE_CLASSIFIER env var. Returns 'off' | 'warn' | 'strict'."""
     mode = os.environ.get("MNEMOSYNE_WRITE_CLASSIFIER", "off").strip().lower()
     if mode not in ("off", "warn", "strict"):
-        logger.warning("Unknown MNEMOSYNE_WRITE_CLASSIFIER=%r, defaulting to 'off'", mode)
+        logger.warning(
+            "Unknown MNEMOSYNE_WRITE_CLASSIFIER=%r, defaulting to 'off'", mode
+        )
         return "off"
     return mode
+
+
+def get_write_classifier_mode() -> str:
+    """Public wrapper around the classifier-mode lookup.
+
+    Reused by both legacy filtering (:func:`should_remember`) and the native
+    Inhale path so there is a single source of truth for mode resolution.
+    Returns ``'off'`` | ``'warn'`` | ``'strict'``.
+    """
+    return _load_classifier_mode()
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def matches_patterns(content: str, patterns: List[str]) -> bool:
     """Check if content matches any regex pattern.
@@ -257,18 +329,38 @@ def classify_memory_write(
     """
     if not content or not content.strip():
         return WriteDecision(
-            action="reject", target="none",
-            reason="empty_content", confidence=1.0,
+            action="reject",
+            target="none",
+            reason="empty_content",
+            confidence=1.0,
         )
 
     # --- Stage 1: secret detection (highest priority) ---
     secret_hits = detect_secrets(content)
     if secret_hits:
         return WriteDecision(
-            action="reject", target="none",
+            action="reject",
+            target="none",
             reason="secret_detected",
             confidence=0.95,
             warnings=[f"Secret-like pattern matched: {', '.join(secret_hits)}"],
+        )
+    # --- Stage 1b: explicit reasoning/approval artifacts (deterministic) ---
+    # Narrowly anchored to artifact envelopes/headers; ordinary sentences
+    # mentioning "thought"/"approved" do not match.
+    if _detect_reasoning_artifact(content):
+        return WriteDecision(
+            action="reject",
+            target="none",
+            reason="reasoning_artifact",
+            confidence=0.9,
+        )
+    if _detect_approval_artifact(content):
+        return WriteDecision(
+            action="reject",
+            target="none",
+            reason="approval_artifact",
+            confidence=0.9,
         )
 
     # --- Stage 2: noise pattern matching (compiled cache) ---
@@ -278,17 +370,23 @@ def classify_memory_write(
     for pat in compiled_noise:
         if pat.search(content):
             return WriteDecision(
-                action="reject", target="none",
+                action="reject",
+                target="none",
                 reason="noise_pattern_match",
                 confidence=0.8,
             )
 
     # User-supplied patterns (from arg or env) — not cached since they
     # change per-call.
-    user_patterns = ignore_patterns if ignore_patterns is not None else _load_ignore_patterns_from_env()
+    user_patterns = (
+        ignore_patterns
+        if ignore_patterns is not None
+        else _load_ignore_patterns_from_env()
+    )
     if user_patterns and matches_patterns(content, user_patterns):
         return WriteDecision(
-            action="reject", target="none",
+            action="reject",
+            target="none",
             reason="noise_pattern_match",
             confidence=0.8,
         )
@@ -301,7 +399,8 @@ def classify_memory_write(
         sentences = content.count(". ")
         if sentences < line_count * 0.1:
             return WriteDecision(
-                action="reject", target="none",
+                action="reject",
+                target="none",
                 reason="likely_dump_high_linecount_low_structure",
                 confidence=0.6,
             )
@@ -336,18 +435,24 @@ def should_remember(
         When ``warn``, always returns ``(True, decision)`` but the
         decision carries warnings for the caller to inspect.
     """
-    mode = classifier_mode or _load_classifier_mode()
+    mode = classifier_mode or get_write_classifier_mode()
 
     # When classifier is off, only apply regex ignore_patterns (backward
     # compat with the provider's _should_filter behavior).
     if mode == "off":
         # Only load from env when ignore_patterns is None (not an empty list,
         # which is an intentional "disable extra patterns" override).
-        patterns = ignore_patterns if ignore_patterns is not None else _load_ignore_patterns_from_env()
+        patterns = (
+            ignore_patterns
+            if ignore_patterns is not None
+            else _load_ignore_patterns_from_env()
+        )
         if patterns and matches_patterns(content, patterns):
             return False, WriteDecision(
-                action="reject", target="none",
-                reason="ignore_pattern_match", confidence=1.0,
+                action="reject",
+                target="none",
+                reason="ignore_pattern_match",
+                confidence=1.0,
             )
         return True, WriteDecision(action="allow", target="memory")
 
@@ -369,3 +474,21 @@ def should_remember(
         return True, decision
 
     return True, decision
+
+
+def redact_memory_artifact(content: str, reason: str) -> str:
+    """Return stable redaction text for a classifier reason.
+
+    Never returns the matched span or the original artifact. The token
+    embedded in the placeholder is derived from the stable ``reason``
+    label, not from ``content``, so callers can safely persist the result.
+
+    Args:
+        content: The original classified content (not retained/echoed).
+        reason: The classifier ``reason`` (e.g. ``reasoning_artifact``).
+
+    Returns:
+        A stable placeholder such as ``"[mnemosyne-redacted: reasoning-artifact]"``.
+    """
+    token = reason.replace("_", "-") if reason else "unknown"
+    return f"[mnemosyne-redacted: {token}]"
