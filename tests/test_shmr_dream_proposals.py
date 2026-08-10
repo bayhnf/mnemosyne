@@ -60,9 +60,7 @@ def _facts_snapshot(beam):
     """Capture every source row that SHMR must not mutate."""
     out = {}
     for table in ("facts", "working_memory", "episodic_memory"):
-        rows = beam.conn.execute(
-            f"SELECT * FROM {table} ORDER BY rowid"
-        ).fetchall()
+        rows = beam.conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
         out[table] = [dict(r) for r in rows]
     return out
 
@@ -112,10 +110,18 @@ class TestFreshSchema:
         _seed_facts(
             beam,
             [
-                {"fact_id": "f1", "subject": "alice", "predicate": "likes",
-                 "object": "rust programming language"},
-                {"fact_id": "f2", "subject": "alice", "predicate": "likes",
-                 "object": "the rust language for systems work"},
+                {
+                    "fact_id": "f1",
+                    "subject": "alice",
+                    "predicate": "likes",
+                    "object": "rust programming language",
+                },
+                {
+                    "fact_id": "f2",
+                    "subject": "alice",
+                    "predicate": "likes",
+                    "object": "the rust language for systems work",
+                },
             ],
         )
         llm = _RecordingLLM(
@@ -152,10 +158,18 @@ class TestScopeIsolation:
         _seed_facts(
             beam,
             [
-                {"fact_id": "fa", "subject": "bob", "predicate": "uses",
-                 "object": "python for data analysis pipelines"},
-                {"fact_id": "fb", "subject": "bob", "predicate": "uses",
-                 "object": "python in data analysis"},
+                {
+                    "fact_id": "fa",
+                    "subject": "bob",
+                    "predicate": "uses",
+                    "object": "python for data analysis pipelines",
+                },
+                {
+                    "fact_id": "fb",
+                    "subject": "bob",
+                    "predicate": "uses",
+                    "object": "python in data analysis",
+                },
             ],
         )
         llm = _RecordingLLM(
@@ -203,10 +217,18 @@ class TestPromptSourceIds:
         ids = _seed_facts(
             beam,
             [
-                {"fact_id": "src-001", "subject": "carol", "predicate": "lives",
-                 "object": "in jakarta the capital of indonesia"},
-                {"fact_id": "src-002", "subject": "carol", "predicate": "based",
-                 "object": "jakarta capital of indonesia region"},
+                {
+                    "fact_id": "src-001",
+                    "subject": "carol",
+                    "predicate": "lives",
+                    "object": "in jakarta the capital of indonesia",
+                },
+                {
+                    "fact_id": "src-002",
+                    "subject": "carol",
+                    "predicate": "based",
+                    "object": "jakarta capital of indonesia region",
+                },
             ],
         )
         llm = _RecordingLLM(["[]"])  # no proposals is fine; we assert the prompt
@@ -227,16 +249,22 @@ class TestPromptSourceIds:
 
 class TestHallucinatedTargetRejection:
     def test_target_fact_id_not_in_cluster_is_dropped(self, tmp_path):
-        beam = BeamMemory(
-            session_id="hall-sess", db_path=tmp_path / "halluc.db"
-        )
+        beam = BeamMemory(session_id="hall-sess", db_path=tmp_path / "halluc.db")
         _seed_facts(
             beam,
             [
-                {"fact_id": "real-1", "subject": "dan", "predicate": "eats",
-                 "object": "sushi every week regularly"},
-                {"fact_id": "real-2", "subject": "dan", "predicate": "enjoys",
-                 "object": "sushi weekly as a regular habit"},
+                {
+                    "fact_id": "real-1",
+                    "subject": "dan",
+                    "predicate": "eats",
+                    "object": "sushi every week regularly",
+                },
+                {
+                    "fact_id": "real-2",
+                    "subject": "dan",
+                    "predicate": "enjoys",
+                    "object": "sushi weekly as a regular habit",
+                },
             ],
         )
         # LLM cites a fact_id that does not exist in this cluster.
@@ -259,9 +287,7 @@ class TestHallucinatedTargetRejection:
         )
         result = shmr.propose_harmony(beam, llm_call=bad, similarity_threshold=0.4)
         # The hallucinated proposal must not be persisted.
-        rows = beam.conn.execute(
-            "SELECT * FROM shmr_proposals"
-        ).fetchall()
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
         assert len(rows) == 0, (
             "out-of-cluster target_fact_id must be rejected; "
             f"got {len(rows)} persisted proposal(s)"
@@ -276,16 +302,22 @@ class TestHallucinatedTargetRejection:
 
 class TestSourcesUnchanged:
     def test_facts_working_episodic_rows_are_byte_identical_after_run(self, tmp_path):
-        beam = BeamMemory(
-            session_id="immutable-sess", db_path=tmp_path / "imm.db"
-        )
+        beam = BeamMemory(session_id="immutable-sess", db_path=tmp_path / "imm.db")
         _seed_facts(
             beam,
             [
-                {"fact_id": "im-1", "subject": "eve", "predicate": "codes",
-                 "object": "in typescript for the frontend app daily"},
-                {"fact_id": "im-2", "subject": "eve", "predicate": "writes",
-                 "object": "typescript on the frontend application often"},
+                {
+                    "fact_id": "im-1",
+                    "subject": "eve",
+                    "predicate": "codes",
+                    "object": "in typescript for the frontend app daily",
+                },
+                {
+                    "fact_id": "im-2",
+                    "subject": "eve",
+                    "predicate": "writes",
+                    "object": "typescript on the frontend application often",
+                },
             ],
         )
         before = _facts_snapshot(beam)
@@ -337,16 +369,22 @@ class TestTransactionRollback:
     def test_persistence_failure_rolls_back_proposals_without_mutating_sources(
         self, tmp_path, monkeypatch
     ):
-        beam = BeamMemory(
-            session_id="rb-sess", db_path=tmp_path / "rollback.db"
-        )
+        beam = BeamMemory(session_id="rb-sess", db_path=tmp_path / "rollback.db")
         _seed_facts(
             beam,
             [
-                {"fact_id": "rb-1", "subject": "frank", "predicate": "runs",
-                 "object": "marathons on weekends in the park"},
-                {"fact_id": "rb-2", "subject": "frank", "predicate": "jogs",
-                 "object": "marathon distances every weekend morning"},
+                {
+                    "fact_id": "rb-1",
+                    "subject": "frank",
+                    "predicate": "runs",
+                    "object": "marathons on weekends in the park",
+                },
+                {
+                    "fact_id": "rb-2",
+                    "subject": "frank",
+                    "predicate": "jogs",
+                    "object": "marathon distances every weekend morning",
+                },
             ],
         )
         before = _facts_snapshot(beam)
@@ -388,9 +426,7 @@ class TestTransactionRollback:
         assert result["status"] == "rolled_back"
 
         # No partial proposal rows.
-        rows = beam.conn.execute(
-            "SELECT * FROM shmr_proposals"
-        ).fetchall()
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
         assert len(rows) == 0
 
         # Sources untouched.
@@ -479,10 +515,18 @@ class TestPublicSurfaceIsProposalOnly:
         _seed_facts(
             beam,
             [
-                {"fact_id": "h-1", "subject": "gina", "predicate": "likes",
-                 "object": "rust programming language a lot"},
-                {"fact_id": "h-2", "subject": "gina", "predicate": "likes",
-                 "object": "the rust language for systems"},
+                {
+                    "fact_id": "h-1",
+                    "subject": "gina",
+                    "predicate": "likes",
+                    "object": "rust programming language a lot",
+                },
+                {
+                    "fact_id": "h-2",
+                    "subject": "gina",
+                    "predicate": "likes",
+                    "object": "the rust language for systems",
+                },
             ],
         )
         before = _facts_snapshot(beam)
@@ -490,18 +534,27 @@ class TestPublicSurfaceIsProposalOnly:
         # Inject a deterministic LLM that would, under the old code, trigger
         # update + dampen actions against source fact_ids.
         monkeypatch.setattr(
-            shmr, "_call_llm",
+            shmr,
+            "_call_llm",
             lambda prompt, system="": json.dumps(
                 [
                     {
-                        "subject": "gina", "predicate": "prefers", "object": "rust",
-                        "confidence": 0.9, "action": "update",
-                        "target_fact_id": "h-1", "rationale": "x",
+                        "subject": "gina",
+                        "predicate": "prefers",
+                        "object": "rust",
+                        "confidence": 0.9,
+                        "action": "update",
+                        "target_fact_id": "h-1",
+                        "rationale": "x",
                     },
                     {
-                        "subject": "gina", "predicate": "noise", "object": "x",
-                        "confidence": 0.2, "action": "dampen",
-                        "target_fact_id": "h-2", "rationale": "y",
+                        "subject": "gina",
+                        "predicate": "noise",
+                        "object": "x",
+                        "confidence": 0.2,
+                        "action": "dampen",
+                        "target_fact_id": "h-2",
+                        "rationale": "y",
                     },
                 ]
             ),
@@ -529,10 +582,18 @@ class TestPublicSurfaceIsProposalOnly:
         _seed_facts(
             beam,
             [
-                {"fact_id": "p-1", "subject": "hank", "predicate": "uses",
-                 "object": "python for data analysis pipelines"},
-                {"fact_id": "p-2", "subject": "hank", "predicate": "uses",
-                 "object": "python in data analysis scripts"},
+                {
+                    "fact_id": "p-1",
+                    "subject": "hank",
+                    "predicate": "uses",
+                    "object": "python for data analysis pipelines",
+                },
+                {
+                    "fact_id": "p-2",
+                    "subject": "hank",
+                    "predicate": "uses",
+                    "object": "python in data analysis scripts",
+                },
             ],
         )
         before = _facts_snapshot(beam)
@@ -564,9 +625,7 @@ class TestPublicSurfaceIsProposalOnly:
 class TestRunLevelAtomicity:
     """Finding 2: a failure on a later cluster must roll back ALL clusters."""
 
-    def test_final_commit_failure_leaves_no_persisted_rows(
-        self, tmp_path, monkeypatch
-    ):
+    def test_final_commit_failure_leaves_no_persisted_rows(self, tmp_path, monkeypatch):
         """Round 2 RED->GREEN: inject a final-commit failure after successful
         proposal inserts. The old code's redundant post-RELEASE commit would
         fail here, its ROLLBACK TO SAVEPOINT would find no live savepoint
@@ -587,18 +646,37 @@ class TestRunLevelAtomicity:
         _seed_facts(
             beam,
             [
-                {"fact_id": "fcf-1", "subject": "vera", "predicate": "uses",
-                 "object": "python data analysis pipelines"},
-                {"fact_id": "fcf-2", "subject": "vera", "predicate": "uses",
-                 "object": "python data analysis scripts"},
+                {
+                    "fact_id": "fcf-1",
+                    "subject": "vera",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "fcf-2",
+                    "subject": "vera",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
             ],
         )
 
         llm = _RecordingLLM(
-            [json.dumps([{"subject": "vera", "predicate": "prefers",
-                          "object": "python", "confidence": 0.8,
-                          "action": "create", "target_source_id": None,
-                          "rationale": "r"}])]
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "vera",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "r",
+                        }
+                    ]
+                )
+            ]
         )
 
         # Sabotage commit() to fail when proposal rows exist in the txn.
@@ -608,9 +686,10 @@ class TestRunLevelAtomicity:
         def commit_guard():
             has_rows = False
             try:
-                has_rows = shmr_conn.execute(
-                    "SELECT 1 FROM shmr_proposals LIMIT 1"
-                ).fetchone() is not None
+                has_rows = (
+                    shmr_conn.execute("SELECT 1 FROM shmr_proposals LIMIT 1").fetchone()
+                    is not None
+                )
             except Exception:
                 pass
             if has_rows:
@@ -621,27 +700,21 @@ class TestRunLevelAtomicity:
 
         monkeypatch.setattr(beam.conn, "commit", commit_guard)
 
-        result = shmr.propose_harmony(
-            beam, llm_call=llm, similarity_threshold=0.3
-        )
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
 
         # GREEN contract: status/counters must be truthful. If rolled_back,
         # zero rows visible and zero persistable. If proposed, rows are
         # legitimately there. The invariant: NEVER rolled_back with live rows.
         if result["status"] == "rolled_back":
             assert result["proposals_persisted"] == 0, result
-            rows = beam.conn.execute(
-                "SELECT * FROM shmr_proposals"
-            ).fetchall()
+            rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
             assert len(rows) == 0, (
                 f"status=rolled_back but {len(rows)} row(s) are visible — "
                 "semantic partial success"
             )
             monkeypatch.undo()
             beam.conn.commit()
-            rows_after = beam.conn.execute(
-                "SELECT * FROM shmr_proposals"
-            ).fetchall()
+            rows_after = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
             assert len(rows_after) == 0, (
                 f"status=rolled_back but {len(rows_after)} row(s) persisted "
                 "by a later commit"
@@ -656,14 +729,30 @@ class TestRunLevelAtomicity:
         _seed_facts(
             beam,
             [
-                {"fact_id": "py-a", "subject": "ivy", "predicate": "uses",
-                 "object": "python data analysis"},
-                {"fact_id": "py-b", "subject": "ivy", "predicate": "uses",
-                 "object": "python analysis scripts"},
-                {"fact_id": "rs-a", "subject": "jack", "predicate": "likes",
-                 "object": "rust systems language"},
-                {"fact_id": "rs-b", "subject": "jack", "predicate": "likes",
-                 "object": "rust for systems"},
+                {
+                    "fact_id": "py-a",
+                    "subject": "ivy",
+                    "predicate": "uses",
+                    "object": "python data analysis",
+                },
+                {
+                    "fact_id": "py-b",
+                    "subject": "ivy",
+                    "predicate": "uses",
+                    "object": "python analysis scripts",
+                },
+                {
+                    "fact_id": "rs-a",
+                    "subject": "jack",
+                    "predicate": "likes",
+                    "object": "rust systems language",
+                },
+                {
+                    "fact_id": "rs-b",
+                    "subject": "jack",
+                    "predicate": "likes",
+                    "object": "rust for systems",
+                },
             ],
         )
         before = _facts_snapshot(beam)
@@ -674,18 +763,26 @@ class TestRunLevelAtomicity:
                 json.dumps(
                     [
                         {
-                            "subject": "ivy", "predicate": "prefers", "object": "python",
-                            "confidence": 0.8, "action": "create",
-                            "target_source_id": None, "rationale": "p1",
+                            "subject": "ivy",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "p1",
                         }
                     ]
                 ),
                 json.dumps(
                     [
                         {
-                            "subject": "jack", "predicate": "prefers", "object": "rust",
-                            "confidence": 0.8, "action": "create",
-                            "target_source_id": None, "rationale": "p2",
+                            "subject": "jack",
+                            "predicate": "prefers",
+                            "object": "rust",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "p2",
                         }
                     ]
                 ),
@@ -731,7 +828,6 @@ class TestRunLevelAtomicity:
         for table in ("facts", "working_memory", "episodic_memory"):
             assert before[table] == after[table]
 
-
     def test_release_failure_leaves_no_rows(self, tmp_path, monkeypatch):
         """Round 2: if RELEASE SAVEPOINT shmr_run fails, the savepoint is
         still live so ROLLBACK TO must undo all INSERTs. Real SQLite
@@ -745,19 +841,38 @@ class TestRunLevelAtomicity:
         _seed_facts(
             beam,
             [
-                {"fact_id": "rf-1", "subject": "ruth", "predicate": "uses",
-                 "object": "python data analysis pipelines"},
-                {"fact_id": "rf-2", "subject": "ruth", "predicate": "uses",
-                 "object": "python data analysis scripts"},
+                {
+                    "fact_id": "rf-1",
+                    "subject": "ruth",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "rf-2",
+                    "subject": "ruth",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
             ],
         )
         before = _facts_snapshot(beam)
 
         llm = _RecordingLLM(
-            [json.dumps([{"subject": "ruth", "predicate": "prefers",
-                          "object": "python", "confidence": 0.8,
-                          "action": "create", "target_source_id": None,
-                          "rationale": "r"}])]
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "ruth",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "r",
+                        }
+                    ]
+                )
+            ]
         )
 
         original_execute = beam.conn.execute
@@ -771,9 +886,7 @@ class TestRunLevelAtomicity:
 
         monkeypatch.setattr(beam.conn, "execute", execute_guard)
 
-        result = shmr.propose_harmony(
-            beam, llm_call=llm, similarity_threshold=0.3
-        )
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
 
         assert release_seen["n"] >= 1, "RELEASE was never attempted"
         assert result["status"] == "rolled_back", result
@@ -788,9 +901,7 @@ class TestRunLevelAtomicity:
         # Zero rows persist after a later commit.
         monkeypatch.undo()
         beam.conn.commit()
-        rows_after = beam.conn.execute(
-            "SELECT * FROM shmr_proposals"
-        ).fetchall()
+        rows_after = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
         assert len(rows_after) == 0, (
             f"{len(rows_after)} row(s) persisted by a later commit"
         )
@@ -812,18 +923,37 @@ class TestRunLevelAtomicity:
         _seed_facts(
             beam,
             [
-                {"fact_id": "nc-1", "subject": "tom", "predicate": "uses",
-                 "object": "python data analysis pipelines"},
-                {"fact_id": "nc-2", "subject": "tom", "predicate": "uses",
-                 "object": "python data analysis scripts"},
+                {
+                    "fact_id": "nc-1",
+                    "subject": "tom",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "nc-2",
+                    "subject": "tom",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
             ],
         )
 
         llm = _RecordingLLM(
-            [json.dumps([{"subject": "tom", "predicate": "prefers",
-                          "object": "python", "confidence": 0.8,
-                          "action": "create", "target_source_id": None,
-                          "rationale": "r"}])]
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "tom",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "r",
+                        }
+                    ]
+                )
+            ]
         )
 
         original_execute = beam.conn.execute
@@ -851,9 +981,7 @@ class TestRunLevelAtomicity:
         monkeypatch.setattr(beam.conn, "execute", log_execute)
         monkeypatch.setattr(beam.conn, "commit", log_commit)
 
-        result = shmr.propose_harmony(
-            beam, llm_call=llm, similarity_threshold=0.3
-        )
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
         assert result["status"] == "proposed", result
         assert result["proposals_persisted"] == 1, result
 
@@ -875,17 +1003,23 @@ class TestNoNetworkEmbeddings:
         _seed_facts(
             beam,
             [
-                {"fact_id": "o-1", "subject": "kate", "predicate": "uses",
-                 "object": "python for analysis"},
-                {"fact_id": "o-2", "subject": "kate", "predicate": "uses",
-                 "object": "python in analysis"},
+                {
+                    "fact_id": "o-1",
+                    "subject": "kate",
+                    "predicate": "uses",
+                    "object": "python for analysis",
+                },
+                {
+                    "fact_id": "o-2",
+                    "subject": "kate",
+                    "predicate": "uses",
+                    "object": "python in analysis",
+                },
             ],
         )
         llm = _RecordingLLM(["[]"])
         # Must not raise the AssertionError planted in _force_offline_embeddings.
-        result = shmr.propose_harmony(
-            beam, llm_call=llm, similarity_threshold=0.3
-        )
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
         assert result["status"] in ("no_convergence", "proposed")
         assert result["clusters_found"] >= 1
         # And prove the embedding backend was never consulted.
@@ -910,10 +1044,18 @@ class TestMalformedConfidenceRejected:
         _seed_facts(
             beam,
             [
-                {"fact_id": "c-1", "subject": "liam", "predicate": "uses",
-                 "object": "python for data analysis pipelines"},
-                {"fact_id": "c-2", "subject": "liam", "predicate": "uses",
-                 "object": "python data analysis scripts"},
+                {
+                    "fact_id": "c-1",
+                    "subject": "liam",
+                    "predicate": "uses",
+                    "object": "python for data analysis pipelines",
+                },
+                {
+                    "fact_id": "c-2",
+                    "subject": "liam",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
             ],
         )
         llm = _RecordingLLM(
@@ -921,17 +1063,19 @@ class TestMalformedConfidenceRejected:
                 json.dumps(
                     [
                         {
-                            "subject": "liam", "predicate": "prefers", "object": "python",
-                            "confidence": "not a number", "action": "create",
-                            "target_source_id": None, "rationale": "bad conf",
+                            "subject": "liam",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": "not a number",
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "bad conf",
                         }
                     ]
                 )
             ]
         )
-        result = shmr.propose_harmony(
-            beam, llm_call=llm, similarity_threshold=0.3
-        )
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
         assert result["status"] == "no_convergence"
         rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
         assert len(rows) == 0
@@ -945,10 +1089,18 @@ class TestMalformedConfidenceRejected:
         _seed_facts(
             beam,
             [
-                {"fact_id": "n-1", "subject": "mia", "predicate": "uses",
-                 "object": "python data analysis pipelines"},
-                {"fact_id": "n-2", "subject": "mia", "predicate": "uses",
-                 "object": "python data analysis scripts"},
+                {
+                    "fact_id": "n-1",
+                    "subject": "mia",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "n-2",
+                    "subject": "mia",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
             ],
         )
         llm = _RecordingLLM(
@@ -962,9 +1114,7 @@ class TestMalformedConfidenceRejected:
                 '"confidence":Infinity,"action":"create","target_source_id":null}]'
             ]
         )
-        result = shmr.propose_harmony(
-            beam, llm_call=llm, similarity_threshold=0.3
-        )
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
         rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
         assert len(rows) == 0
         assert result["proposals_rejected"] >= 2
@@ -991,19 +1141,37 @@ class TestProvenancePartition:
             beam,
             [
                 {
-                    "id": "e-human", "content": "nora uses python for data analysis",
-                    "author_type": "human", "author_id": "nora", "channel_id": "proj-x",
+                    "id": "e-human",
+                    "content": "nora uses python for data analysis",
+                    "author_type": "human",
+                    "author_id": "nora",
+                    "channel_id": "proj-x",
                 },
                 {
-                    "id": "e-agent", "content": "nora uses python for data analysis",
-                    "author_type": "agent", "author_id": "agent-7", "channel_id": "proj-x",
+                    "id": "e-agent",
+                    "content": "nora uses python for data analysis",
+                    "author_type": "agent",
+                    "author_id": "agent-7",
+                    "channel_id": "proj-x",
                 },
             ],
         )
         llm = _RecordingLLM(
-            [json.dumps([{"subject": "nora", "predicate": "uses", "object": "python",
-                          "confidence": 0.8, "action": "create",
-                          "target_source_id": None, "rationale": "r"}])]
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "nora",
+                            "predicate": "uses",
+                            "object": "python",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "r",
+                        }
+                    ]
+                )
+            ]
         )
         shmr.propose_harmony(
             beam, llm_call=llm, similarity_threshold=0.3, min_cluster_size=2
@@ -1044,12 +1212,24 @@ class TestTruthfulCitations:
         _seed_facts(
             beam,
             [
-                {"fact_id": "ci-1", "subject": "oscar", "predicate": "uses",
-                 "object": "python data analysis pipelines"},
-                {"fact_id": "ci-2", "subject": "oscar", "predicate": "uses",
-                 "object": "python data analysis scripts"},
-                {"fact_id": "ci-3", "subject": "oscar", "predicate": "uses",
-                 "object": "python data analysis notebooks"},
+                {
+                    "fact_id": "ci-1",
+                    "subject": "oscar",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "ci-2",
+                    "subject": "oscar",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
+                {
+                    "fact_id": "ci-3",
+                    "subject": "oscar",
+                    "predicate": "uses",
+                    "object": "python data analysis notebooks",
+                },
             ],
         )
         # LLM cites only ci-1 and ci-2 for its single proposal, NOT ci-3.
@@ -1058,9 +1238,12 @@ class TestTruthfulCitations:
                 json.dumps(
                     [
                         {
-                            "subject": "oscar", "predicate": "prefers",
-                            "object": "python", "confidence": 0.85,
-                            "action": "create", "target_source_id": None,
+                            "subject": "oscar",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.85,
+                            "action": "create",
+                            "target_source_id": None,
                             "rationale": "r",
                             "cited_source_ids": ["ci-1", "ci-2"],
                         }
@@ -1082,18 +1265,24 @@ class TestTruthfulCitations:
         )
         assert "ci-3" not in cited
 
-    def test_citation_of_id_not_in_cluster_is_rejected(
-        self, tmp_path, monkeypatch
-    ):
+    def test_citation_of_id_not_in_cluster_is_rejected(self, tmp_path, monkeypatch):
         _force_offline_embeddings(monkeypatch)
         beam = BeamMemory(session_id="cite2", db_path=tmp_path / "cite2.db")
         _seed_facts(
             beam,
             [
-                {"fact_id": "ck-1", "subject": "penny", "predicate": "uses",
-                 "object": "python data analysis pipelines"},
-                {"fact_id": "ck-2", "subject": "penny", "predicate": "uses",
-                 "object": "python data analysis scripts"},
+                {
+                    "fact_id": "ck-1",
+                    "subject": "penny",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "ck-2",
+                    "subject": "penny",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
             ],
         )
         # Model cites an id that is NOT in the cluster.
@@ -1102,9 +1291,12 @@ class TestTruthfulCitations:
                 json.dumps(
                     [
                         {
-                            "subject": "penny", "predicate": "prefers",
-                            "object": "python", "confidence": 0.85,
-                            "action": "create", "target_source_id": None,
+                            "subject": "penny",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.85,
+                            "action": "create",
+                            "target_source_id": None,
                             "rationale": "r",
                             "cited_source_ids": ["ck-1", "FABRICATED"],
                         }
@@ -1112,11 +1304,211 @@ class TestTruthfulCitations:
                 )
             ]
         )
-        result = shmr.propose_harmony(
-            beam, llm_call=llm, similarity_threshold=0.3
-        )
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
         rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
         assert len(rows) == 0, (
             "proposal with an out-of-cluster cited id must be rejected"
         )
         assert result["proposals_rejected"] >= 1
+
+
+# ===========================================================================
+# Task 13: content-free degradation diagnostics (degraded_reasons)
+# ===========================================================================
+#
+# SHMR converts episodic fetch failure, embedding backend failure, and LLM
+# call failure into empty/fallback values. The terminal status vocabulary
+# (proposed | no_convergence | insufficient_candidates | rolled_back) cannot
+# distinguish "healthy system, nothing to consolidate" from "a backend broke
+# and consolidation silently degraded." The compatible repair is an additive
+# `degraded_reasons: list[str]` on every return dict, carrying static reason
+# codes only (no exception text, prompt, content, or model output).
+#
+# Required codes: episodic_fetch_failed, embedding_lexical_fallback,
+# llm_call_failed. A healthy run returns degraded_reasons == [].
+
+
+class TestDegradedReasons:
+    """Task 13: every propose_harmony result carries a content-free
+    ``degraded_reasons`` list, and each degradation seam appends a static
+    reason code."""
+
+    def test_llm_call_failure_records_reason_without_exception_text(
+        self, tmp_path, monkeypatch
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="llm-fail", db_path=tmp_path / "llmfail.db")
+        _seed_facts(
+            beam,
+            [
+                {
+                    "fact_id": "lf-1",
+                    "subject": "quinn",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines regularly",
+                },
+                {
+                    "fact_id": "lf-2",
+                    "subject": "quinn",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts often",
+                },
+            ],
+        )
+
+        def raising_llm(prompt, system=""):
+            raise RuntimeError("synthetic llm failure")
+
+        result = shmr.propose_harmony(
+            beam, llm_call=raising_llm, similarity_threshold=0.3
+        )
+
+        assert result["status"] == "no_convergence", result
+        assert result["proposals_persisted"] == 0, result
+        assert "degraded_reasons" in result, (
+            "result must carry degraded_reasons (Task 13)"
+        )
+        reasons = result["degraded_reasons"]
+        assert isinstance(reasons, list), (
+            f"degraded_reasons must be a list, got {type(reasons).__name__}"
+        )
+        assert "llm_call_failed" in reasons, f"expected llm_call_failed in {reasons}"
+        # Content-free: the raw exception message must not leak into the result.
+        result_blob = json.dumps(result, default=str)
+        assert "synthetic llm failure" not in result_blob, (
+            "raw exception text leaked into result"
+        )
+
+    def test_embedding_backend_failure_falls_back_and_records_reason(
+        self, tmp_path, monkeypatch
+    ):
+        # Force the embedding seam ON (not None) so _gather_candidates tries
+        # the dense path, then make that path raise so the lexical fallback
+        # runs and the reason is recorded.
+        def exploding_embed(_texts):
+            raise RuntimeError("embedding backend unreachable")
+
+        monkeypatch.setattr(shmr, "_embedding_fn", lambda: exploding_embed)
+        beam = BeamMemory(session_id="emb-fail", db_path=tmp_path / "embfail.db")
+        _seed_facts(
+            beam,
+            [
+                {
+                    "fact_id": "ef-1",
+                    "subject": "ruth",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "ef-2",
+                    "subject": "ruth",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
+            ],
+        )
+        llm = _RecordingLLM(["[]"])
+
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
+
+        # Lexical fallback must keep the run usable (cluster still formed).
+        assert result["clusters_found"] >= 1, result
+        assert "degraded_reasons" in result, result
+        reasons = result["degraded_reasons"]
+        assert isinstance(reasons, list), reasons
+        assert "embedding_lexical_fallback" in reasons, (
+            f"expected embedding_lexical_fallback in {reasons}"
+        )
+        # Content-free: no exception text in the result.
+        result_blob = json.dumps(result, default=str)
+        assert "embedding backend unreachable" not in result_blob
+
+    def test_episodic_fetch_denial_records_reason(self, tmp_path, monkeypatch):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="ep-deny", db_path=tmp_path / "epdeny.db")
+        # Seed enough fact candidates that the run reaches the proposal phase.
+        _seed_facts(
+            beam,
+            [
+                {
+                    "fact_id": "ep-1",
+                    "subject": "sam",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "ep-2",
+                    "subject": "sam",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
+            ],
+        )
+        llm = _RecordingLLM(["[]"])
+
+        sqlite3_mod = sqlite3
+        conn_ref = beam.conn
+
+        def deny_episodic_read(action, arg1, arg2, arg3, arg4):
+            # Deny only SQLITE_READ on episodic_memory; allow everything else.
+            if action == sqlite3_mod.SQLITE_READ and arg1 == "episodic_memory":
+                return sqlite3_mod.SQLITE_DENY
+            return sqlite3_mod.SQLITE_OK
+
+        try:
+            conn_ref.set_authorizer(deny_episodic_read)
+            result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
+        finally:
+            conn_ref.set_authorizer(None)
+
+        assert "degraded_reasons" in result, result
+        reasons = result["degraded_reasons"]
+        assert isinstance(reasons, list), reasons
+        assert "episodic_fetch_failed" in reasons, (
+            f"expected episodic_fetch_failed in {reasons}"
+        )
+
+    def test_healthy_run_returns_empty_degraded_reasons(self, tmp_path, monkeypatch):
+        _force_offline_embeddings(monkeypatch)
+        beam = BeamMemory(session_id="healthy", db_path=tmp_path / "healthy.db")
+        _seed_facts(
+            beam,
+            [
+                {
+                    "fact_id": "hl-1",
+                    "subject": "tess",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines",
+                },
+                {
+                    "fact_id": "hl-2",
+                    "subject": "tess",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts",
+                },
+            ],
+        )
+        llm = _RecordingLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "tess",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "r",
+                        }
+                    ]
+                )
+            ]
+        )
+
+        result = shmr.propose_harmony(beam, llm_call=llm, similarity_threshold=0.3)
+
+        assert result["status"] == "proposed", result
+        assert result["degraded_reasons"] == [], (
+            f"healthy run must have empty degraded_reasons, got {result['degraded_reasons']}"
+        )

@@ -26,8 +26,12 @@ logger = logging.getLogger("mnemosyne.shmr")
 # --- Config ---
 SHMR_BATCH_SIZE = int(os.environ.get("MNEMOSYNE_SHMR_BATCH_SIZE", "50"))
 SHMR_MAX_ITERATIONS = int(os.environ.get("MNEMOSYNE_SHMR_MAX_ITERATIONS", "3"))
-SHMR_SIMILARITY_THRESHOLD = float(os.environ.get("MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD", "0.70"))
-SHMR_HARMONY_THRESHOLD = float(os.environ.get("MNEMOSYNE_SHMR_HARMONY_THRESHOLD", "0.60"))
+SHMR_SIMILARITY_THRESHOLD = float(
+    os.environ.get("MNEMOSYNE_SHMR_SIMILARITY_THRESHOLD", "0.70")
+)
+SHMR_HARMONY_THRESHOLD = float(
+    os.environ.get("MNEMOSYNE_SHMR_HARMONY_THRESHOLD", "0.60")
+)
 SHMR_MODEL = os.environ.get("MNEMOSYNE_SHMR_MODEL", "")
 SHMR_MIN_CLUSTER_SIZE = int(os.environ.get("MNEMOSYNE_SHMR_MIN_CLUSTER_SIZE", "2"))
 SHMR_TEMPERATURE = float(os.environ.get("MNEMOSYNE_SHMR_TEMPERATURE", "0.2"))
@@ -215,6 +219,7 @@ def _call_llm(prompt: str, system: str = "") -> str:
     # Try local LLM first
     try:
         from mnemosyne.core.local_llm import _call_local_llm
+
         result = _call_local_llm(prompt, system=system, temperature=SHMR_TEMPERATURE)
         if result and len(result.strip()) > 10:
             return result
@@ -237,6 +242,7 @@ def _call_llm(prompt: str, system: str = "") -> str:
     # then never used.
     try:
         from mnemosyne.extraction import ExtractionClient
+
         client = ExtractionClient(model=SHMR_MODEL or None)
         messages = []
         if system:
@@ -264,8 +270,9 @@ def _compute_harmony_score(
         return 0.0
 
     # Compute cluster centroid
-    cluster_embs = np.array([item.get("embedding", np.zeros(EMBEDDING_DIM))
-                              for item in cluster])
+    cluster_embs = np.array(
+        [item.get("embedding", np.zeros(EMBEDDING_DIM)) for item in cluster]
+    )
     centroid = cluster_embs.mean(axis=0)
 
     # Score each belief against centroid
@@ -285,7 +292,9 @@ def _compute_harmony_score(
         belief_embs = []
         for b in beliefs:
             try:
-                belief_embs.append(_embed(f"{b.get('predicate','')} {b.get('object','')}"))
+                belief_embs.append(
+                    _embed(f"{b.get('predicate', '')} {b.get('object', '')}")
+                )
             except Exception:
                 belief_embs.append(np.zeros(EMBEDDING_DIM))
         belief_embs = np.array(belief_embs)
@@ -320,7 +329,7 @@ def _extract_json_from_llm_output(text: str) -> List[Dict]:
         pass
 
     # Try extracting from ```json ... ``` block
-    json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', text, re.DOTALL)
+    json_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
     if json_match:
         try:
             return json.loads(json_match.group(1))
@@ -328,7 +337,7 @@ def _extract_json_from_llm_output(text: str) -> List[Dict]:
             pass
 
     # Try extracting bare array
-    array_match = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
+    array_match = re.search(r"\[\s*\{.*?\}\s*\]", text, re.DOTALL)
     if array_match:
         try:
             return json.loads(array_match.group(0))
@@ -336,7 +345,7 @@ def _extract_json_from_llm_output(text: str) -> List[Dict]:
             pass
 
     # Fallback: parse line by line for { ... } objects
-    objects = re.findall(r'\{[^{}]*\}', text)
+    objects = re.findall(r"\{[^{}]*\}", text)
     results = []
     for obj_str in objects:
         try:
@@ -362,8 +371,12 @@ def _apply_beliefs(conn, beliefs, cluster, cluster_id):
     return None
 
 
-def harmonize(beam, batch_size: int = None, max_iterations: int = None,
-              similarity_threshold: float = None) -> Dict:
+def harmonize(
+    beam,
+    batch_size: int = None,
+    max_iterations: int = None,
+    similarity_threshold: float = None,
+) -> Dict:
     """Proposal-only SHMR cycle (Task 4 hardening).
 
     Historically this was the source-mutating entry point: it UPDATEd
@@ -394,12 +407,8 @@ def harmonize(beam, batch_size: int = None, max_iterations: int = None,
         similarity_threshold=similarity_threshold,
     )
     # Mirror legacy keys for any consumer that still reads them.
-    result.setdefault(
-        "beliefs_generated", result.get("proposals_persisted", 0)
-    )
-    result.setdefault(
-        "contradictions_resolved", result.get("proposals_rejected", 0)
-    )
+    result.setdefault("beliefs_generated", result.get("proposals_persisted", 0))
+    result.setdefault("contradictions_resolved", result.get("proposals_rejected", 0))
     result.setdefault("harmony_score_avg", 0.0)
     return result
 
@@ -417,13 +426,16 @@ def recall_beliefs(beam, query: str, top_k: int = 10) -> List[Dict]:
 
         # Search by embedding on object text
         results = []
-        rows = cursor.execute("""
+        rows = cursor.execute(
+            """
             SELECT belief_id, subject, predicate, object, confidence,
                    provenance, created_at
             FROM harmonic_beliefs
             ORDER BY confidence DESC
             LIMIT ?
-        """, (top_k * 2,)).fetchall()
+        """,
+            (top_k * 2,),
+        ).fetchall()
 
         # Score by embedding similarity
         scored = []
@@ -438,15 +450,17 @@ def recall_beliefs(beam, query: str, top_k: int = 10) -> List[Dict]:
         scored.sort(key=lambda x: x[0], reverse=True)
 
         for score, row in scored[:top_k]:
-            results.append({
-                "content": row["object"],
-                "score": round(score, 4),
-                "belief_id": row["belief_id"],
-                "subject": row["subject"],
-                "predicate": row["predicate"],
-                "provenance": row["provenance"],
-                "source": "harmonic_belief",
-            })
+            results.append(
+                {
+                    "content": row["object"],
+                    "score": round(score, 4),
+                    "belief_id": row["belief_id"],
+                    "subject": row["subject"],
+                    "predicate": row["predicate"],
+                    "provenance": row["provenance"],
+                    "source": "harmonic_belief",
+                }
+            )
 
         return results
     except Exception:
@@ -474,8 +488,9 @@ Based on these facts, provide a concise synthesis (2-4 sentences) that:
 SYNTHESIS:"""
 
 
-def reflect(beam, question: str, facts: List[Dict] = None,
-            top_k: int = 10) -> Optional[str]:
+def reflect(
+    beam, question: str, facts: List[Dict] = None, top_k: int = 10
+) -> Optional[str]:
     """Single-pass reflective synthesis over retrieved facts.
 
     Takes a question and a list of fact dicts (from fact_recall()), sends them
@@ -527,10 +542,13 @@ def get_resonance_log(beam, limit: int = 10) -> List[Dict]:
     cursor = beam.conn.cursor()
     _init_schema(beam.conn)
     try:
-        rows = cursor.execute("""
+        rows = cursor.execute(
+            """
             SELECT * FROM memory_resonance_log
             ORDER BY created_at DESC LIMIT ?
-        """, (limit,)).fetchall()
+        """,
+            (limit,),
+        ).fetchall()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -633,6 +651,7 @@ def _coerce_confidence(value, default: Optional[float] = None) -> Optional[float
     if f != f:  # NaN
         return None
     import math
+
     if not math.isfinite(f):
         return None
     return max(0.0, min(1.0, f))
@@ -684,7 +703,9 @@ def _row_scope(row: Dict, session_id: str) -> Dict:
     return scope
 
 
-def _gather_candidates(beam, batch_size: int) -> List[Dict]:
+def _gather_candidates(
+    beam, batch_size: int, degraded_reasons: Optional[List[str]] = None
+) -> List[Dict]:
     """Read echo candidates from the standard schema. Read-only.
 
     Pulls active facts and recent episodic memories for the beam's session.
@@ -710,7 +731,9 @@ def _gather_candidates(beam, batch_size: int) -> List[Dict]:
                 "subject": row["subject"],
                 "predicate": row["predicate"],
                 "object": row["object"],
-                "confidence": row["confidence"] if row["confidence"] is not None else 0.5,
+                "confidence": row["confidence"]
+                if row["confidence"] is not None
+                else 0.5,
                 "timestamp": row["timestamp"],
                 "session_id": row["session_id"] or beam.session_id,
                 "author_id": None,
@@ -728,6 +751,11 @@ def _gather_candidates(beam, batch_size: int) -> List[Dict]:
             (beam.session_id, max(1, batch_size // 2)),
         ).fetchall()
     except Exception:
+        if degraded_reasons is not None:
+            degraded_reasons.append("episodic_fetch_failed")
+        logger.debug(
+            "SHMR episodic fetch failed; continuing without episodic candidates"
+        )
         ep_rows = []
     for row in ep_rows:
         content = row["content"] or ""
@@ -740,11 +768,15 @@ def _gather_candidates(beam, batch_size: int) -> List[Dict]:
                 "subject": "memory",
                 "predicate": "contains",
                 "object": content[:300],
-                "confidence": row["importance"] if row["importance"] is not None else 0.5,
+                "confidence": row["importance"]
+                if row["importance"] is not None
+                else 0.5,
                 "timestamp": None,
                 "session_id": row["session_id"] or beam.session_id,
                 "author_id": row["author_id"] if "author_id" in row.keys() else None,
-                "author_type": row["author_type"] if "author_type" in row.keys() else None,
+                "author_type": row["author_type"]
+                if "author_type" in row.keys()
+                else None,
                 "channel_id": row["channel_id"] if "channel_id" in row.keys() else None,
             }
         )
@@ -759,11 +791,18 @@ def _gather_candidates(beam, batch_size: int) -> List[Dict]:
         try:
             texts = [c["object"] for c in candidates]
             embs = embed_fn(texts)
-            if embs is not None and hasattr(embs, "shape") and embs.shape[0] == len(candidates):
+            if (
+                embs is not None
+                and hasattr(embs, "shape")
+                and embs.shape[0] == len(candidates)
+            ):
                 for i, c in enumerate(candidates):
                     c["embedding"] = embs[i].astype(np.float32).flatten()
                 dense_used = True
         except Exception:
+            if degraded_reasons is not None:
+                degraded_reasons.append("embedding_lexical_fallback")
+            logger.debug("SHMR dense embedding failed; using lexical fallback")
             dense_used = False
     if not dense_used:
         for c in candidates:
@@ -873,14 +912,17 @@ def propose_harmony(
     t0 = time.perf_counter()
     batch_size = batch_size or SHMR_BATCH_SIZE
     similarity_threshold = (
-        SHMR_SIMILARITY_THRESHOLD if similarity_threshold is None else similarity_threshold
+        SHMR_SIMILARITY_THRESHOLD
+        if similarity_threshold is None
+        else similarity_threshold
     )
     min_cluster_size = (
         SHMR_MIN_CLUSTER_SIZE if min_cluster_size is None else min_cluster_size
     )
 
     _init_proposal_schema(beam.conn)
-    candidates = _gather_candidates(beam, batch_size)
+    degraded_reasons: List[str] = []
+    candidates = _gather_candidates(beam, batch_size, degraded_reasons)
 
     if len(candidates) < min_cluster_size:
         return {
@@ -889,6 +931,7 @@ def propose_harmony(
             "proposals_rejected": 0,
             "duration_ms": int((time.perf_counter() - t0) * 1000),
             "status": "insufficient_candidates",
+            "degraded_reasons": degraded_reasons,
         }
 
     # Finding 5: partition by provenance BEFORE clustering so mixed scope is
@@ -896,11 +939,12 @@ def propose_harmony(
     all_clusters: List[List[Dict]] = []
     for part in _partition_by_scope(candidates).values():
         all_clusters.extend(
-            c for c in _cluster_by_similarity(part, similarity_threshold)
+            c
+            for c in _cluster_by_similarity(part, similarity_threshold)
             if len(c) >= min_cluster_size
         )
 
-    run_id = f"shmr_{int(time.time()*1000)}"
+    run_id = f"shmr_{int(time.time() * 1000)}"
     total_persisted = 0
     total_rejected = 0
     any_cluster_proposed = False
@@ -923,6 +967,8 @@ def propose_harmony(
         try:
             raw = llm_call(prompt)
         except Exception:
+            degraded_reasons.append("llm_call_failed")
+            logger.debug("SHMR LLM call failed for cluster %s", cluster_id)
             raw = ""
         beliefs = _extract_json_from_llm_output(raw) if raw else []
 
@@ -1043,9 +1089,7 @@ def propose_harmony(
             beam.conn.execute("RELEASE SAVEPOINT shmr_run")
             total_persisted = len(plans)
         except Exception as exc:
-            logger.warning(
-                "SHMR run %s rolled back: %s", run_id, exc, exc_info=False
-            )
+            logger.warning("SHMR run %s rolled back: %s", run_id, exc, exc_info=False)
             rollback_reason = str(exc)
             try:
                 beam.conn.execute("ROLLBACK TO SAVEPOINT shmr_run")
@@ -1054,9 +1098,7 @@ def propose_harmony(
                 # Do NOT swallow a rollback failure. Surface it as a distinct
                 # reason so the caller knows the transaction state may be
                 # dirty, rather than silently claiming rolled_back.
-                rollback_reason = (
-                    f"{exc} (rollback also failed: {rb_exc})"
-                )
+                rollback_reason = f"{exc} (rollback also failed: {rb_exc})"
             return {
                 "clusters_found": len(all_clusters),
                 "proposals_persisted": 0,
@@ -1064,6 +1106,7 @@ def propose_harmony(
                 "duration_ms": int((time.perf_counter() - t0) * 1000),
                 "status": "rolled_back",
                 "failure_reason": rollback_reason,
+                "degraded_reasons": degraded_reasons,
             }
 
     return {
@@ -1072,4 +1115,5 @@ def propose_harmony(
         "proposals_rejected": total_rejected,
         "duration_ms": int((time.perf_counter() - t0) * 1000),
         "status": "proposed" if any_cluster_proposed else "no_convergence",
+        "degraded_reasons": degraded_reasons,
     }
