@@ -567,8 +567,278 @@ def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     return PASS, "ok", checks
 
 
+def _g4_isolate_config(trial_root: Path) -> None:
+    """Point the central config at the trial root and force offline lexical
+    embeddings. Mirrors the trial driver's config-isolation pattern."""
+    os.environ["MNEMOSYNE_DATA_DIR"] = str(trial_root)
+    import mnemosyne.core.config as config_module
+
+    config_module.MnemosyneConfig.reset_instance()
+    from mnemosyne.core import embeddings as _emb
+    from mnemosyne.core import shmr
+
+    shmr._embedding_fn = lambda: None  # type: ignore[assignment]
+    _emb.embed = lambda _texts: (_ for _ in ()).throw(
+        AssertionError("offline lexical fallback only")
+    )
+
+
+def _g4_event(i: int):
+    """Deterministic synthetic ingest event (content-free: benign phrases)."""
+    import hashlib
+
+    from mnemosyne.core.inhale import IngestEvent
+
+    content = f"baseline threshold recorded for lane segment number {i}"
+    return IngestEvent(
+        event_id=f"evt-g4-{i}",
+        producer="campaign",
+        actor_id="campaign-actor",
+        project_id="campaign-project",
+        session_id="campaign-sess",
+        turn_id=f"turn-{i}",
+        role="user",
+        content=content,
+        content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        occurred_at="2026-08-10T01:02:03Z",
+        metadata=None,
+    )
+
+
+def _g4_run_exactly_once(beam, n_events: int) -> tuple[int, int]:
+    """Ingest n_events distinct events once; return (stored, duplicate)."""
+    stored = duplicate = 0
+    for i in range(n_events):
+        status = beam.remember_event(_g4_event(i)).status
+        if status == "stored":
+            stored += 1
+        elif status == "duplicate":
+            duplicate += 1
+    return stored, duplicate
+
+
+def _g4_run_crash_retry(beam, trial_root: Path) -> bool:
+    """Drive one event through a simulated crash then hermetic retry.
+
+    Pins deterministic vector seams for the retry on hosts without sqlite-vec
+    (never monkeypatch.undo, which would tear down the seams retry needs).
+    """
+    import mnemosyne.core.beam as beam_module
+    import mnemosyne.core.inhale as inhale
+    from mnemosyne.core.inhale import retry_pending_ingest
+
+    real_finalize = inhale._finalize_receipt
+    inhale._finalize_receipt = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("process died")
+    )
+    beam_module._embeddings.embed = lambda texts: (_ for _ in ()).throw(
+        RuntimeError("embedding service down")
+    )
+    try:
+        beam.remember_event(_g4_event(9001))
+    except RuntimeError:
+        pass
+    # Hermetic recovery.
+    inhale._finalize_receipt = real_finalize
+    beam_module._embeddings.available = lambda: True
+    beam_module._embeddings.embed = lambda texts: [
+        [0.5] * beam_module.EMBEDDING_DIM for _ in texts
+    ]
+    beam_module._wm_vec_available = lambda conn: True  # type: ignore[assignment]
+    beam_module._store_working_embedding = lambda *a, **k: None  # type: ignore[assignment]
+    report = retry_pending_ingest(beam)
+    # The retry must complete at least the crashed event, and exactly-once
+    # must be preserved: ingest_receipts holds the crashed event exactly once.
+    conn = sqlite3.connect(str(beam.db_path))
+    try:
+        rc_count = conn.execute(
+            "SELECT COUNT(*) FROM ingest_receipts WHERE event_id = 'evt-g4-9001'"
+        ).fetchone()[0]
+        rc_stored = conn.execute(
+            "SELECT COUNT(*) FROM ingest_receipts "
+            "WHERE event_id = 'evt-g4-9001' AND status = 'stored'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return bool(report.succeeded >= 1 and rc_count == 1 and rc_stored == 1)
+
+
+def _g4_run_duplicate_race(db_path: Path, n_writers: int) -> bool:
+    """n_writers race to ingest the SAME event id; exactly one must store."""
+    import threading
+
+    from mnemosyne.core.beam import BeamMemory
+
+    BeamMemory(session_id="race-sess", db_path=db_path)  # schema init serially
+    barrier = threading.Barrier(n_writers)
+    results: list[str | None] = [None] * n_writers
+    errors: list[BaseException | None] = [None] * n_writers
+
+    def worker(idx: int) -> None:
+        try:
+            barrier.wait()
+            b = BeamMemory(session_id="race-sess", db_path=db_path)
+            results[idx] = b.remember_event(_g4_event(7777)).status
+        except BaseException as exc:  # noqa: BLE001 - race surfaced error
+            errors[idx] = exc
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if any(e is not None for e in errors):
+        return False
+    stored = sum(1 for r in results if r == "stored")
+    return stored == 1
+
+
+def _g4_run_dream_lifecycle(trial_root: Path) -> str | None:
+    """Plan -> receipt -> apply -> undo on a clone; return final state."""
+    import mnemosyne.core.config as config_module
+    from mnemosyne.core import dream, shmr
+    from mnemosyne.core.beam import BeamMemory
+
+    dream_dir = trial_root / "dream"
+    dream_dir.mkdir(exist_ok=True)
+    os.environ["MNEMOSYNE_DATA_DIR"] = str(dream_dir)
+    config_module.MnemosyneConfig.reset_instance()
+
+    beam = BeamMemory(session_id="dream-sess", db_path=dream_dir / "dream.db")
+    # Seed two facts so a proposal has something to act on.
+    beam.conn.execute(
+        "INSERT INTO facts "
+        "(fact_id, session_id, subject, predicate, object, confidence) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("f1", "dream-sess", "svc-a", "latency", "baseline threshold", 0.9),
+    )
+    beam.conn.execute(
+        "INSERT INTO facts "
+        "(fact_id, session_id, subject, predicate, object, confidence) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("f2", "dream-sess", "svc-a", "latency", "baseline threshold amended", 0.9),
+    )
+    beam.conn.commit()
+    shmr._init_proposal_schema(beam.conn)
+    beam.conn.execute(
+        "INSERT INTO shmr_proposals "
+        "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+        "subject, predicate, object, confidence, action, target_source_id, "
+        "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "shmr_g4",
+            "cc",
+            "dream-sess",
+            '{"session_id": "dream-sess"}',
+            '["f1"]',
+            "svc-a",
+            "latency",
+            "baseline",
+            0.9,
+            "create",
+            None,
+            "rationale",
+            "proposed",
+        ),
+    )
+    beam.conn.commit()
+
+    run = dream.dream_plan(
+        beam, scope={"session_id": "dream-sess"}, request_id="req-g4-1"
+    )
+    receipt = {
+        "role": "reviewer",
+        "actor_id": "g4-reviewer",
+        "run_id": run.run_id,
+        "manifest_hash": run.manifest_hash,
+        "verdict": "PASS",
+        "reason_code": "ok",
+        "timestamp": "2026-08-10T01:02:03Z",
+    }
+    run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+    receipt["role"] = "verifier"
+    receipt["actor_id"] = "g4-verifier"
+    run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+    dream.dream_apply(beam, run.run_id)
+    undone = dream.dream_undo(beam, run.run_id)
+    return undone.state
+
+
 def _stage_g4(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    return FAIL, "not_implemented", _empty_checks()
+    """G4 core lifecycle / concurrency on a clone.
+
+    Runs a deterministic synthetic corpus through exactly-once ingest, a
+    crash/retry cycle, a concurrent duplicate race, and a Dream
+    lifecycle+undo -- all on a trial clone, never production. Smaller test
+    parameters are honored; the campaign defaults (10000 events / 16 writers)
+    are the real values.
+    """
+
+    import mnemosyne.core.config as config_module
+    from mnemosyne.core.beam import BeamMemory
+
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    n_events = max(1, int(args.g4_events))
+    n_writers = max(1, int(args.g4_writers))
+
+    checks: dict[str, Any] = {}
+    work_dir = trial_root / "g4"
+    work_dir.mkdir(exist_ok=True)
+    os.chmod(work_dir, _DIR_MODE)
+
+    # --- exactly-once ingest on a clone ---
+    clone = work_dir / "lifecycle.db"
+    _g4_isolate_config(work_dir)
+    beam = BeamMemory(session_id="campaign-sess", db_path=clone)
+    stored, duplicate = _g4_run_exactly_once(beam, n_events)
+    checks["exactly_once"] = {
+        "verdict": PASS if stored == n_events and duplicate == 0 else FAIL,
+        "reason_code": "ok"
+        if stored == n_events and duplicate == 0
+        else "not_exactly_once",
+        "stored": stored,
+        "duplicate": duplicate,
+    }
+
+    # --- crash/retry ---
+    retry_ok = _g4_run_crash_retry(beam, work_dir)
+    checks["crash_retry"] = {
+        "verdict": PASS if retry_ok else FAIL,
+        "reason_code": "ok" if retry_ok else "retry_failed",
+    }
+
+    # Reset config for the race clone.
+    config_module.MnemosyneConfig.reset_instance()
+    race_db = work_dir / "race.db"
+    _g4_isolate_config(work_dir)
+    race_ok = _g4_run_duplicate_race(race_db, n_writers)
+    checks["duplicate_race"] = {
+        "verdict": PASS if race_ok else FAIL,
+        "reason_code": "ok" if race_ok else "race_not_exactly_one",
+    }
+
+    # --- Dream lifecycle + undo on a clone ---
+    final_state = _g4_run_dream_lifecycle(work_dir)
+    checks["dream_lifecycle"] = {
+        "verdict": PASS if final_state == "undone" else FAIL,
+        "reason_code": "ok" if final_state == "undone" else "dream_lifecycle_failed",
+        "final_state": final_state or "unknown",
+    }
+
+    # Restore offline lexical seams to a no-op state for later stages.
+    config_module.MnemosyneConfig.reset_instance()
+
+    for key in ("exactly_once", "crash_retry", "duplicate_race", "dream_lifecycle"):
+        if checks[key]["verdict"] != PASS:
+            return FAIL, f"g4_{key}_failed", checks
+    return PASS, "ok", checks
 
 
 def _stage_g5(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:

@@ -496,3 +496,123 @@ class TestG8RollbackRehearsal:
             str(trial / "nope.db"),
         )
         assert code == 1
+
+
+# ===========================================================================
+# Commit 4: G4 core lifecycle / concurrency
+# ===========================================================================
+
+
+def _seed_clone_for_g4(trial_root: Path) -> Path:
+    """Make a trial clone DB for G4 (no BeamMemory wiring yet)."""
+    from mnemosyne.core.memory import init_db
+
+    clones = trial_root / "clones"
+    clones.mkdir(exist_ok=True)
+    clone = clones / "g4.db"
+    init_db(clone)
+    return clone
+
+
+class TestG4CoreLifecycle:
+    def test_g4_passes_with_small_params_and_records_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g4",
+            trial,
+            monkeypatch,
+            "--g4-events",
+            "12",
+            "--g4-writers",
+            "3",
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["verdict"] == lpc.PASS
+        checks = report["checks"]
+        assert checks["exactly_once"]["verdict"] == PASS
+        # 12 distinct events -> 12 stored, 0 duplicates expected on first run.
+        assert checks["exactly_once"]["stored"] == 12
+        assert checks["exactly_once"]["duplicate"] == 0
+
+    def test_g4_crash_retry_completes_once(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g4",
+            trial,
+            monkeypatch,
+            "--g4-events",
+            "5",
+            "--g4-writers",
+            "1",
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["checks"]["crash_retry"]["verdict"] == PASS
+
+    def test_g4_concurrent_duplicate_race_exactly_one(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g4",
+            trial,
+            monkeypatch,
+            "--g4-events",
+            "8",
+            "--g4-writers",
+            "4",
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert report["checks"]["duplicate_race"]["verdict"] == PASS
+
+    def test_g4_dream_lifecycle_and_undo_on_clone(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g4",
+            trial,
+            monkeypatch,
+            "--g4-events",
+            "4",
+            "--g4-writers",
+            "1",
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        checks = report["checks"]
+        assert checks["dream_lifecycle"]["verdict"] == PASS
+        # Applied then undone -> final state is undone.
+        assert checks["dream_lifecycle"]["final_state"] == "undone"
+
+    def test_g4_content_free(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        _, report_path = _run_stage(
+            "g4", trial, monkeypatch, "--g4-events", "3", "--g4-writers", "1"
+        )
+        report = _read_report(report_path)
+        _assert_content_free(json.dumps(report))
+        _assert_allowlist(report)
+
+    def test_g4_fails_without_trial_root(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"  # not created
+        report_path = trial / "r.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "lpc.py",
+                "--trial-root",
+                str(trial),
+                "--report",
+                str(report_path),
+                "--stage",
+                "g4",
+            ],
+        )
+        assert lpc.main() == 1
