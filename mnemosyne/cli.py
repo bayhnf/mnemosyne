@@ -1644,6 +1644,43 @@ def _serialize_dataclass(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
+def _dream_run_projection(run) -> dict:
+    """Content-free curated JSON projection of a DreamRun.
+
+    NEVER includes raw manifest, actions, before/after images, content,
+    config audit, or unbounded failure text. Only durable identifiers, state,
+    scope, manifest hash, checkpoint, error code, safe timestamps, and receipt
+    role/status counts.
+    """
+    receipt_counts: dict = {}
+    raw_receipts = getattr(run, "receipts", None) or []
+    if isinstance(raw_receipts, list):
+        for r in raw_receipts:
+            if not isinstance(r, dict):
+                continue
+            role = r.get("role", "unknown")
+            verdict = r.get("verdict", "unknown")
+            key = f"{role}:{verdict}"
+            receipt_counts[key] = receipt_counts.get(key, 0) + 1
+    action_count = 0
+    raw_actions = getattr(run, "actions", None)
+    if isinstance(raw_actions, list):
+        action_count = len(raw_actions)
+    return {
+        "run_id": run.run_id,
+        "state": run.state,
+        "scope": getattr(run, "scope", {}) or {},
+        "manifest_hash": getattr(run, "manifest_hash", "") or "",
+        "checkpoint": getattr(run, "checkpoint", "") or "",
+        "error_code": getattr(run, "error_code", None),
+        "created_at": getattr(run, "created_at", "") or "",
+        "updated_at": getattr(run, "updated_at", "") or "",
+        "request_id": getattr(run, "request_id", None),
+        "action_count": action_count,
+        "receipt_counts": receipt_counts,
+    }
+
+
 _INGEST_USAGE = (
     "Usage: mnemosyne ingest --event-id ID --producer P --actor-id A "
     "--project-id P --session-id S --turn-id T --role R --content C "
@@ -1676,7 +1713,7 @@ def cmd_ingest(args):
             i += 1
             continue
         if arg in flags:
-            if i + 1 >= len(args):
+            if i + 1 >= len(args) or args[i + 1].startswith("--"):
                 _fail(f"{arg} requires a value")
             flags[arg] = args[i + 1]
             i += 2
@@ -1875,6 +1912,10 @@ def cmd_recall(args):
             print()
         return
 
+    if "--explain" in args:
+        _fail("--explain is not supported with bounded recall options "
+              "(RecallEnvelope explanation is not yet implemented)")
+
     # Bounded path.
     query_parts = []
     json_output = False
@@ -2016,7 +2057,7 @@ def cmd_reclaim_orphans(args):
         else:
             _fail(f"Unknown reclaim-orphans option: {arg}")
 
-    if not dry_run and "--dry-run" in args and "--apply" in args:
+    if "--apply" in args and "--dry-run" in args:
         _fail("--apply and --dry-run cannot be used together")
 
     mem = _get_memory()
@@ -2076,11 +2117,8 @@ def cmd_dream(args):
             elif arg == "--request-id":
                 request_id, i = _require_value(rest, i, "--request-id", lambda v, _n: v)
             elif arg == "--limits":
-                raw, i = _require_value(rest, i, "--limits", lambda v, _n: v)
-                try:
-                    limits = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    _fail(f"--limits must be valid JSON: {exc}")
+                _fail("--limits is not supported; the core Dream planner "
+                      "ignores it (Task 6A boundary check)")
             elif arg == "--json":
                 json_output = True
                 i += 1
@@ -2090,7 +2128,7 @@ def cmd_dream(args):
             _fail("--session-id is required for dream plan")
         run = mem.dream_plan(scope=scope, limits=limits, request_id=request_id)
         if json_output:
-            print(_serialize_dataclass(run))
+            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
         else:
             print(f"Dream plan: run_id={run.run_id} state={run.state}")
             if run.error_code:
@@ -2105,7 +2143,7 @@ def cmd_dream(args):
         run_id = None
         manifest_hash = None
         actor_id = None
-        verdict = "PASS"
+        verdict = None
         reason_code = "ok"
         json_output = False
         i = 0
@@ -2130,8 +2168,10 @@ def cmd_dream(args):
             _fail("--run-id is required for dream " + sub)
         if not actor_id:
             _fail("--actor-id is required for dream " + sub)
+        if verdict is None:
+            _fail(f"--verdict is required for dream {sub} (PASS or FAIL)")
         if verdict not in ("PASS", "FAIL"):
-            _fail("--verdict must be PASS or FAIL")
+            _fail(f"--verdict must be PASS or FAIL, got: {verdict}")
 
         from datetime import datetime, timezone
         receipt = {
@@ -2149,7 +2189,7 @@ def cmd_dream(args):
             receipt["manifest_hash"] = existing.manifest_hash or ""
         run = mem.dream_submit_receipt(run_id, receipt)
         if json_output:
-            print(_serialize_dataclass(run))
+            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
         else:
             print(f"Dream {sub}: run_id={run.run_id} state={run.state}")
             if run.error_code:
@@ -2174,7 +2214,7 @@ def cmd_dream(args):
             _fail("--run-id is required for dream status")
         run = mem.dream_status(run_id)
         if json_output:
-            print(_serialize_dataclass(run))
+            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
         else:
             print(f"Dream status: run_id={run.run_id} state={run.state}")
             if run.error_code:
@@ -2197,7 +2237,7 @@ def cmd_dream(args):
             _fail("--run-id is required for dream resume")
         run = mem.dream_resume(run_id)
         if json_output:
-            print(_serialize_dataclass(run))
+            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
         else:
             print(f"Dream resume: run_id={run.run_id} state={run.state}")
 
@@ -2218,7 +2258,7 @@ def cmd_dream(args):
             _fail("--run-id is required for dream apply")
         run = mem.dream_apply(run_id)
         if json_output:
-            print(_serialize_dataclass(run))
+            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
         else:
             print(f"Dream apply: run_id={run.run_id} state={run.state}")
         if run.state in ("failed_terminal", "rejected"):
@@ -2241,7 +2281,7 @@ def cmd_dream(args):
             _fail("--run-id is required for dream undo")
         run = mem.dream_undo(run_id)
         if json_output:
-            print(_serialize_dataclass(run))
+            print(json.dumps(_dream_run_projection(run), ensure_ascii=False, default=str))
         else:
             print(f"Dream undo: run_id={run.run_id} state={run.state}")
 
@@ -2338,6 +2378,12 @@ def run_cli():
         print("  hygiene audit|clean                  Noise audit and safe cleanup")
         print("  profile list|apply|show|create       Config templates (gamified)")
         print("  config reload|get|set|migrate         Manage config.yaml")
+        print("  ingest --event-id ID ...              Durably ingest one event (receipt-backed)")
+        print("  ingest-status [--event-id ID]         Show content-free ingest receipt status")
+        print("  ingest-retry [--limit N]              Re-run indexing for non-ready receipts")
+        print("  recall <query> [--max-tokens N ...]   Search (bounded options -> RecallEnvelope)")
+        print("  reclaim-orphans [--apply]             Clear stale sleep claims (dry-run by default)")
+        print("  dream plan|review|verify|status|resume|apply|undo  Native Dream lifecycle")
         return
 
     command = sys.argv[1]

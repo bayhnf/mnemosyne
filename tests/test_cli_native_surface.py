@@ -481,3 +481,325 @@ class TestCLIBoundaryErrors:
         ], tmp_path)
         assert r.returncode == 2
         assert "Traceback" not in r.stderr
+
+
+# ===========================================================================
+# Task 6A fix round 1: DeepSeek review findings
+# ===========================================================================
+
+
+class TestCLIDreamLifecycleIntegration:
+    """P1: genuine CLI Dream review/verify lifecycle coverage.
+
+    Seeds shmr_proposals + matching facts directly into the DB so the CLI
+    subprocess can plan without an LLM, then drives review/verify through
+    the CLI and asserts the state machine.
+    """
+
+    def _seed_proposals(self, tmp_path):
+        """Seed facts + shmr_proposals so dream plan finds eligible actions."""
+        env = os.environ.copy()
+        env["HOME"] = str(tmp_path / "home")
+        data_dir = tmp_path / "mnemosyne-data"
+        env["MNEMOSYNE_DATA_DIR"] = str(data_dir)
+        db_path = data_dir / "mnemosyne.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        from mnemosyne.core.beam import BeamMemory
+        from mnemosyne.core.shmr import _init_schema, PROPOSAL_SCHEMA_SQL
+        beam = BeamMemory(session_id="dream-int-sess", db_path=db_path)
+        # Ensure shmr_proposals table exists (normally created lazily by
+        # propose_harmony, which we bypass by seeding directly).
+        _init_schema(beam.conn)
+        beam.conn.executescript(PROPOSAL_SCHEMA_SQL)
+        beam.conn.execute(
+            "INSERT INTO facts "
+            "(fact_id, session_id, subject, predicate, object, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("ifact1", "dream-int-sess", "alice", "likes", "rust lang", 0.9),
+        )
+        beam.conn.execute(
+            "INSERT INTO facts "
+            "(fact_id, session_id, subject, predicate, object, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("ifact2", "dream-int-sess", "alice", "likes", "rust programming", 0.9),
+        )
+        beam.conn.execute(
+            "INSERT INTO facts "
+            "(fact_id, session_id, subject, predicate, object, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("ifact3", "dream-int-sess", "bob", "uses", "python daily", 0.9),
+        )
+        beam.conn.execute(
+            "INSERT INTO facts "
+            "(fact_id, session_id, subject, predicate, object, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("ifact4", "dream-int-sess", "bob", "uses", "python regularly", 0.9),
+        )
+        beam.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "seed-run-1", "c1", "dream-int-sess",
+                json.dumps({"session_id": "dream-int-sess"}),
+                json.dumps(["ifact1", "ifact2"]),
+                "alice", "prefers", "rust", 0.9, "create",
+                "ifact1", "seeded cluster", "proposed",
+            ),
+        )
+        beam.conn.execute(
+            "INSERT INTO shmr_proposals "
+            "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+            "subject, predicate, object, confidence, action, target_source_id, "
+            "rationale, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "seed-run-1", "c2", "dream-int-sess",
+                json.dumps({"session_id": "dream-int-sess"}),
+                json.dumps(["ifact3", "ifact4"]),
+                "bob", "prefers", "python", 0.88, "create",
+                "ifact3", "seeded cluster", "proposed",
+            ),
+        )
+        beam.conn.commit()
+        beam.conn.close()
+        return db_path
+
+    def test_plan_review_verify_ready_lifecycle(self, tmp_path):
+        self._seed_proposals(tmp_path)
+        # Plan
+        r = run_cli(
+            ["dream", "plan", "--session-id", "dream-int-sess", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        plan_payload = json.loads(r.stdout)
+        assert plan_payload["state"] == "awaiting_approval"
+        assert plan_payload["manifest_hash"]
+        run_id = plan_payload["run_id"]
+
+        # Review with actor A, PASS
+        r = run_cli(
+            ["dream", "review", "--run-id", run_id, "--actor-id", "revA",
+             "--verdict", "PASS", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        review_payload = json.loads(r.stdout)
+        assert review_payload["state"] == "awaiting_approval"
+
+        # Verify with actor B (distinct), PASS -> ready
+        r = run_cli(
+            ["dream", "verify", "--run-id", run_id, "--actor-id", "verB",
+             "--verdict", "PASS", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        verify_payload = json.loads(r.stdout)
+        assert verify_payload["state"] == "ready"
+
+    def test_same_actor_review_verify_rejected(self, tmp_path):
+        self._seed_proposals(tmp_path)
+        r = run_cli(
+            ["dream", "plan", "--session-id", "dream-int-sess", "--json"],
+            tmp_path,
+        )
+        run_id = json.loads(r.stdout)["run_id"]
+
+        # Review with actor A
+        run_cli(
+            ["dream", "review", "--run-id", run_id, "--actor-id", "sameActor",
+             "--verdict", "PASS", "--json"],
+            tmp_path,
+        )
+        # Verify with same actor -> rejected (state goes to rejected)
+        r = run_cli(
+            ["dream", "verify", "--run-id", run_id, "--actor-id", "sameActor",
+             "--verdict", "PASS", "--json"],
+            tmp_path,
+        )
+        assert r.returncode != 0
+        payload = json.loads(r.stdout)
+        assert payload["state"] == "rejected"
+
+    def test_wrong_manifest_hash_rejected(self, tmp_path):
+        self._seed_proposals(tmp_path)
+        r = run_cli(
+            ["dream", "plan", "--session-id", "dream-int-sess", "--json"],
+            tmp_path,
+        )
+        run_id = json.loads(r.stdout)["run_id"]
+
+        r = run_cli(
+            ["dream", "review", "--run-id", run_id, "--actor-id", "revA",
+             "--manifest-hash", "deadbeef" * 8,
+             "--verdict", "PASS", "--json"],
+            tmp_path,
+        )
+        assert r.returncode != 0
+        payload = json.loads(r.stdout)
+        assert payload["state"] == "rejected"
+
+
+class TestDreamJSONProjection:
+    """P2: --json output must be content-free curated projection."""
+
+    def test_plan_json_has_no_manifest_actions_or_content(self, tmp_path):
+        # Use a no-candidates plan (no seeding needed); the projection must
+        # still be curated.
+        r = run_cli(
+            ["dream", "plan", "--session-id", "empty-sess", "--json"],
+            tmp_path,
+        )
+        assert r.returncode == 0, r.stderr
+        payload = json.loads(r.stdout)
+        # Allowed keys: durable identifiers/state/scope/manifest_hash/
+        # checkpoint/error code/safe timestamps/receipt counts.
+        for forbidden in ("manifest", "actions", "receipts", "before_image",
+                          "after_image", "content", "config"):
+            assert forbidden not in payload, (
+                f"dream --json must not include '{forbidden}': {payload!r}"
+            )
+        # Must include safe identifiers.
+        for required in ("run_id", "state", "manifest_hash"):
+            assert required in payload, f"missing {required}: {payload!r}"
+
+    def test_status_json_has_no_manifest_or_actions(self, tmp_path):
+        r = run_cli(
+            ["dream", "plan", "--session-id", "empty-sess-2", "--json"],
+            tmp_path,
+        )
+        run_id = json.loads(r.stdout)["run_id"]
+        r = run_cli(["dream", "status", "--run-id", run_id, "--json"], tmp_path)
+        assert r.returncode == 0, r.stderr
+        payload = json.loads(r.stdout)
+        for forbidden in ("manifest", "actions", "receipts"):
+            assert forbidden not in payload
+
+    def test_review_json_has_receipt_summary_not_details(self, tmp_path):
+        # Plan then review with FAIL — the JSON must not leak raw receipt.
+        r = run_cli(
+            ["dream", "plan", "--session-id", "empty-sess-3", "--json"],
+            tmp_path,
+        )
+        run_id = json.loads(r.stdout)["run_id"]
+        # This will be rejected because there's nothing to review (state is
+        # already terminal), but the JSON projection must still be curated.
+        r = run_cli(
+            ["dream", "review", "--run-id", run_id, "--actor-id", "revA",
+             "--verdict", "FAIL", "--json"],
+            tmp_path,
+        )
+        payload = json.loads(r.stdout)
+        # receipts as a raw list must never appear; a count is OK.
+        assert "receipts" not in payload
+        # A receipt_count or receipt_summary is acceptable.
+        assert "actions" not in payload
+
+
+class TestDreamLimitsRejected:
+    """P2: --limits accepted but core ignores it; reject at CLI boundary."""
+
+    def test_dream_plan_limits_exits_2(self, tmp_path):
+        r = run_cli(
+            ["dream", "plan", "--session-id", "x", "--limits", "{}"],
+            tmp_path,
+        )
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+        assert "limits" in r.stderr.lower() or "unsupported" in r.stderr.lower()
+
+
+class TestDreamVerdictRequired:
+    """P2: review/verify must require explicit --verdict."""
+
+    def test_review_missing_verdict_exits_2(self, tmp_path):
+        r = run_cli(
+            ["dream", "review", "--run-id", "x", "--actor-id", "a"],
+            tmp_path,
+        )
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+        assert "verdict" in r.stderr.lower()
+
+    def test_verify_missing_verdict_exits_2(self, tmp_path):
+        r = run_cli(
+            ["dream", "verify", "--run-id", "x", "--actor-id", "a"],
+            tmp_path,
+        )
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+        assert "verdict" in r.stderr.lower()
+
+    def test_review_invalid_verdict_exits_2(self, tmp_path):
+        r = run_cli(
+            ["dream", "review", "--run-id", "x", "--actor-id", "a",
+             "--verdict", "MAYBE"],
+            tmp_path,
+        )
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+
+
+class TestBoundedRecallExplainRejected:
+    """P3: bounded recall --explain must not silently no-op."""
+
+    def test_bounded_recall_explain_exits_2(self, tmp_path):
+        r = run_cli(
+            ["recall", "query", "--max-tokens", "50", "--explain"],
+            tmp_path,
+        )
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+        assert "explain" in r.stderr.lower()
+
+
+class TestReclaimOrphansApplyDryRunOrder:
+    """P3: reject --apply + --dry-run in either order."""
+
+    def test_apply_then_dry_run_rejected(self, tmp_path):
+        r = run_cli(["reclaim-orphans", "--apply", "--dry-run"], tmp_path)
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+
+    def test_dry_run_then_apply_rejected(self, tmp_path):
+        r = run_cli(["reclaim-orphans", "--dry-run", "--apply"], tmp_path)
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+
+
+class TestIngestNextFlagAsValue:
+    """P3: cmd_ingest must reject a next flag as a missing value."""
+
+    def test_ingest_flag_value_is_next_flag_exits_2(self, tmp_path):
+        # --producer is followed by --actor-id: must reject, not silently
+        # consume --actor-id as the producer value.
+        r = run_cli(
+            ["ingest",
+             "--event-id", "evt-x",
+             "--producer", "--actor-id",
+             "--actor-id", "a1",
+             "--project-id", "p1",
+             "--session-id", "s1",
+             "--turn-id", "t1",
+             "--role", "user",
+             "--content", "hello",
+             "--occurred-at", "2026-08-10T01:02:03Z"],
+            tmp_path,
+        )
+        assert r.returncode == 2
+        assert "Traceback" not in r.stderr
+
+
+class TestCLIHelpDiscoverability:
+    """P3: new commands appear in CLI help."""
+
+    def test_help_lists_new_commands(self, tmp_path):
+        r = run_cli(["--help"], tmp_path)
+        assert r.returncode == 0
+        for cmd in ("ingest", "ingest-status", "ingest-retry",
+                     "reclaim-orphans", "dream"):
+            assert cmd in r.stdout, f"'{cmd}' missing from --help output"
