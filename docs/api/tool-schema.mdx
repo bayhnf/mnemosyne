@@ -85,7 +85,7 @@ Submit a reviewer PASS/FAIL receipt for a Dream run via the one native receipt p
 
 ### 7. `mnemosyne_dream_status`
 
-Read the durable state of a Dream run. Content-free projection identical to dream_plan. Pure read; safe to call any time.
+Read the durable state of a Dream run. Content-free projection identical to dream_plan. Note: may reconcile the dream_active gate from durable state (a config.yaml write), so it is NOT marked read-only.
 
 | Parameter | Type | Required | Default |
 |-----------|------|----------|---------|

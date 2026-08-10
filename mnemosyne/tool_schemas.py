@@ -984,7 +984,9 @@ DREAM_STATUS_SCHEMA = {
     "name": "mnemosyne_dream_status",
     "description": (
         "Read the durable state of a Dream run. Content-free projection "
-        "identical to dream_plan. Pure read; safe to call any time."
+        "identical to dream_plan. Note: may reconcile the dream_active gate "
+        "from durable state (a config.yaml write), so it is NOT marked "
+        "read-only."
     ),
     "parameters": {
         "type": "object",
@@ -1114,9 +1116,17 @@ READ_ONLY_TOOLS = frozenset({
     "mnemosyne_recall", "mnemosyne_shared_recall", "mnemosyne_shared_stats",
     "mnemosyne_stats", "mnemosyne_get", "mnemosyne_triple_query",
     "mnemosyne_recall_canonical", "mnemosyne_scratchpad_read",
-    "mnemosyne_diagnose", "mnemosyne_graph_query", "mnemosyne_sync_status",
+    "mnemosyne_diagnose", "mnemosyne_graph_query",
+    # mnemosyne_persona_list / mnemosyne_ingest_status are routed through a
+    # read-only DB connection (no default-DB materialization), so they are
+    # truthfully read-only. mnemosyne_dream_status is intentionally ABSENT:
+    # its core path reconciles the dream_active gate, which writes
+    # config.yaml — a read-only advertisement would be untruthful.
+    # mnemosyne_sync_status is absent: status uses the SyncAdapter which
+    # may mutate engine state; local-only status is surfaced structurally
+    # but the tool is not marked read-only.
     "mnemosyne_persona_list", "mnemosyne_hygiene_audit",
-    "mnemosyne_ingest_status", "mnemosyne_dream_status",
+    "mnemosyne_ingest_status",
 })
 
 

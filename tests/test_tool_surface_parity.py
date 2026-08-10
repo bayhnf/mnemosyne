@@ -31,16 +31,10 @@ def test_every_defined_schema_is_exported():
     """A *_SCHEMA that is not in ALL_TOOL_SCHEMAS is invisible over MCP.
 
     mnemosyne_forget_canonical was defined and shipped in a release note but
-    omitted from ALL_TOOL_SCHEMAS, so it was never advertised. If a tool is
-    deliberately provider-only, add it to PROVIDER_ONLY below with a reason.
+    omitted from ALL_TOOL_SCHEMAS, so it was never advertised. Every defined
+    schema must be advertised; the legacy PROVIDER_ONLY escape hatch is gone.
     """
     from mnemosyne import tool_schemas
-
-    # Tools intentionally not advertised over MCP, with justification.
-    PROVIDER_ONLY = {
-        # Implemented in hermes_memory_provider only; no MCP handler exists.
-        "mnemosyne_forget_canonical",
-    }
 
     exported = {s["name"] for s in tool_schemas.ALL_TOOL_SCHEMAS}
     defined = {
@@ -48,11 +42,10 @@ def test_every_defined_schema_is_exported():
         for k, v in vars(tool_schemas).items()
         if k.endswith("_SCHEMA") and isinstance(v, dict) and "name" in v
     }
-    missing = defined - exported - PROVIDER_ONLY
+    missing = defined - exported
     assert not missing, (
         f"schema(s) defined but absent from ALL_TOOL_SCHEMAS, so not advertised "
-        f"over MCP: {sorted(missing)}. Add them to ALL_TOOL_SCHEMAS, or to "
-        f"PROVIDER_ONLY in this test with a reason."
+        f"over MCP: {sorted(missing)}. Add them to ALL_TOOL_SCHEMAS."
     )
 
 
@@ -81,27 +74,22 @@ def test_plugin_yaml_tools_all_have_schemas():
     assert not unknown, f"plugin.yaml declares tools with no schema: {unknown}"
 
 
-def test_no_tool_is_unreachable():
-    """Every advertised tool must be callable somewhere.
+def test_every_advertised_tool_has_a_real_handler():
+    """Every ALL_TOOL_SCHEMAS entry must have a real _TOOL_HANDLERS entry.
 
-    Either it has an MCP handler, or the Hermes provider implements it. A
-    schema reachable through neither is advertised to clients that can only
-    ever receive an error.
+    Binding 1 (Task 6B): the legacy exception that accepted a schema merely
+    because a Hermes-provider source file contained its name is GONE. A schema
+    reachable only through provider source text is advertised to clients that
+    can only ever receive an error over MCP. Actual schema<->handler parity is
+    the enforcement, in both directions.
     """
     from mnemosyne import mcp_tools, tool_schemas
 
+    schemas = {s["name"] for s in tool_schemas.ALL_TOOL_SCHEMAS}
     handlers = set(mcp_tools._TOOL_HANDLERS)
-    provider_src = ""
-    for path in (REPO / "hermes_memory_provider").rglob("*.py"):
-        provider_src += path.read_text()
-
-    unreachable = [
-        s["name"]
-        for s in tool_schemas.ALL_TOOL_SCHEMAS
-        if s["name"] not in handlers and s["name"] not in provider_src
-    ]
-    assert not unreachable, (
-        f"advertised but callable nowhere: {unreachable}"
+    missing = schemas - handlers
+    assert not missing, (
+        f"advertised schemas without a real _TOOL_HANDLERS entry: {sorted(missing)}"
     )
 
 

@@ -1818,9 +1818,13 @@ class IngestReceiptHealthAdapter:
             if "ingest_conflicts" in catalog.tables
             else _BoundedCount(value=0)
         )
-        stale_cutoff = (
-            datetime.now() - timedelta(seconds=_RECEIPT_CLAIM_STALE_SECONDS)
-        ).isoformat()
+        # Match core reclaim eligibility exactly: mnemosyne.core.inhale writes
+        # claim_worker_lease as aware-UTC ISO strings and reclaims when
+        # ``lease_iso < now_iso``. A naive local-time cutoff would misclassify
+        # leases in any non-UTC zone (e.g. UTC+7 counts a still-valid lease as
+        # stale), and the prior ``now - 60s`` offset lagged eligibility. Use
+        # aware UTC ``now`` with no offset so the metric mirrors reclaim.
+        stale_cutoff = datetime.now(timezone.utc).isoformat()
         stale_claims = _bounded_count(
             self.conn,
             "SELECT 1 FROM ingest_receipts "

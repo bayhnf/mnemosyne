@@ -1909,8 +1909,11 @@ class TestTask6BMCPParity:
         from mnemosyne.mcp_tools import TOOLS
         names = {t["name"] for t in TOOLS}
         write_tools = ("mnemosyne_ingest", "mnemosyne_remember",
-                       "mnemosyne_dream_apply", "mnemosyne_reclaim_orphans")
-        read_tools = ("mnemosyne_recall", "mnemosyne_stats", "mnemosyne_dream_status")
+                       "mnemosyne_dream_apply", "mnemosyne_reclaim_orphans",
+                       # dream_status writes config.yaml via gate reconciliation;
+                       # it must NOT be advertised as read-only (Task 6B r1 #1).
+                       "mnemosyne_dream_status")
+        read_tools = ("mnemosyne_recall", "mnemosyne_stats")
         for w in write_tools:
             assert w in names
         for r in read_tools:

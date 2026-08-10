@@ -1035,27 +1035,19 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_diagnose tool call.
 
-    MCP diagnose is read-only by default: it MUST NOT write a JSONL log,
-    create a default database, run repair, or mutate SQLite. It calls
-    run_diagnostics(read_only=True), which is the safe path implemented
-    independently. A requested repair (repair_vec_working=True) through this
-    surface returns a structured rejection instead of mutating.
-
-    Falls back to the legacy signature if read_only is not yet accepted by
-    run_diagnostics, but only when no repair was requested (so we never
-    silently mutate over MCP). Once the parallel Task 6B-diagnose work lands
-    read_only support, the fallback path is dead code.
+    MCP diagnose is strictly read-only: it MUST NOT write a JSONL log, create
+    a default database, run repair, or mutate SQLite. It calls
+    ``run_diagnostics(read_only=True)`` unconditionally. A requested repair
+    (``repair_vec_working=True``) through this surface returns a structured
+    rejection instead of mutating. There is NO legacy fallback: if the safe
+    read-only path is unavailable, the handler fails closed with a structured
+    error rather than silently calling the writable ``dry_run`` path.
     """
     from mnemosyne.diagnose import run_diagnostics
-    import inspect
 
-    wants_repair = bool(arguments.get("repair_vec_working", False))
-    sig = inspect.signature(run_diagnostics)
-    supports_read_only = "read_only" in sig.parameters
-
-    if wants_repair:
-        # Repair over MCP is never permitted, regardless of read_only support.
-        # Fail-closed: return a structured rejection the client can act on.
+    if arguments.get("repair_vec_working"):
+        # Repair over MCP is never permitted. Fail-closed: return a structured
+        # rejection the client can act on.
         return {
             "status": "read_only",
             "repair_rejected": True,
@@ -1066,13 +1058,22 @@ def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
             ),
         }
 
-    kwargs = {"dry_run": True}
-    if supports_read_only:
-        kwargs["read_only"] = True
-    result = run_diagnostics(**kwargs)
     # Do NOT call _create_instance() here: constructing a Mnemosyne
     # materializes a default DB, which violates the read-only contract.
     # run_diagnostics already includes any db_path it resolved internally.
+    # Fail closed/structured if the read-only path is not accepted rather than
+    # silently routing to the legacy writable signature.
+    try:
+        result = run_diagnostics(read_only=True)
+    except TypeError:
+        return {
+            "status": "read_only",
+            "error": "read_only_unavailable",
+            "detail": (
+                "The read-only diagnostics path is unavailable in this "
+                "runtime; MCP diagnose refuses to fall back to a writable path."
+            ),
+        }
     return _serialize(result)
 
 
@@ -1256,6 +1257,11 @@ def _dream_projection(run) -> Dict[str, Any]:
     raw_actions = getattr(run, "actions", None)
     if isinstance(raw_actions, list):
         action_count = len(raw_actions)
+    # Content-free idempotency signal for dream_undo: core surfaces a second
+    # undo via failure_reason="already_undone" (a fixed enum), which we expose
+    # as an explicit boolean so first vs second undo are distinguishable
+    # WITHOUT echoing the unbounded failure_reason field.
+    already_undone = getattr(run, "failure_reason", None) == "already_undone"
     return {
         "run_id": run.run_id,
         "state": run.state,
@@ -1267,6 +1273,7 @@ def _dream_projection(run) -> Dict[str, Any]:
         "request_id": getattr(run, "request_id", None),
         "action_count": action_count,
         "receipt_counts": receipt_counts,
+        "already_undone": already_undone,
     }
 
 
@@ -1332,8 +1339,36 @@ def _handle_ingest(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _read_only_beam(bank: str):
+    """Return a lightweight beam-like exposing a read-only SQLite connection.
+
+    Resolves the bank DB path WITHOUT materializing state (no Mnemosyne/beam
+    construction, no config.yaml seed, no init_db) and opens it with
+    ``mode=ro`` + ``query_only``. Used by read-only MCP handlers so a fresh
+    data dir is never mutated by a readOnly-flagged call. Raises
+    ``FileNotFoundError`` if the database does not exist yet.
+    """
+    import types
+    from mnemosyne.core.banks import get_bank_db_path_read_only
+    from mnemosyne.doctor import open_readonly_doctor_db
+    db_path = get_bank_db_path_read_only(bank)
+    try:
+        conn = open_readonly_doctor_db(db_path)
+    except sqlite3.OperationalError as exc:
+        # mode=ro refuses to create a missing DB; surface as FileNotFoundError
+        # so callers can return an empty structured result instead of mutating.
+        if "unable to open" in str(exc).lower():
+            raise FileNotFoundError(f"database for bank '{bank}' does not exist")
+        raise
+    return types.SimpleNamespace(conn=conn, db_path=db_path)
+
+
 def _handle_ingest_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle mnemosyne_ingest_status tool call — content-free receipts."""
+    """Handle mnemosyne_ingest_status tool call — content-free receipts.
+
+    Routed through a read-only DB connection: does NOT construct a Mnemosyne
+    instance and therefore never materializes a default DB on a fresh data dir.
+    """
     event_id = arguments.get("event_id") or None
     try:
         limit = int(arguments.get("limit", 100))
@@ -1343,11 +1378,19 @@ def _handle_ingest_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "limit must be a positive integer"}
 
     bank = _resolve_bank(arguments)
-    mem = _create_instance(bank=bank)
+    from mnemosyne.core.inhale import ingest_status as _ingest_status
     try:
-        rows = mem.ingest_status(event_id=event_id, limit=limit)
-    except ValueError as exc:
+        beam = _read_only_beam(bank)
+    except (FileNotFoundError, ValueError):
+        # No database exists yet for this bank: no receipts to report. Do NOT
+        # materialize one; return an empty structured result.
+        return {"status": "ok", "count": 0, "receipts": [], "bank": bank}
+    try:
+        rows = _ingest_status(beam, event_id=event_id, limit=limit)
+    except (FileNotFoundError, ValueError) as exc:
         return {"error": str(exc)}
+    finally:
+        beam.conn.close()
     return {
         "status": "ok",
         "count": len(rows),
@@ -1492,7 +1535,7 @@ def _handle_dream_undo(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 def _handle_reclaim_orphans(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_reclaim_orphans — dry-run by default."""
-    dry_run = not bool(arguments.get("apply", False))
+    dry_run = arguments.get("apply") is not True
     try:
         stale_after_seconds = int(arguments.get("stale_after_seconds", 3600))
     except (TypeError, ValueError):
@@ -1597,14 +1640,28 @@ def _handle_persona_demote(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_persona_list(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle mnemosyne_persona_list tool call."""
+    """Handle mnemosyne_persona_list tool call.
+
+    Routed through a read-only DB connection so the call never materializes a
+    default DB or seeds config.yaml on a fresh data dir. PersonaAdapter._list
+    only executes SELECTs, so a read-only conn is sufficient and truthful.
+    """
     bank = _resolve_bank(arguments)
-    mem = _create_instance(bank=bank)
-    adapter = _persona_adapter(mem)
-    raw = adapter.handle_tool_call("mnemosyne_persona_list", {
-        "tier": arguments.get("tier"),
-        "topic": arguments.get("topic"),
-    })
+    try:
+        beam = _read_only_beam(bank)
+    except (FileNotFoundError, ValueError):
+        return {"status": "ok", "count": 0, "personas": [], "bank": bank}
+    try:
+        from hermes_memory_provider.persona_adapter import PersonaAdapter
+        adapter = PersonaAdapter(beam_instance=beam)
+        raw = adapter.handle_tool_call("mnemosyne_persona_list", {
+            "tier": arguments.get("tier"),
+            "topic": arguments.get("topic"),
+        })
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+    finally:
+        beam.conn.close()
     result = _persona_result(raw)
     result["bank"] = bank
     return result
@@ -1627,21 +1684,36 @@ def _handle_persona_reinforce(arguments: Dict[str, Any]) -> Dict[str, Any]:
 # Sync handlers (binding behavior #1, #6) — safe-default, no network widening
 # ---------------------------------------------------------------------------
 
-def _sync_remote_configured() -> str:
-    """Return the configured remote URL, or empty string if unconfigured.
+def _sync_resolve_remote() -> str:
+    """Resolve the configured sync remote URL.
 
-    Honors the same env precedence as the CLI. An MCP handler must NEVER
-    widen remote/network authority: when no remote is configured we return a
-    structured 'unconfigured' status and perform no network call.
+    Honors the SAME resolution as ``SyncAdapter._resolve_remote`` and the
+    CLI/config layer: config.yaml ``sync_remote`` → ``MNEMOSYNE_SYNC_REMOTE``
+    env → ``MNEMOSYNE_SYNC_HOST`` + ``MNEMOSYNE_SYNC_PORT`` env. A deployment
+    configured through any of these must not be rejected as 'unconfigured'.
+
+    An MCP handler never widens remote/network authority: this only resolves
+    the configured value; it never accepts an inline URL from the call.
     """
-    return (os.environ.get("MNEMOSYNE_SYNC_REMOTE") or "").strip()
+    from mnemosyne.core.config import get_config
+    remote = str(get_config().get("sync_remote", "") or "").strip()
+    if remote:
+        return remote
+    remote = (os.environ.get("MNEMOSYNE_SYNC_REMOTE") or "").strip()
+    if remote:
+        return remote
+    host = (os.environ.get("MNEMOSYNE_SYNC_HOST") or "").strip()
+    port = (os.environ.get("MNEMOSYNE_SYNC_PORT") or "").strip()
+    if host and port:
+        return f"https://{host}:{port}"
+    return ""
 
 
 def _sync_unconfigured_result() -> Dict[str, Any]:
     return {
         "status": "unconfigured",
         "remote": "(unconfigured)",
-        "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE or use the CLI (mnemosyne sync --remote URL --db-path PATH).",
+        "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE (or sync_remote in config.yaml, or MNEMOSYNE_SYNC_HOST+PORT), or use the CLI (mnemosyne sync --remote URL --db-path PATH).",
     }
 
 
@@ -1653,10 +1725,8 @@ def _handle_sync_push(arguments: Dict[str, Any]) -> Dict[str, Any]:
     attempting any network call. This intentionally does NOT accept an inline
     remote URL: the CLI is the trust boundary for binding a remote.
     """
-    if not _sync_remote_configured():
+    if not _sync_resolve_remote():
         return _sync_unconfigured_result()
-    # Remote is configured: defer to the Hermes SyncAdapter, which owns the
-    # transport, encryption, and auth semantics. We do not inline those here.
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
     try:
@@ -1664,15 +1734,15 @@ def _handle_sync_push(arguments: Dict[str, Any]) -> Dict[str, Any]:
         adapter = SyncAdapter(mem.beam, config={})
         raw = adapter.handle_tool_call("mnemosyne_sync_push", {})
         result = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception as exc:
-        result = {"status": "error", "error": str(exc)}
+    except Exception:
+        result = {"status": "error", "error": "sync_push_failed"}
     result["bank"] = bank
     return result
 
 
 def _handle_sync_pull(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_sync_pull tool call."""
-    if not _sync_remote_configured():
+    if not _sync_resolve_remote():
         return _sync_unconfigured_result()
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
@@ -1681,8 +1751,8 @@ def _handle_sync_pull(arguments: Dict[str, Any]) -> Dict[str, Any]:
         adapter = SyncAdapter(mem.beam, config={})
         raw = adapter.handle_tool_call("mnemosyne_sync_pull", {})
         result = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception as exc:
-        result = {"status": "error", "error": str(exc)}
+    except Exception:
+        result = {"status": "error", "error": "sync_pull_failed"}
     result["bank"] = bank
     return result
 
@@ -1690,12 +1760,10 @@ def _handle_sync_pull(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_sync_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_sync_status tool call.
 
-    With no remote configured we return a safe 'unconfigured' status with no
-    network attempt. With a remote configured we defer to the SyncAdapter
-    status path (which may itself decide whether to contact the remote).
+    Local status (device id, event count, encryption state) is returned even
+    when no remote is configured: ``SyncAdapter._handle_status`` produces this
+    without any network contact. Only push/pull require a configured remote.
     """
-    if not _sync_remote_configured():
-        return _sync_unconfigured_result()
     bank = _resolve_bank(arguments)
     mem = _create_instance(bank=bank)
     try:
@@ -1703,8 +1771,8 @@ def _handle_sync_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
         adapter = SyncAdapter(mem.beam, config={})
         raw = adapter.handle_tool_call("mnemosyne_sync_status", {})
         result = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception as exc:
-        result = {"status": "error", "error": str(exc)}
+    except Exception:
+        result = {"status": "error", "error": "sync_status_failed"}
     result["bank"] = bank
     return result
 
