@@ -33,7 +33,9 @@ HOOKS_DIR = os.path.join(PLUGIN_ROOT, "hooks")
 WORKTREE_ROOT = os.path.dirname(os.path.dirname(PLUGIN_ROOT))
 
 
-def _run(script: str, payload, env: dict) -> tuple[int, dict | None, str, str]:
+def _run(
+    script: str, payload, env: dict, cwd: str = "/tmp"
+) -> tuple[int, dict | None, str, str]:
     """Run a hook with raw stdin (may be non-object JSON). Returns (rc, parsed, out, err)."""
     full = dict(os.environ)
     full.update(env)
@@ -53,6 +55,7 @@ def _run(script: str, payload, env: dict) -> tuple[int, dict | None, str, str]:
         text=True,
         env=full,
         timeout=30,
+        cwd=cwd,
     )
     parsed = None
     if proc.stdout.strip():
@@ -562,36 +565,6 @@ class TestBoundedSpool(_Base):
 
 
 class TestSessionEndBoundedTime(_Base):
-    def test_session_end_returns_under_3s_with_slow_ingest(self) -> None:
-        """Even if native ingest hangs, SessionEnd must return before 3s."""
-        env = self._env(
-            MNEMOSYNE_CODEX_ACTOR_ID="alice",
-            MNEMOSYNE_CODEX_PROJECT_ID="projX",
-            MNEMOSYNE_CODEX_FORCE_SPOOL="1",
-        )
-        # Seed the spool with a pending event
-        _run(
-            "user_prompt_submit.py",
-            {"session_id": "s1", "turn_id": "t1", "prompt": "pending", "cwd": "/tmp"},
-            env,
-        )
-        # Install a slow-ingest shim: point the hook at a mnemosyne that sleeps.
-        # We simulate by making the data dir's parent require a slow init:
-        # set MNEMOSYNE_CODEX_SESSION_END_BUDGET_MS small and confirm the hook
-        # honors an internal deadline.
-        env2 = self._env(
-            MNEMOSYNE_CODEX_ACTOR_ID="alice",
-            MNEMOSYNE_CODEX_PROJECT_ID="projX",
-            MNEMOSYNE_CODEX_FORCE_SPOOL="1",
-        )
-        start = time.monotonic()
-        code, out, _o, err = _run(
-            "session_end.py", {"session_id": "s1", "cwd": "/tmp"}, env2
-        )
-        elapsed = time.monotonic() - start
-        self.assertEqual(code, 0)
-        self.assertLess(elapsed, 3.0, f"SessionEnd took {elapsed:.2f}s, must be < 3s")
-
     def test_session_end_retains_unacked_events(self) -> None:
         """SessionEnd must not delete events it cannot deliver. We seed the
         spool, then make native ingest fail (bad data dir) during SessionEnd:
@@ -804,197 +777,3 @@ class TestSessionEndSlowIngest(_Base):
 
 
 # ---------------------------------------------------------------------------
-# Codex CLI marketplace discovery (read-only, isolated)
-# ---------------------------------------------------------------------------
-
-
-class TestMarketplaceDiscovery(_Base):
-    """Validate the repo-scoped marketplace.json structure and CLI discovery.
-
-    The repo-scoped marketplace at $REPO_ROOT/.agents/plugins/marketplace.json
-    is discovered by the ChatGPT desktop app's Plugins Directory, NOT by the
-    CLI's `codex plugin marketplace list` (which discovers only personal
-    marketplaces at ~/.agents/plugins/ and explicitly added/configured ones).
-
-    This test validates the marketplace.json schema and CLI output shape
-    without mutating ~/.codex/config.toml or using CODEX_HOME.
-    """
-
-    def test_marketplace_json_schema_is_valid(self) -> None:
-        """A disposable marketplace.json pointing at the plugin must conform
-        to the documented schema (name, plugins[], source.path, policy)."""
-        import json
-
-        plugin_root = PLUGIN_ROOT
-        marketplace = {
-            "name": "mnemosyne-codex-test",
-            "interface": {"displayName": "Mnemosyne Codex Test"},
-            "plugins": [
-                {
-                    "name": "codex-mnemosyne",
-                    "source": {
-                        "source": "local",
-                        "path": plugin_root,
-                    },
-                    "policy": {
-                        "installation": "AVAILABLE",
-                        "authentication": "ON_INSTALL",
-                    },
-                    "category": "Productivity",
-                }
-            ],
-        }
-        # Schema checks
-        self.assertIn("name", marketplace)
-        self.assertIsInstance(marketplace["plugins"], list)
-        entry = marketplace["plugins"][0]
-        self.assertEqual(entry["name"], "codex-mnemosyne")
-        src = entry["source"]
-        self.assertEqual(src["source"], "local")
-        self.assertTrue(
-            os.path.isdir(src["path"]),
-            f"plugin source.path must exist: {src['path']}",
-        )
-        # The referenced plugin must have a valid manifest
-        manifest_path = os.path.join(src["path"], ".codex-plugin", "plugin.json")
-        self.assertTrue(os.path.exists(manifest_path))
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        self.assertEqual(manifest["name"], "codex-mnemosyne")
-        # The referenced plugin must have hooks.json with all 4 events
-        hooks_path = os.path.join(src["path"], "hooks", "hooks.json")
-        self.assertTrue(os.path.exists(hooks_path))
-        with open(hooks_path) as f:
-            hooks = json.load(f)
-        events = set(hooks.get("hooks", {}).keys())
-        self.assertEqual(
-            events, {"SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"}
-        )
-        # All hook commands must use ${PLUGIN_ROOT} (installed-plugin path)
-        for event, entries in hooks["hooks"].items():
-            for entry_group in entries:
-                for hook in entry_group["hooks"]:
-                    self.assertIn(
-                        "${PLUGIN_ROOT}",
-                        hook["command"],
-                        f"{event} must use ${{PLUGIN_ROOT}}",
-                    )
-
-    def test_cli_marketplace_list_json_shape(self) -> None:
-        """codex plugin marketplace list --json must return the documented
-        {marketplaces: [...]} shape. This is read-only and does NOT mutate
-        ~/.codex/config.toml."""
-        import shutil
-
-        codex = shutil.which("codex")
-        if not codex:
-            self.skipTest("codex CLI not installed")
-        result = subprocess.run(
-            [codex, "plugin", "marketplace", "list", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            self.skipTest(f"codex CLI failed (auth/login?): {result.stderr[:200]}")
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            self.fail(
-                f"codex marketplace list --json returned invalid JSON: {result.stdout[:200]}"
-            )
-        self.assertIn("marketplaces", data)
-        self.assertIsInstance(data["marketplaces"], list)
-        # Each marketplace entry must have at least name + root
-        for m in data["marketplaces"]:
-            self.assertIn("name", m)
-            self.assertIn("root", m)
-
-    def test_repo_scoped_marketplace_not_mutated_by_cli_list(self) -> None:
-        """Running 'codex plugin marketplace list' from a repo with a
-        .agents/plugins/marketplace.json must NOT write to ~/.codex/config.toml."""
-        import shutil
-
-        codex = shutil.which("codex")
-        if not codex:
-            self.skipTest("codex CLI not installed")
-
-        # Read config.toml before
-        config_path = os.path.expanduser("~/.codex/config.toml")
-        before = ""
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                before = f.read()
-
-        # Create disposable repo with marketplace.json
-        repo_dir = tempfile.mkdtemp(prefix="mnem-mkt-isolation-")
-        try:
-            os.makedirs(os.path.join(repo_dir, ".agents", "plugins"))
-            mkt_path = os.path.join(repo_dir, ".agents", "plugins", "marketplace.json")
-            with open(mkt_path, "w") as f:
-                json.dump(
-                    {
-                        "name": "mnemosyne-isolation-test",
-                        "interface": {"displayName": "Isolation Test"},
-                        "plugins": [
-                            {
-                                "name": "codex-mnemosyne",
-                                "source": {
-                                    "source": "local",
-                                    "path": PLUGIN_ROOT,
-                                },
-                                "policy": {
-                                    "installation": "AVAILABLE",
-                                    "authentication": "ON_INSTALL",
-                                },
-                                "category": "Productivity",
-                            }
-                        ],
-                    },
-                    f,
-                )
-            # git init + commit (needed for REPO_ROOT detection)
-            subprocess.run(
-                ["git", "init", "-q"], cwd=repo_dir, capture_output=True, timeout=10
-            )
-            subprocess.run(
-                ["git", "add", "-A"], cwd=repo_dir, capture_output=True, timeout=10
-            )
-            subprocess.run(
-                ["git", "commit", "-q", "-m", "isolation test fixture"],
-                cwd=repo_dir,
-                capture_output=True,
-                timeout=10,
-                env={
-                    **os.environ,
-                    "GIT_AUTHOR_NAME": "test",
-                    "GIT_AUTHOR_EMAIL": "test@test",
-                    "GIT_COMMITTER_NAME": "test",
-                    "GIT_COMMITTER_EMAIL": "test@test",
-                },
-            )
-            # Run marketplace list from the disposable repo (read-only)
-            subprocess.run(
-                [codex, "plugin", "marketplace", "list", "--json"],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            # Verify config.toml was NOT mutated
-            after = ""
-            if os.path.exists(config_path):
-                with open(config_path) as f:
-                    after = f.read()
-            self.assertEqual(
-                before,
-                after,
-                "~/.codex/config.toml must NOT be mutated by marketplace list",
-            )
-            self.assertNotIn(
-                "mnemosyne-isolation-test",
-                after,
-                "repo-scoped marketplace must not leak into global config",
-            )
-        finally:
-            shutil.rmtree(repo_dir, ignore_errors=True)

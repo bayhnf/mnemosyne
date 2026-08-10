@@ -35,6 +35,10 @@ If the package is not importable at hook runtime, every hook emits a safe,
 actionable `systemMessage` warning naming `mnemosyne` and the install step,
 then exits 0 (fail-open). No traceback, no silent failure.
 
+A disposable-venv installed-location smoke test proves hooks import
+`mnemosyne` from site-packages (not source tree) and exercise the full
+lifecycle without repository imports.
+
 ## Persistent cross-session memory
 
 Memory is **persistent across Codex sessions** and **isolated per actor +
@@ -71,10 +75,10 @@ Environment variables (all optional). In an installed plugin, Codex sets
 | Variable | Default | Purpose |
 |---|---|---|
 | `PLUGIN_DATA` | (set by Codex) | Writable plugin state dir (spool + default data) |
-| `MNEMOSYNE_DATA_DIR` | `<PLUGIN_DATA>` | Mnemosyne database directory |
+| `MNEMOSYNE_DATA_DIR` | Derived from `PLUGIN_DATA` | Mnemosyne database directory (auto-set at import) |
 | `MNEMOSYNE_CODEX_ACTOR_ID` | `codex-actor` | Actor identity for memory scope |
 | `MNEMOSYNE_CODEX_ACTOR_TYPE` | `human` | Actor type |
-| `MNEMOSYNE_CODEX_PROJECT_ID` | SHA-256(cwd)[:12] | Project/channel identity |
+| `MNEMOSYNE_CODEX_PROJECT_ID` | `cwd-` + SHA-256(cwd)[:12] | Project/channel identity |
 | `MNEMOSYNE_CODEX_SPOOL_PATH` | `<PLUGIN_DATA>/codex-spool.db` | Transport spool path |
 
 ## Design constraints
@@ -98,7 +102,7 @@ Environment variables (all optional). In an installed plugin, Codex sets
   or retry indefinitely. Corrupt rows are retained, never silently deleted.
   All deletion is ack-only.
 - **Bounded SessionEnd.** Returns before the 3-second Codex ceiling even if a
-  native ingest attempt is slow or hung, using a SIGALRM-based deadline. Does
+  native ingest attempt is slow or hung, using a subprocess hard deadline. Does
   not rely solely on Codex forcibly killing the hook. Unacknowledged events
   are always retained.
 - **stdlib JSON only.** No third-party dependencies in the hook path.
@@ -111,7 +115,7 @@ Environment variables (all optional). In an installed plugin, Codex sets
 python3 -m pytest integrations/codex-mnemosyne/tests/ -v
 ```
 
-50 tests cover: manifest/hook contract, persistent cross-session recall,
+61 tests cover: manifest/hook contract, persistent cross-session recall,
 actor/project isolation, stable host turn IDs, non-object payload fail-open,
 honest content-free messages, bounded spool (0600, idempotent, finite
 capacity, terminal state, corrupt-row retention, ack-only deletion), slow

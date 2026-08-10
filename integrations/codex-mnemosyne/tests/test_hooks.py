@@ -11,7 +11,6 @@ implementation to GREEN.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import stat
@@ -44,6 +43,7 @@ def _run_hook(
         text=True,
         env=full_env,
         timeout=30,
+        cwd=tempfile.gettempdir(),
     )
     parsed = None
     if proc.stdout.strip():
@@ -52,11 +52,6 @@ def _run_hook(
         except json.JSONDecodeError:
             parsed = None
     return proc.returncode, parsed, proc.stdout, proc.stderr
-
-
-def _make_event_id(session_id: str, turn_id: str, role: str) -> str:
-    """Stable event ID: deterministic from session+turn+role."""
-    return f"cx-{hashlib.sha256(f'{session_id}|{turn_id}|{role}'.encode()).hexdigest()[:24]}"
 
 
 class _HookTestBase(unittest.TestCase):
@@ -221,10 +216,10 @@ class TestUserPromptSubmit(_HookTestBase):
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        eid1 = mod.stable_event_id(self.session_id, "turn-5", "user")
-        eid2 = mod.stable_event_id(self.session_id, "turn-5", "user")
+        eid1 = mod.stable_event_id("mem-test-scope", "turn-5", "user")
+        eid2 = mod.stable_event_id("mem-test-scope", "turn-5", "user")
         self.assertEqual(eid1, eid2, "event_id must be stable across calls")
-        eid3 = mod.stable_event_id(self.session_id, "turn-6", "user")
+        eid3 = mod.stable_event_id("mem-test-scope", "turn-6", "user")
         self.assertNotEqual(eid1, eid3, "different turn must yield different event_id")
 
 
@@ -323,7 +318,7 @@ class TestSpoolFailurePath(_HookTestBase):
 
         m = Mnemosyne(
             session_id=self.session_id,
-            db_path=None,
+            db_path=os.path.join(self.data_dir, "mnemosyne.db"),
             author_id=self.actor,
             author_type="human",
             channel_id=self.project,

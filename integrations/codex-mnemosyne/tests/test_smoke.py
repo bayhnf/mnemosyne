@@ -33,6 +33,7 @@ def _run_hook(script: str, payload: dict, env: dict) -> tuple[int, dict | None, 
         text=True,
         env=full,
         timeout=30,
+        cwd=tempfile.gettempdir(),
     )
     parsed = None
     if proc.stdout.strip():

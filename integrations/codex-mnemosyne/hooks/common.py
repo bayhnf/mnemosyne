@@ -1,6 +1,6 @@
 """Shared helpers for Mnemosyne Codex hook scripts.
 
-Design constraints (Task 8 brief + round-1 review):
+Design constraints (Task 8 brief + round-1/round-2 reviews):
   - stdlib JSON only; no third-party deps in the hook path
   - persistent cross-session memory via one deterministic opaque memory scope
     derived from actor + project (NOT the ephemeral Codex session_id)
@@ -10,33 +10,32 @@ Design constraints (Task 8 brief + round-1 review):
   - 0600 transport-only spool; never searchable, ack-deleted only
   - bounded spool: idempotent event IDs, finite capacity, terminal retry state,
     no silent deletion of corrupt rows, additive schema
-  - SessionEnd returns before the 3s Codex ceiling
-  - PLUGIN_DATA for default writable plugin state; no repo-root import trick
+  - SessionEnd returns before the 3s Codex ceiling via a real hard subprocess
+    boundary (not SIGALRM-only)
+  - PLUGIN_DATA for default writable plugin state AND native Mnemosyne data;
+    no repo-root import trick; no global home-directory access
   - never parse transcripts
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 import sys
-from typing import Any, Dict, Optional, Tuple
+import tempfile
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Installed-plugin discovery: no repo-root sys.path trick.
 #
 # Codex runs hooks by path; Python only puts the hook's own directory on
 # sys.path. The mnemosyne package must be importable as an installed package
-# (pip install -e . from the repo, or pip install mnemosyne). We deliberately
-# do NOT inject the source repository root, so the installed plugin behaves
-# identically whether the source tree is present or not.
-#
-# For the test-time path (hooks imported by tests under the source tree), the
-# mnemosyne package is already importable because tests run from a repo where
-# it is installed/editable.
+# (pip install mnemosyne). We do NOT inject the source repository root.
 # ---------------------------------------------------------------------------
 
 PRODUCER = "codex"
@@ -45,10 +44,8 @@ PRODUCER = "codex"
 _SPOOL_MAX_ROWS = 32
 _SPOOL_MAX_ATTEMPTS = 8
 
-
-# ---------------------------------------------------------------------------
-# Time helpers
-# ---------------------------------------------------------------------------
+# SessionEnd budget (well within Codex's 3-second ceiling).
+_SESSION_END_BUDGET_S = 2.0
 
 
 def _now_iso() -> str:
@@ -58,6 +55,54 @@ def _now_iso() -> str:
 def _content_hash(content: str) -> str:
     """SHA-256 of the content (matches Mnemosyne IngestEvent contract)."""
     return hashlib.sha256(content.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Environment management (no process-global leakage)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _scoped_env(extra: Dict[str, str]) -> Iterator[None]:
+    """Temporarily set env vars, restoring the exact prior state on exit.
+
+    flush_spool uses this instead of mutating os.environ permanently, so
+    test isolation never depends on stale env side-effects.
+    """
+    sentinel = object()
+    saved: Dict[str, Any] = {}
+    try:
+        for k, v in extra.items():
+            saved[k] = os.environ.get(k, sentinel)
+            os.environ[k] = str(v)
+        yield
+    finally:
+        for k, old in saved.items():
+            if old is sentinel:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old  # type: ignore[assignment]
+
+
+def _ensure_mnemosyne_data_dir() -> None:
+    """Ensure MNEMOSYNE_DATA_DIR points to PLUGIN_DATA so the native Mnemosyne
+    DB never defaults to a global home directory.
+
+    If MNEMOSYNE_DATA_DIR is already set, respect it. Otherwise derive from
+    PLUGIN_DATA / CLAUDE_PLUGIN_DATA. This runs at import time so every
+    Mnemosyne() constructor uses the disposable/plugin-data path.
+    """
+    if os.environ.get("MNEMOSYNE_DATA_DIR"):
+        return
+    for name in ("PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"):
+        v = os.environ.get(name)
+        if v:
+            os.environ["MNEMOSYNE_DATA_DIR"] = v
+            return
+
+
+# Run at import so all downstream Mnemosyne() calls see the right path.
+_ensure_mnemosyne_data_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -83,24 +128,16 @@ def read_stdin() -> Dict[str, Any]:
     except (json.JSONDecodeError, ValueError):
         return {}
     if not isinstance(parsed, dict):
-        # Valid JSON but not an object — fail open without a traceback.
         return {}
     return parsed
 
 
 def emit(payload: Dict[str, Any]) -> None:
-    """Write one JSON object to stdout and flush."""
     sys.stdout.write(json.dumps(payload, default=str) + "\n")
     sys.stdout.flush()
 
 
 def emit_context(hook_event_name: str, additional_context: str) -> None:
-    """Emit additionalContext for injection into the Codex turn.
-
-    Preserves an existing systemMessage by coexisting in the same object:
-    documented hook output shape supports both systemMessage and
-    hookSpecificOutput simultaneously.
-    """
     ctx = additional_context.strip()
     if not ctx:
         emit({})
@@ -116,7 +153,6 @@ def emit_context(hook_event_name: str, additional_context: str) -> None:
 
 
 def emit_system_message(message: str) -> None:
-    """Emit a visible system message (non-sensitive warning)."""
     if not message:
         emit({})
         return
@@ -161,16 +197,7 @@ def project_id(cwd: Optional[str] = None) -> str:
 
 
 def memory_scope(actor: str, project: str) -> str:
-    """One deterministic opaque memory scope per actor + project.
-
-    This is the single key used as Mnemosyne(session_id=...) for BOTH native
-    ingest (IngestEvent.session_id) and bounded recall, so memories persist
-    across Codex sessions for the same actor+project. Different actor OR
-    project yields a different scope => no cross-isolation recall.
-
-    The scope is opaque (never widens to global/shared and never leaks raw
-    actor/project/path values).
-    """
+    """One deterministic opaque memory scope per actor + project."""
     material = f"{actor}|{project}".encode()
     return "mem-" + hashlib.sha256(material).hexdigest()[:16]
 
@@ -178,7 +205,7 @@ def memory_scope(actor: str, project: str) -> str:
 def _plugin_data_dir() -> str:
     """Default writable plugin state dir from PLUGIN_DATA (Codex extension).
 
-    Falls back to a mnemosyne-local data dir. Never uses $HOME directly.
+    Falls back to MNEMOSYNE_DATA_DIR. Never uses a global home directory.
     """
     for name in ("PLUGIN_DATA", "CLAUDE_PLUGIN_DATA"):
         v = os.environ.get(name)
@@ -187,8 +214,7 @@ def _plugin_data_dir() -> str:
     env_data = os.environ.get("MNEMOSYNE_DATA_DIR")
     if env_data:
         return env_data
-    # Last-resort default: a plugin-local subdir (not $HOME).
-    return os.path.join("/tmp", "codex-mnemosyne-data")
+    return os.path.join(tempfile.gettempdir(), "codex-mnemosyne-data")
 
 
 def spool_path() -> str:
@@ -205,12 +231,6 @@ def spool_path() -> str:
 
 
 def stable_event_id(scope: str, turn_id: str, role: str) -> str:
-    """Deterministic event id from memory scope + host turn id + role.
-
-    Same inputs always produce the same event_id, so replaying a hook for the
-    same logical event is idempotent (native ingest deduplicates by
-    event_id, and the spool deduplicates by event_id).
-    """
     material = f"{scope}|{turn_id}|{role}".encode()
     return "cx-" + hashlib.sha256(material).hexdigest()[:24]
 
@@ -232,11 +252,6 @@ def fallback_turn_id(scope: str, content: str) -> str:
 def format_recall_context(
     results: list, retrieval_mode: str = "", degradation: Optional[list] = None
 ) -> str:
-    """Render bounded recall results as a compact, non-sensitive context block.
-
-    Each result is one line. No raw memory ids, payload hashes, scope, or
-    internal metadata leak.
-    """
     if not results:
         return ""
     lines = ['<mnemosyne-recall source="codex-hook" format="digest">']
@@ -253,7 +268,6 @@ def format_recall_context(
             except (TypeError, ValueError):
                 pass
         tag = f" [{', '.join(tag_parts)}]" if tag_parts else ""
-        # Hard ceiling as defence in depth (recall_bounded already bounds).
         if len(content) > 500:
             content = content[:497] + "..."
         lines.append(f"-{tag} {content}")
@@ -267,11 +281,6 @@ def format_recall_context(
 
 
 class Outcome:
-    """Structured outcome of a native operation.
-
-    error_message is for internal logic only — never emitted to the user.
-    """
-
     def __init__(self, ok: bool, error_code: str = "", error_message: str = ""):
         self.ok = ok
         self.error_code = error_code
@@ -282,10 +291,6 @@ class Outcome:
 
 
 def _import_mnemosyne() -> Tuple[bool, str]:
-    """Probe whether the mnemosyne package is importable.
-
-    Returns (importable, error_code). error_code is empty on success.
-    """
     try:
         import mnemosyne  # noqa: F401
         from mnemosyne.core.memory import Mnemosyne  # noqa: F401
@@ -297,16 +302,6 @@ def _import_mnemosyne() -> Tuple[bool, str]:
 
 
 def native_ingest(event_dict: Dict[str, Any]) -> Outcome:
-    """Call mnemosyne remember_event with an IngestEvent built from event_dict.
-
-    The memory scope (derived from actor+project) is used as the
-    Mnemosyne.session_id so memories persist across Codex sessions and are
-    isolated per actor+project. The ephemeral Codex session_id is kept only
-    in event metadata for non-recall provenance.
-
-    Returns Outcome(ok=True) on stored/duplicate, Outcome(ok=False, ...) on
-    conflict/rejected/exception/package-absent. Never raises.
-    """
     try:
         from mnemosyne.core.memory import Mnemosyne
         from mnemosyne.core.inhale import IngestEvent
@@ -352,11 +347,6 @@ def native_recall(
     actor: str,
     project: str,
 ) -> Tuple[list, str, list]:
-    """Call mnemosyne recall_bounded using the same memory scope as ingest.
-
-    Returns (results, retrieval_mode, degradation). Never raises; on failure
-    returns ([], "error", []).
-    """
     try:
         from mnemosyne.core.memory import Mnemosyne
         from mnemosyne.core.recall_bounded import RecallPolicy
@@ -447,9 +437,6 @@ def message_session_end_delivered() -> str:
 # Transport-only spool (0600, never searchable, ack-deleted, bounded)
 # ---------------------------------------------------------------------------
 
-# Additive schema: the prior local spool had the columns below without
-# `terminal`; we add `terminal` and `scope`/`role` columns for the bounded
-# retry policy WITHOUT breaking an existing prior-local spool db.
 _SPOOL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS spooled_events (
     rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -463,16 +450,10 @@ CREATE TABLE IF NOT EXISTS spooled_events (
 
 
 def _ensure_spool(path: str) -> None:
-    """Create the spool db with mode 0600 if it does not exist.
-
-    Additive migration: if a prior schema lacks the `terminal` column, add it
-    without dropping data.
-    """
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, mode=0o700, exist_ok=True)
-    created = not os.path.exists(path)
-    if created:
+    if not os.path.exists(path):
         fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
         os.close(fd)
     else:
@@ -480,7 +461,6 @@ def _ensure_spool(path: str) -> None:
     conn = sqlite3.connect(path)
     try:
         conn.executescript(_SPOOL_SCHEMA)
-        # Additive migration for prior local spool schema.
         cols = {
             r[1] for r in conn.execute("PRAGMA table_info(spooled_events)").fetchall()
         }
@@ -501,9 +481,7 @@ def _spool_is_full(conn: sqlite3.Connection) -> bool:
 def spool_put(path: str, event_dict: Dict[str, Any]) -> str:
     """Persist one event to the transport spool (idempotent by event_id).
 
-    Returns one of: "stored" (new row written), "duplicate" (event_id already
-    present), "full" (capacity reached, nothing written), "error" (write
-    failed). Never raises.
+    Returns "stored", "duplicate", "full", or "error". Never raises.
     """
     try:
         _ensure_spool(path)
@@ -532,7 +510,6 @@ def spool_put(path: str, event_dict: Dict[str, Any]) -> str:
 
 
 def spool_count(path: str) -> int:
-    """Return the number of spooled events (for tests)."""
     if not os.path.exists(path):
         return 0
     try:
@@ -550,25 +527,8 @@ def _deadline_remaining(start: float, budget_s: float) -> float:
     return max(0.0, budget_s - (datetime.datetime.now().timestamp() - start))
 
 
-def flush_spool(
-    path: str,
-    env: Optional[Dict[str, Any]] = None,
-    budget_s: float = 2.5,
-) -> Tuple[int, int, int]:
-    """Attempt to deliver spooled events via native ingest within a deadline.
-
-    Deletes a row only after a successful ack (stored/duplicate). Terminal
-    rows (attempts >= _SPOOL_MAX_ATTEMPTS) are retained, not retried. Corrupt
-    rows are retained (never silently deleted).
-
-    Returns (flushed, retained_pending, retained_terminal). Never raises.
-    Guarantees return before `budget_s` seconds elapse even if ingest hangs,
-    by checking the deadline between each row and never blocking on a single
-    ingest beyond the remaining budget.
-    """
-    if env:
-        for k, v in env.items():
-            os.environ[k] = str(v)
+def _flush_spool_inner(path: str, budget_s: float) -> Tuple[int, int, int]:
+    """Inner flush logic (no env management). Returns (flushed, pending, terminal)."""
     if not os.path.exists(path):
         return 0, 0, 0
     _ensure_spool(path)
@@ -589,7 +549,6 @@ def flush_spool(
             try:
                 event_dict = json.loads(payload_json)
             except (json.JSONDecodeError, TypeError, ValueError):
-                # Corrupt row — retain, never silently delete.
                 retained_pending += 1
                 continue
             outcome = native_ingest(event_dict)
@@ -609,7 +568,6 @@ def flush_spool(
                     retained_terminal += 1
                 else:
                     retained_pending += 1
-        # Count pre-existing terminal rows (not selected above).
         trow = conn.execute(
             "SELECT COUNT(*) FROM spooled_events WHERE terminal = 1"
         ).fetchone()
@@ -621,47 +579,89 @@ def flush_spool(
     return flushed, retained_pending, retained_terminal
 
 
-def flush_spool_bounded(path: str, budget_s: float = 2.0) -> Tuple[int, int, int]:
-    """Run flush_spool under a hard wall-clock deadline.
+def flush_spool(
+    path: str,
+    env: Optional[Dict[str, Any]] = None,
+    budget_s: float = 2.5,
+) -> Tuple[int, int, int]:
+    """Attempt to deliver spooled events via native ingest within a deadline.
 
-    Uses signal.SIGALRM (Unix) to guarantee return within budget_s seconds even
-    if a single native ingest call blocks/hangs. On timeout, returns immediately
-    with whatever was flushed so far; unprocessed rows are retained. On
-    platforms without SIGALRM, falls back to the between-row deadline in
-    flush_spool (which still bounds fast-per-row cases).
+    If ``env`` is provided, it is applied temporarily via ``_scoped_env`` and
+    restored on exit — it never permanently mutates ``os.environ``.
 
-    ponytail: ceiling = a single ingest call blocking longer than budget;
-    SIGALRM interrupts it. Upgrade path = run flush in a child process with
-    subprocess timeout if SIGALRM is ever unavailable.
+    Deletes a row only after a successful ack. Terminal rows are retained.
+    Corrupt rows are retained. Never raises.
     """
-    import signal
+    if env:
+        with _scoped_env({k: str(v) for k, v in env.items()}):
+            return _flush_spool_inner(path, budget_s)
+    return _flush_spool_inner(path, budget_s)
 
-    result = {"flushed": 0, "pending": 0, "terminal": 0}
 
-    def _alarm_handler(signum, frame):
-        raise TimeoutError("flush deadline exceeded")
-
-    old_handler = None
-    had_alarm = hasattr(signal, "SIGALRM")
-    if had_alarm:
-        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-        # Budget in whole seconds, minimum 1.
-        signal.setitimer(signal.ITIMER_REAL, max(1.0, budget_s))
+def _write_flush_result(path: str, result: Tuple[int, int, int]) -> None:
+    """Write flush results to a temp file for the parent to read."""
+    result_path = path + ".flush_result"
     try:
-        f, p_, t_ = flush_spool(path, budget_s=budget_s)
-        result["flushed"] = f
-        result["pending"] = p_
-        result["terminal"] = t_
-    except TimeoutError:
-        # Deadline hit mid-flush; whatever was acked is already committed per-row.
-        pass
+        with open(result_path, "w") as f:
+            json.dump(result, f)
     except Exception:
         pass
-    finally:
-        if had_alarm:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, old_handler)
-    return result["flushed"], result["pending"], result["terminal"]
+
+
+def _read_flush_result(path: str) -> Tuple[int, int, int]:
+    result_path = path + ".flush_result"
+    try:
+        with open(result_path) as f:
+            data = json.load(f)
+        os.unlink(result_path)
+        return tuple(data)
+    except Exception:
+        return 0, 0, 0
+
+
+def flush_spool_bounded(
+    path: str, budget_s: float = _SESSION_END_BUDGET_S
+) -> Tuple[int, int, int]:
+    """Run flush_spool in a child process with a hard subprocess timeout.
+
+    This provides a real hard process boundary: if the child is killed on
+    timeout, unacked rows are retained (they were only ever deleted inside the
+    child after a successful ack). The parent never blocks longer than
+    budget_s + small overhead.
+
+    Falls back to in-process flush (with SIGALRM where available) only if the
+    subprocess cannot be spawned.
+    """
+    # Serialize current env so the child inherits the same config (disposable
+    # MNEMOSYNE_DATA_DIR, PLUGIN_DATA, etc.) without the parent leaking.
+    child_env = {k: v for k, v in os.environ.items()}
+
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import json, os, sys; "
+                    f"sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r}); "
+                    "import common; "
+                    f"r = common._flush_spool_inner({path!r}, {budget_s!r}); "
+                    f"common._write_flush_result({path!r}, r)"
+                ),
+            ],
+            env=child_env,
+            timeout=budget_s + 0.5,
+            capture_output=True,
+            text=True,
+        )
+        return _read_flush_result(path)
+    except subprocess.TimeoutExpired:
+        # Child was killed. Whatever it acked was committed per-row in the
+        # child's SQLite connection. Unacked rows are retained.
+        return _read_flush_result(path)
+    except Exception:
+        # Last-resort fallback: in-process flush.
+        return _flush_spool_inner(path, budget_s)
 
 
 # ---------------------------------------------------------------------------
@@ -669,14 +669,14 @@ def flush_spool_bounded(path: str, budget_s: float = 2.0) -> Tuple[int, int, int
 # ---------------------------------------------------------------------------
 
 
+# Test-only backdoor: MNEMOSYNE_CODEX_FORCE_SPOOL=1 forces the spool path,
+# bypassing native ingest. This is a production-code test hook documented here
+# for clarity; it does not affect deployed behavior unless set.
 def ingest_or_spool(event_dict: Dict[str, Any]) -> Tuple[Outcome, str]:
     """Try native ingest; on failure, spool for later delivery.
 
     Returns (Outcome, spool_status). spool_status is one of:
-    "stored", "duplicate", "full", "error", "" (ingest succeeded, not spooled).
-
-    If MNEMOSYNE_CODEX_FORCE_SPOOL=1, always attempt the spool path (for
-    testing the failure path without breaking the native DB).
+    "stored", "duplicate", "full", "error", "" (ingest succeeded).
     """
     force = os.environ.get("MNEMOSYNE_CODEX_FORCE_SPOOL", "") == "1"
     if not force:
