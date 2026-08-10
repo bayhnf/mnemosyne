@@ -94,10 +94,10 @@ def dry_run_batch(normalized: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def batch_validation_error_payload(exc: BatchValidationError) -> dict[str, Any]:
-    payload: dict[str, Any] = {"status": "error", "error": str(exc)}
+    payload: dict[str, Any] = {"status": "error", "error": "batch_validation_failed"}
     if exc.failed_index is not None:
         payload["failed_index"] = exc.failed_index
-    if exc.action:
+    if exc.action in _ALLOWED_BATCH_ACTIONS:
         payload["action"] = exc.action
     return payload
 
@@ -127,18 +127,18 @@ def apply_beam_batch(
                     audit_events=audit_events,
                     extract_defaults_global=extract_defaults_global,
                 ))
-    except Exception as exc:
-        logger.exception(
+    except Exception:
+        logger.error(
             "mnemosyne_batch failed at index=%s action=%s",
             current.get("index"),
             current.get("action"),
         )
-        return {
-            "status": "error",
-            "failed_index": current.get("index"),
-            "action": current.get("action"),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        error_payload: dict[str, Any] = {"status": "error", "error": "batch_failed"}
+        if current.get("index") is not None:
+            error_payload["failed_index"] = current["index"]
+        if current.get("action") in _ALLOWED_BATCH_ACTIONS:
+            error_payload["action"] = current["action"]
+        return error_payload
     if audit_event:
         for event_name, event_kwargs in audit_events:
             audit_event(event_name, **event_kwargs)

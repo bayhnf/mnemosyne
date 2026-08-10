@@ -226,3 +226,37 @@ def test_batch_requires_exact_ids_for_destructive_ops(tmp_path):
         assert result["status"] == "error"
         assert result["failed_index"] == 0
         assert result["action"] == action
+
+
+def test_batch_validation_error_hides_untrusted_action(tmp_path):
+    provider = _provider(tmp_path)
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [{"action": "synthetic-untrusted-action"}],
+    }))
+
+    assert result == {
+        "status": "error",
+        "error": "batch_validation_failed",
+        "failed_index": 0,
+    }
+    assert "synthetic-untrusted-action" not in json.dumps(result)
+
+
+def test_batch_execution_error_hides_internal_detail(tmp_path, monkeypatch, caplog):
+    provider = _provider(tmp_path)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("synthetic-internal-detail")
+
+    monkeypatch.setattr("mnemosyne.batch_tool._apply_one", _explode)
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [{"action": "remember", "content": "trigger failure"}],
+    }))
+
+    assert result["status"] == "error"
+    assert result["error"] == "batch_failed"
+    assert result["failed_index"] == 0
+    assert result["action"] == "remember"
+    assert "synthetic-internal-detail" not in json.dumps(result)
+    assert "synthetic-internal-detail" not in caplog.text
+    assert "Traceback" not in caplog.text
