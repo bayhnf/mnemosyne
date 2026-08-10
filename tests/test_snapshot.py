@@ -662,3 +662,149 @@ def test_mode_check_raises_content_free_error_without_assert(tmp_path, monkeypat
     # No path basename should leak either.
     assert ".pristine.sqlite" not in msg
     assert "source.db" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Task 9: snapshot restore must also re-acquire the writer lock on the
+# replacement inode after its own os.replace(). Snapshot does NOT inherit a
+# recovery-only fix — it has its own replace/verify/rollback/finally.
+# ---------------------------------------------------------------------------
+
+import multiprocessing as _mp
+import threading as _threading
+
+
+def _snapshot_worker_enter(target_str, enter_event, allow_event, result_queue):
+    """Separate-process competitor for snapshot restore: waits for
+    enter_event, then tries BEGIN IMMEDIATE + insert with busy_timeout=0."""
+    import sqlite3
+
+    try:
+        enter_event.wait(timeout=10)
+        conn = sqlite3.connect(target_str, timeout=0)
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO t VALUES (8888, 'competitor')")
+        conn.commit()
+        conn.close()
+        result_queue.put((True, None))
+    except sqlite3.OperationalError as exc:
+        result_queue.put((False, str(exc)))
+    except Exception as exc:  # pragma: no cover - defensive
+        result_queue.put((False, repr(exc)))
+
+
+def test_snapshot_restore_blocks_writer_in_post_replace_verify_window(
+    tmp_path, monkeypatch
+):
+    """Through restore_isolated_snapshot, a separate-process writer must NOT
+    be able to BEGIN IMMEDIATE on the target during post-replace verify.
+    Normal restore succeeds after the release event, and no public
+    SnapshotError contains the target path."""
+    source = _seed_database(tmp_path / "source.db")
+    snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+    snap = Path(snap_result["snapshot_path"])
+
+    target = tmp_path / "target.db"
+    _seed_database(target)
+
+    verify_entered = _threading.Event()
+    allow_verify = _threading.Event()
+
+    ctx = _mp.get_context("spawn")
+    m_enter = ctx.Event()
+    m_allow = ctx.Event()
+    m_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_snapshot_worker_enter,
+        args=(str(target), m_enter, m_allow, m_queue),
+    )
+    proc.start()
+
+    def gated_verify(path):
+        verify_entered.set()
+        m_enter.set()
+        allow_verify.wait(timeout=10)
+        return True
+
+    monkeypatch.setattr(snapshot_mod.recovery, "verify_integrity", gated_verify)
+
+    try:
+        result_holder = {"exc": None}
+
+        def do_restore():
+            try:
+                snapshot.restore_isolated_snapshot(snap, target)
+            except Exception as exc:
+                result_holder["exc"] = exc
+
+        t = _threading.Thread(target=do_restore)
+        t.start()
+        verify_entered.wait(timeout=10)
+        competitor_result = m_queue.get(timeout=5)
+        allow_verify.set()
+        t.join(timeout=10)
+
+        assert result_holder["exc"] is None, (
+            f"restore raised unexpectedly: {result_holder['exc']!r}"
+        )
+        entered, err = competitor_result
+        assert entered is False, (
+            "competing writer entered the snapshot post-replace VERIFY window "
+            f"(err={err})"
+        )
+        assert err is not None and "locked" in err.lower(), (
+            f"expected 'database is locked', got: {err}"
+        )
+    finally:
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+
+def test_snapshot_restore_reacquire_failure_is_content_free_and_preserves_original(
+    tmp_path, monkeypatch
+):
+    """If post-replace lock re-acquisition fails, restore_isolated_snapshot
+    must surface a content-free SnapshotError (no raw target path or file
+    name) and must retain the .restore_preserved original (data-loss guard).
+    """
+    source = _seed_database(tmp_path / "source.db")
+    snap_result = snapshot.create_isolated_snapshot(source, tmp_path / "snapshots")
+    snap = Path(snap_result["snapshot_path"])
+
+    target = tmp_path / "target.db"
+    _seed_database(target)
+    conn = sqlite3.connect(str(target))
+    conn.execute("INSERT INTO t VALUES (77, 'preserved-me')")
+    conn.commit()
+    conn.close()
+
+    original_acquire = snapshot_mod.recovery._acquire_writer_lock
+    call_count = {"n": 0}
+
+    def fail_second_acquire(db_path):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise sqlite3.OperationalError("database is locked (forced)")
+        return original_acquire(db_path)
+
+    monkeypatch.setattr(
+        snapshot_mod.recovery, "_acquire_writer_lock", fail_second_acquire
+    )
+
+    with pytest.raises(snapshot.SnapshotError) as ei:
+        snapshot.restore_isolated_snapshot(snap, target)
+
+    msg = str(ei.value)
+    assert str(target) not in msg, f"raw target path leaked into SnapshotError: {msg!r}"
+    assert target.name not in msg, (
+        f"target file name leaked into SnapshotError: {msg!r}"
+    )
+
+    # Data-loss guard: the preserved original must still exist.
+    preserved = target.with_name(target.name + ".restore_preserved")
+    assert preserved.exists(), (
+        "preserved original was deleted on re-acquire failure (data-loss)"
+    )

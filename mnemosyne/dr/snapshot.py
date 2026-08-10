@@ -225,9 +225,13 @@ def restore_isolated_snapshot(
          ``Connection.backup()``, force ``journal_mode=DELETE``, require
          ``integrity_check == "ok"`` before the atomic replace.
       5. Preserve the original target, ``os.replace`` the staged file onto
-         the target, fsync target and parent dir.
-      6. Post-replace integrity check; on failure restore the preserved
-         original in place and raise.
+         the target, then release the old-inode writer lock and re-acquire
+         ``BEGIN IMMEDIATE`` on the replacement inode (the held lock does not
+         follow the path across replace). Fsync the parent dir after
+         re-acquisition. On re-acquisition failure, surface a content-free
+         ``SnapshotError`` and retain the preserved original.
+      6. Post-replace integrity check under the new-inode lock; on failure
+         restore the preserved original in place and raise.
 
     Target is preserved on any post-check failure; pre-check failures leave
     the target untouched. Only paths created by this call are cleaned up.
@@ -306,7 +310,10 @@ def restore_isolated_snapshot(
 
         recovery._fsync_path(staged_path)
 
-        # --- 5. Preserve original, atomic replace, fsync -----------------
+        # --- 5. Preserve original, atomic replace -------------------------
+        # ponytail: rename changes SQLite's locked inode; re-acquire the native
+        # lock immediately after replace. A zero-window design needs an in-place
+        # restore or a separately governed sentinel lock.
         if preserved_existed:
             shutil.copy2(target_path, preserved_path)
             # The preserved copy is an artifact of THIS call, so it must be
@@ -314,9 +321,24 @@ def restore_isolated_snapshot(
             # can still fail after os.replace succeeds).
             created.append(preserved_path)
         os.replace(staged_path, target_path)
-        recovery._fsync_path(target_path)
-        recovery._fsync_dir(target_path.parent)
         created.remove(staged_path)  # consumed by replace
+        # The old-inode lock no longer covers the path; release it and
+        # re-acquire on the replacement inode BEFORE any fsync or verify, so
+        # the vulnerable interval is just the release+acquire syscall pair.
+        # The staged bytes were fsynced pre-replace; dir fd is a different
+        # inode and safe to fsync under the held file lock.
+        lock_conn = recovery._release_writer_lock(lock_conn)
+        try:
+            lock_conn = recovery._reacquire_writer_lock(target_path)
+        except Exception as exc:
+            # Content-free: no raw target path escapes the public exception.
+            # Retain the preserved original: exception cleanup would otherwise
+            # delete the only remaining copy of the original while the target
+            # holds an image a competitor may have touched.
+            if preserved_path in created:
+                created.remove(preserved_path)
+            raise SnapshotError("could not reacquire exclusive writer lock") from exc
+        recovery._fsync_dir(target_path.parent)
 
         # --- 6. Post-replace integrity; rollback on failure --------------
         if not recovery.verify_integrity(target_path):
@@ -340,12 +362,7 @@ def restore_isolated_snapshot(
             raise
         raise SnapshotError("restore failed") from exc
     finally:
-        if lock_conn is not None:
-            try:
-                lock_conn.rollback()
-                lock_conn.close()
-            except sqlite3.Error:
-                pass
+        lock_conn = recovery._release_writer_lock(lock_conn)
 
     return {
         "restored": True,

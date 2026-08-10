@@ -7,6 +7,7 @@ uses. Previously they hardcoded ``~/.mnemosyne/data`` and ignored
 MNEMOSYNE_DATA_DIR / HERMES_HOME, so they operated on (or failed to find) the
 wrong database.
 """
+
 from __future__ import annotations
 
 import json
@@ -47,7 +48,9 @@ def test_get_default_paths_backup_dir_override(monkeypatch, tmp_path):
     assert backup_dir == tmp_path / "custom_backups"
 
 
-def test_get_default_paths_data_dir_takes_precedence_over_hermes_home(monkeypatch, tmp_path):
+def test_get_default_paths_data_dir_takes_precedence_over_hermes_home(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "explicit"))
     data_dir, _, db_path = recovery.get_default_paths()
@@ -74,6 +77,7 @@ def test_create_backup_succeeds_with_sqlite_vec_tables(tmp_path):
     conn = sqlite3.connect(str(db_path))
     conn.enable_load_extension(True)
     import sqlite_vec
+
     sqlite_vec.load(conn)
     conn.execute(
         "CREATE VIRTUAL TABLE vec_items USING vec0("
@@ -93,6 +97,7 @@ def test_create_backup_succeeds_with_sqlite_vec_tables(tmp_path):
     assert Path(result["backup_path"]).exists()
     assert result["backup_size"] > 0
     import gzip
+
     with gzip.open(result["backup_path"], "rt") as f:
         dump = f.read()
     assert "vec_items" in dump
@@ -203,7 +208,9 @@ def test_restore_failed_integrity_preserves_original(tmp_path):
 
     # Break the dump so it produces an invalid DB but still parses as SQL.
     raw = _gzip.decompress(backup_path.read_bytes())
-    backup_path.write_bytes(_gzip.compress(raw.replace(b"CREATE TABLE", b"BREAK TABLE")))
+    backup_path.write_bytes(
+        _gzip.compress(raw.replace(b"CREATE TABLE", b"BREAK TABLE"))
+    )
 
     with pytest.raises(Exception):
         recovery.restore_backup(backup_path, db_path)
@@ -231,9 +238,9 @@ def test_successful_restore_replaces_target_and_preserves_original(tmp_path):
     assert result["integrity_check"] is True
     conn = sqlite3.connect(str(db_path))
     total = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
-    post_backup_gone = conn.execute(
-        "SELECT COUNT(*) FROM t WHERE id = 42"
-    ).fetchone()[0]
+    post_backup_gone = conn.execute("SELECT COUNT(*) FROM t WHERE id = 42").fetchone()[
+        0
+    ]
     conn.close()
     assert total == 2, "target not restored to backup contents"
     assert post_backup_gone == 0
@@ -343,9 +350,7 @@ class TestRestorePostReplaceIntegrityFailure:
 
 
 class TestExclusiveWriterLockHeld:
-    def test_competing_writer_cannot_enter_staging_window(
-        self, tmp_path, monkeypatch
-    ):
+    def test_competing_writer_cannot_enter_staging_window(self, tmp_path, monkeypatch):
         """A second connection must be unable to BEGIN IMMEDIATE while a
         restore holds the writer lock across staging and os.replace."""
         db_path = tmp_path / "src.db"
@@ -365,6 +370,7 @@ class TestExclusiveWriterLockHeld:
                 events["locked"] = True
                 ready.set()
                 import time
+
                 time.sleep(0.3)
             return original_replace(staged, dest)
 
@@ -422,9 +428,7 @@ class TestBackupAndStagingRaces:
 
         def make():
             try:
-                results.append(
-                    recovery.create_backup(db_path=db_path, backup_dir=bdir)
-                )
+                results.append(recovery.create_backup(db_path=db_path, backup_dir=bdir))
             except Exception as exc:
                 errors.append(exc)
 
@@ -526,6 +530,7 @@ class TestBackupAndStagingRaces:
 # fires before enable_load_extension runs).
 # ---------------------------------------------------------------------------
 
+
 def _install_sqlite_vec_stub(monkeypatch, load_side_effect=None):
     """Install a fake ``sqlite_vec`` module whose ``load(conn)`` mirrors the
     real extension's behavior: it requires (and enables) extension loading on
@@ -536,6 +541,7 @@ def _install_sqlite_vec_stub(monkeypatch, load_side_effect=None):
     current loader calls enable_load_extension(True) and never restores it).
     """
     import sys, types
+
     fake = types.ModuleType("sqlite_vec")
 
     def _load(conn):
@@ -576,7 +582,9 @@ def test_load_sqlite_vec_disables_extension_loading_after_success(monkeypatch):
     _assert_load_extension_blocked(conn)
 
 
-def test_load_sqlite_vec_disables_extension_loading_after_operational_error(monkeypatch):
+def test_load_sqlite_vec_disables_extension_loading_after_operational_error(
+    monkeypatch,
+):
     """If sqlite_vec.load() itself raises OperationalError (e.g. a failed
     dlopen on a present-but-broken build), enable_load_extension(True) has
     already run and must still be re-disabled.
@@ -596,6 +604,7 @@ def test_load_sqlite_vec_disables_extension_loading_when_absent(monkeypatch):
     makes the assertion load-bearing for the future.)
     """
     import sys
+
     monkeypatch.setitem(sys.modules, "sqlite_vec", None)
     conn = sqlite3.connect(":memory:")
     recovery._load_sqlite_vec(conn)  # must not raise
@@ -643,4 +652,287 @@ def test_restore_backup_rejects_load_extension_in_dump(tmp_path, monkeypatch):
         f"untrusted dump SQL reached load_extension during restore "
         f"(extension loading was enabled on the staged connection): "
         f"{excinfo.value!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 9: re-acquire the writer lock on the replacement inode after
+# os.replace(). A BEGIN IMMEDIATE lock binds to the inode opened at connect
+# time; after os.replace the path resolves to a NEW inode that the held lock
+# does not cover. These tests prove a competing writer (a separate process
+# with busy_timeout=0) cannot enter the post-replace verify or rollback
+# window, that re-acquisition failure is fail-closed and visible, and that
+# rollback remains an in-place copy (inode-stable) so the new-inode lock
+# covers it.
+#
+# Competitors run in a SEPARATE PROCESS (multiprocessing) coordinated by
+# multiprocessing.Event / Queue — no arbitrary sleeps. This catches a lock
+# regression that same-process threads would not on a POSIX-fcntl-lock build.
+# ---------------------------------------------------------------------------
+
+import multiprocessing as _mp
+import shutil as _shutil
+
+
+def _backup_and_target(tmp_path):
+    """Build a valid backup and an existing target with a distinguishing row."""
+    db_path = tmp_path / "src.db"
+    bdir = tmp_path / "bk"
+    _make_db_simple(db_path)
+    backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+    target = tmp_path / "target.db"
+    _make_db_simple(target)
+    conn = sqlite3.connect(str(target))
+    conn.execute("INSERT INTO t VALUES (777, 'target-original')")
+    conn.commit()
+    conn.close()
+    return backup, target
+
+
+def _competitor_worker(target_str, enter_event, allow_event, result_queue):
+    """Separate-process competitor: wait for enter_event, then try to acquire
+    a writer lock with busy_timeout=0 and insert a row. Reports (entered, err)
+    via result_queue."""
+    try:
+        enter_event.wait(timeout=10)
+        conn = sqlite3.connect(target_str, timeout=0)
+        conn.execute("PRAGMA busy_timeout=0")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO t VALUES (8888, 'competitor')")
+        conn.commit()
+        conn.close()
+        result_queue.put((True, None))
+    except sqlite3.OperationalError as exc:
+        result_queue.put((False, str(exc)))
+    except Exception as exc:  # pragma: no cover - defensive
+        result_queue.put((False, repr(exc)))
+
+
+def test_competing_writer_cannot_enter_post_replace_verify_window(
+    tmp_path, monkeypatch
+):
+    """A separate-process writer must NOT be able to BEGIN IMMEDIATE on the
+    target while post-replace integrity verification runs. Before the fix the
+    held lock belongs to the OLD inode (replaced away), so the competitor
+    succeeds."""
+    backup, target = _backup_and_target(tmp_path)
+
+    verify_entered = _threading.Event()
+    allow_verify = _threading.Event()
+
+    def gated_verify(path):
+        verify_entered.set()
+        allow_verify.wait(timeout=10)
+        return True
+
+    monkeypatch.setattr(recovery, "verify_integrity", gated_verify)
+
+    # Use a multiprocessing Event/Queue visible to the child process.
+    ctx = _mp.get_context("spawn")
+    m_enter = ctx.Event()
+    m_allow = ctx.Event()
+    m_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_competitor_worker,
+        args=(str(target), m_enter, m_allow, m_queue),
+    )
+    proc.start()
+
+    # Bridge the in-process threading.Event to the multiprocessing.Event so
+    # the competitor is released exactly when verify_integrity is entered.
+    def gated_verify_mp(path):
+        verify_entered.set()
+        m_enter.set()
+        allow_verify.wait(timeout=10)
+        return True
+
+    monkeypatch.setattr(recovery, "verify_integrity", gated_verify_mp)
+
+    try:
+        # Run restore in a thread so we can handshake events.
+        result_holder = {"exc": None}
+
+        def do_restore():
+            try:
+                recovery.restore_backup(Path(backup["backup_path"]), target)
+            except Exception as exc:
+                result_holder["exc"] = exc
+
+        t = _threading.Thread(target=do_restore)
+        t.start()
+        # Wait until verify is entered (competitor now released).
+        verify_entered.wait(timeout=10)
+        # Give the competitor a moment to attempt (it will block/fail under
+        # the fix; under the bug it commits instantly). Poll the queue with a
+        # short timeout instead of sleeping.
+        competitor_result = m_queue.get(timeout=5)
+        allow_verify.set()
+        t.join(timeout=10)
+
+        assert result_holder["exc"] is None, (
+            f"restore raised unexpectedly: {result_holder['exc']!r}"
+        )
+        entered, err = competitor_result
+        assert entered is False, (
+            "competing writer entered the post-replace VERIFY window and "
+            f"committed a row (err={err})"
+        )
+        assert err is not None and "locked" in err.lower(), (
+            f"expected 'database is locked', got: {err}"
+        )
+    finally:
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+
+def test_competing_writer_cannot_enter_post_replace_rollback_window(
+    tmp_path, monkeypatch
+):
+    """When post-replace verify fails and the rollback copy runs, a separate-
+    process writer must NOT be able to BEGIN IMMEDIATE on the target. Before
+    the fix the new inode is unlocked during rollback."""
+    backup, target = _backup_and_target(tmp_path)
+    original_bytes = target.read_bytes()
+
+    monkeypatch.setattr(recovery, "verify_integrity", lambda p: False)
+
+    ctx = _mp.get_context("spawn")
+    m_enter = ctx.Event()
+    m_allow = ctx.Event()
+    m_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_competitor_worker,
+        args=(str(target), m_enter, m_allow, m_queue),
+    )
+    proc.start()
+
+    rollback_entered = _threading.Event()
+    allow_rollback = _threading.Event()
+    real_copy2 = _shutil.copy2
+
+    def gated_copy2(src, dst, *args, **kwargs):
+        # Only the rollback direction: preserved -> target.
+        if str(src).endswith(".restore_preserved") and str(dst) == str(target):
+            rollback_entered.set()
+            m_enter.set()
+            allow_rollback.wait(timeout=10)
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("mnemosyne.dr.recovery.shutil.copy2", gated_copy2)
+
+    try:
+        result_holder = {"exc": None}
+
+        def do_restore():
+            try:
+                recovery.restore_backup(Path(backup["backup_path"]), target)
+            except Exception as exc:
+                result_holder["exc"] = exc
+
+        t = _threading.Thread(target=do_restore)
+        t.start()
+        rollback_entered.wait(timeout=10)
+        competitor_result = m_queue.get(timeout=5)
+        allow_rollback.set()
+        t.join(timeout=10)
+
+        assert result_holder["exc"] is not None, (
+            "restore did not raise after forced post-replace integrity failure"
+        )
+        entered, err = competitor_result
+        assert entered is False, (
+            "competing writer entered the post-replace ROLLBACK window and "
+            f"committed a row (err={err})"
+        )
+        assert err is not None and "locked" in err.lower(), (
+            f"expected 'database is locked', got: {err}"
+        )
+        # Rollback restored original bytes in place.
+        assert target.read_bytes() == original_bytes, (
+            "target bytes differ from original after rollback"
+        )
+    finally:
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+
+def test_restore_backup_post_replace_reacquire_failure_is_visible_and_valid(
+    tmp_path, monkeypatch
+):
+    """If the SECOND (post-replace) writer-lock acquisition fails, the restore
+    must raise visibly (fail-closed) and never claim success. The target holds
+    the staged image (verified + fsynced before replace). This test fakes the
+    failure; the real-race contract is a visible failure + retained preserved
+    original, not a proof that a competitor could not have changed the target.
+    """
+    backup, target = _backup_and_target(tmp_path)
+
+    original_acquire = recovery._acquire_writer_lock
+    call_count = {"n": 0}
+
+    def fail_second_acquire(db_path):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return original_acquire(db_path)
+
+    monkeypatch.setattr(recovery, "_acquire_writer_lock", fail_second_acquire)
+
+    with pytest.raises(Exception) as excinfo:
+        recovery.restore_backup(Path(backup["backup_path"]), target)
+
+    # Fail-closed: a visible error, not a silent success.
+    assert (
+        "locked" in str(excinfo.value).lower()
+        or "restore" in str(excinfo.value).lower()
+    ), f"unexpected error shape: {excinfo.value!r}"
+
+    # The staged image at the path is a valid database (it was verified and
+    # fsynced before the replace). Pinned only because this test fakes the
+    # failure with no real competitor.
+    conn = sqlite3.connect(str(target))
+    ok = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    conn.close()
+    assert ok == "ok", "staged image left at target was not a valid database"
+
+    # The preserved original is retained (recovery never cleans it).
+    preserved = target.with_name(target.name + ".restore_preserved")
+    assert preserved.exists(), "preserved original was lost on reacquire failure"
+
+
+def test_restore_backup_rollback_copy_keeps_target_inode(tmp_path, monkeypatch):
+    """The rollback copy (shutil.copy2 preserved -> target) must be in-place:
+    it must NOT replace the target inode. This pins the assumption that lets
+    the replacement-inode lock cover the rollback copy."""
+    backup, target = _backup_and_target(tmp_path)
+
+    monkeypatch.setattr(recovery, "verify_integrity", lambda p: False)
+
+    inodes = {}
+    real_copy2 = _shutil.copy2
+
+    def inode_tracking_copy2(src, dst, *args, **kwargs):
+        if str(src).endswith(".restore_preserved") and str(dst) == str(target):
+            inodes["before"] = os.stat(str(target)).st_ino
+        result = real_copy2(src, dst, *args, **kwargs)
+        if str(src).endswith(".restore_preserved") and str(dst) == str(target):
+            inodes["after"] = os.stat(str(target)).st_ino
+        return result
+
+    monkeypatch.setattr("mnemosyne.dr.recovery.shutil.copy2", inode_tracking_copy2)
+
+    with pytest.raises(Exception):
+        recovery.restore_backup(Path(backup["backup_path"]), target)
+
+    assert "before" in inodes and "after" in inodes, (
+        "rollback copy was not observed (inode tracking did not fire)"
+    )
+    assert inodes["before"] == inodes["after"], (
+        f"rollback copy changed the target inode ({inodes['before']} -> "
+        f"{inodes['after']}); the new-inode lock would NOT cover the rollback"
     )

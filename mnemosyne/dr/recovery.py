@@ -38,7 +38,9 @@ def get_default_paths():
     else:
         root = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
         data_dir = root / "mnemosyne" / "data"
-    backup_dir = Path(os.environ.get("MNEMOSYNE_BACKUP_DIR", data_dir.parent / "backups"))
+    backup_dir = Path(
+        os.environ.get("MNEMOSYNE_BACKUP_DIR", data_dir.parent / "backups")
+    )
     db_path = data_dir / "mnemosyne.db"
     return data_dir, backup_dir, db_path
 
@@ -51,6 +53,7 @@ def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> Path:
     a short random suffix until an exclusive create succeeds.
     """
     import secrets
+
     suffix = ""
     for _ in range(64):
         name = f"mnemosyne_backup_{timestamp}{suffix}.db.gz"
@@ -68,6 +71,7 @@ def _unique_staged_path(db_path: Path) -> Path:
     """A staged-restore path unique per invocation, so concurrent restores to
     the same target cannot clobber each other's staging file."""
     import secrets
+
     token = secrets.token_hex(4)
     return db_path.with_name(f"{db_path.name}.{os.getpid()}.{token}.restore_staged")
 
@@ -89,22 +93,22 @@ def _fsync_dir(path: Path) -> None:
 def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     """
     Create a compressed backup of the database.
-    
+
     Returns:
         Dict with backup_path, size, checksum, and timestamp
     """
     _, default_backup_dir, default_db = get_default_paths()
     db_path = db_path or default_db
     backup_dir = backup_dir or default_backup_dir
-    
+
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
-    
+
     backup_dir.mkdir(parents=True, exist_ok=True)
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = _allocate_unique_backup_path(backup_dir, timestamp)
-    
+
     # Use sqlite3 online backup API instead of shutil.copyfileobj.
     # sqlite3.backup() is lock-aware (acquires read-lock), includes
     # uncommitted WAL frames, and is atomic — it won't produce a torn
@@ -150,18 +154,18 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
         "db_checksum": db_checksum,
         "backup_checksum": backup_checksum,
         "dump_checksum": dump_checksum,
-        "compressed": True
+        "compressed": True,
     }
-    
+
     # Save metadata
-    meta_path = backup_path.with_suffix('.gz.json')
-    with open(meta_path, 'w') as f:
+    meta_path = backup_path.with_suffix(".gz.json")
+    with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2)
-    
+
     return {
         "backup_path": str(backup_path),
         "metadata_path": str(meta_path),
-        **metadata
+        **metadata,
     }
 
 
@@ -181,6 +185,7 @@ def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
     conn.enable_load_extension(True)
     try:
         import sqlite_vec
+
         sqlite_vec.load(conn)
     except (ImportError, sqlite3.OperationalError):
         pass  # optional extra; absence/breakage just means no vec0 tables
@@ -236,6 +241,41 @@ def _acquire_writer_lock(db_path: Path) -> Optional[sqlite3.Connection]:
     return lock_conn
 
 
+def _release_writer_lock(conn: Optional[sqlite3.Connection]) -> None:
+    """Safely roll back and close a held writer-lock connection.
+
+    Returns None so call sites rebind (lock_conn = _release_writer_lock(
+    lock_conn)), making cleanup idempotent: the finally can call it on
+    a connection that was already released. Tolerates an already-closed
+    connection by swallowing sqlite3.Error. Replaces the duplicated
+    rollback()/close() blocks in the restore paths.
+    """
+    if conn is None:
+        return None
+    try:
+        conn.rollback()
+    except sqlite3.Error:
+        pass
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+    return None
+
+
+def _reacquire_writer_lock(db_path: Path) -> sqlite3.Connection:
+    """Re-acquire the exclusive writer lock on the *replacement* inode.
+
+    os.replace swaps the path to a new inode; the connection held since
+    before the replace still locks the OLD (now-unlinked) inode. This must be
+    called immediately after os.replace so the new inode is covered for
+    post-replace verify and rollback. It delegates to _acquire_writer_lock
+    (no second lock implementation) and raises a visible RuntimeError if
+    the new inode cannot be locked — never silently continuing.
+    """
+    return _acquire_writer_lock(db_path)
+
+
 def _fsync_path(path: Path) -> None:
     """fsync a file path so the staged bytes reach durable storage."""
     fd = os.open(str(path), os.O_RDONLY)
@@ -264,8 +304,11 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
          directory, load sqlite-vec where supported, and run
          ``PRAGMA integrity_check``. fsync the staged file.
       5. Preserve the original as ``.restore_preserved``, ``os.replace`` the
-         staged file onto the target, fsync the target AND its parent dir.
-      6. Re-open the target and run ``PRAGMA integrity_check``. If it fails,
+         staged file onto the target, then immediately release the old-inode
+         writer lock and re-acquire ``BEGIN IMMEDIATE`` on the replacement
+         inode (the held lock does not follow the path across replace). Fsync
+         the parent dir after re-acquisition.
+      6. Run ``PRAGMA integrity_check`` under the new-inode lock. If it fails,
          restore the preserved original in place, fsync, and raise — never
          report success after a failed post-replace check.
 
@@ -305,9 +348,7 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
             f"to restore without checksum verification."
         ) from exc
     if not isinstance(metadata, dict):
-        raise RuntimeError(
-            "Backup metadata is not a JSON object; refusing to restore."
-        )
+        raise RuntimeError("Backup metadata is not a JSON object; refusing to restore.")
 
     with gzip.open(backup_path, "rb") as f_in:
         dump_bytes = f_in.read()
@@ -372,13 +413,22 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
 
         _fsync_path(staged_path)
 
-        # --- 5. Preserve original, atomic replace, fsync target + dir ----
+        # --- 5. Preserve original, atomic replace -------------------------
+        # ponytail: rename changes SQLite's locked inode; re-acquire the native
+        # lock immediately after replace. A zero-window design needs an in-place
+        # restore or a separately governed sentinel lock.
         if preserved_existed:
             shutil.copy2(db_path, preserved_path)
         os.replace(staged_path, db_path)
-        _fsync_path(db_path)
-        _fsync_dir(db_path.parent)
         staged_path = None  # consumed by replace
+        # The old-inode lock no longer covers the path; release it and
+        # re-acquire on the replacement inode BEFORE any fsync or verify, so
+        # the vulnerable interval is just the release+acquire syscall pair.
+        lock_conn = _release_writer_lock(lock_conn)
+        lock_conn = _reacquire_writer_lock(db_path)
+        # Dir fsync persists the rename; dir fd is a different inode, safe
+        # under the held file lock. The staged bytes were fsynced pre-replace.
+        _fsync_dir(db_path.parent)
 
         # --- 6. Post-replace integrity check; restore original on failure
         if not verify_integrity(db_path):
@@ -393,12 +443,7 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
                 f"original target was restored from {preserved_path}."
             )
     finally:
-        if lock_conn is not None:
-            try:
-                lock_conn.rollback()
-                lock_conn.close()
-            except sqlite3.Error:
-                pass
+        lock_conn = _release_writer_lock(lock_conn)
         if staged_path is not None and staged_path.exists():
             try:
                 staged_path.unlink()
@@ -419,61 +464,57 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
 def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
     """
     Automatically restore from the most recent valid backup.
-    
+
     Returns:
         Dict with restore status
     """
     _, default_backup_dir, default_db = get_default_paths()
     backup_dir = backup_dir or default_backup_dir
     db_path = db_path or default_db
-    
+
     # Find all backups
     backups = sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True)
-    
+
     if not backups:
         raise FileNotFoundError("No backups found in " + str(backup_dir))
-    
+
     # Try each backup until one works
     for backup in backups:
         try:
             result = restore_backup(backup, db_path)
             if result["integrity_check"]:
-                return {
-                    "restored": True,
-                    "backup_used": str(backup),
-                    "attempts": 1
-                }
+                return {"restored": True, "backup_used": str(backup), "attempts": 1}
         except Exception:
             continue
-    
+
     raise RuntimeError("All backups failed integrity check")
 
 
 def verify_integrity(db_path: Path = None) -> bool:
     """
     Verify SQLite database integrity.
-    
+
     Returns:
         True if database is valid, False otherwise
     """
     import sqlite3
-    
+
     _, _, default_db = get_default_paths()
     db_path = db_path or default_db
-    
+
     if not db_path.exists():
         return False
-    
+
     try:
         conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
-        
+
         # Run PRAGMA integrity_check
         cursor.execute("PRAGMA integrity_check")
         result = cursor.fetchone()
-        
+
         conn.close()
-        
+
         return result[0] == "ok"
     except Exception:
         return False
@@ -482,137 +523,145 @@ def verify_integrity(db_path: Path = None) -> bool:
 def list_backups(backup_dir: Path = None) -> List[Dict]:
     """
     List all available backups with metadata.
-    
+
     Returns:
         List of backup information dictionaries
     """
     _, default_backup_dir, _ = get_default_paths()
     backup_dir = backup_dir or default_backup_dir
-    
+
     backups = []
-    for backup_file in sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True):
-        meta_file = backup_file.with_suffix('.gz.json')
-        
+    for backup_file in sorted(
+        backup_dir.glob("mnemosyne_backup_*.db.gz"), reverse=True
+    ):
+        meta_file = backup_file.with_suffix(".gz.json")
+
         info = {
             "file": str(backup_file),
             "name": backup_file.name,
             "size": backup_file.stat().st_size,
-            "modified": datetime.fromtimestamp(backup_file.stat().st_mtime).isoformat()
+            "modified": datetime.fromtimestamp(backup_file.stat().st_mtime).isoformat(),
         }
-        
+
         if meta_file.exists():
             with open(meta_file) as f:
                 info["metadata"] = json.load(f)
-        
+
         backups.append(info)
-    
+
     return backups
 
 
 def rotate_backups(backup_dir: Path = None, keep: int = 10) -> Dict:
     """
     Rotate backups, keeping only the most recent N.
-    
+
     Args:
         keep: Number of backups to retain
-        
+
     Returns:
         Dict with rotation results
     """
     _, default_backup_dir, _ = get_default_paths()
     backup_dir = backup_dir or default_backup_dir
-    
+
     backups = sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"))
-    
+
     to_delete = backups[:-keep] if len(backups) > keep else []
     deleted = []
-    
+
     for backup in to_delete:
         # Delete backup and metadata
         backup.unlink()
-        meta = backup.with_suffix('.gz.json')
+        meta = backup.with_suffix(".gz.json")
         if meta.exists():
             meta.unlink()
         deleted.append(backup.name)
-    
+
     return {
         "total_backups": len(backups),
         "kept": keep,
         "deleted": len(deleted),
-        "deleted_files": deleted
+        "deleted_files": deleted,
     }
 
 
 def health_check() -> Dict:
     """
     Comprehensive health check of Mnemosyne system.
-    
+
     Returns:
         Dict with health status of all components
     """
     data_dir, backup_dir, db_path = get_default_paths()
-    
+
     # Check database
     db_exists = db_path.exists()
     db_valid = verify_integrity(db_path) if db_exists else False
-    
+
     # Check backups
-    backups = list(backup_dir.glob("mnemosyne_backup_*.db.gz")) if backup_dir.exists() else []
-    
+    backups = (
+        list(backup_dir.glob("mnemosyne_backup_*.db.gz")) if backup_dir.exists() else []
+    )
+
     return {
         "database": {
             "exists": db_exists,
             "valid": db_valid,
             "path": str(db_path),
-            "message": "Database integrity verified" if db_valid else "Database missing or corrupt"
+            "message": "Database integrity verified"
+            if db_valid
+            else "Database missing or corrupt",
         },
         "backups": {
             "total": len(backups),
             "latest": str(backups[-1]) if backups else None,
-            "directory": str(backup_dir)
+            "directory": str(backup_dir),
         },
-        "status": "healthy" if db_valid else "unhealthy"
+        "status": "healthy" if db_valid else "unhealthy",
     }
 
 
 # CLI interface
 if __name__ == "__main__":
     import sys
-    
+
     if len(sys.argv) < 2:
-        print("Usage: python -m mnemosyne.dr [backup|restore|emergency|verify|list|health|rotate]")
+        print(
+            "Usage: python -m mnemosyne.dr [backup|restore|emergency|verify|list|health|rotate]"
+        )
         sys.exit(1)
-    
+
     cmd = sys.argv[1]
-    
+
     if cmd == "backup":
         result = create_backup()
         print(json.dumps(result, indent=2))
-    
+
     elif cmd == "restore" and len(sys.argv) > 2:
         result = restore_backup(Path(sys.argv[2]))
         print(json.dumps(result, indent=2))
-    
+
     elif cmd == "emergency":
         result = emergency_restore()
         print(json.dumps(result, indent=2))
-    
+
     elif cmd == "verify":
         valid = verify_integrity()
         print(json.dumps({"valid": valid}))
-    
+
     elif cmd == "list":
         backups = list_backups()
         print(json.dumps(backups, indent=2))
-    
+
     elif cmd == "health":
         status = health_check()
         print(json.dumps(status, indent=2))
-    
+
     elif cmd == "rotate":
         result = rotate_backups()
         print(json.dumps(result, indent=2))
-    
+
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
