@@ -283,7 +283,9 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
     enrichment so two workers cannot duplicate work. Claims are acquired and
     released in short SQLite transactions; enrichment (network/embedding)
     never runs while a transaction is open. Stale claims (crashed worker /
-    expired lease) are reclaimed deterministically.
+    expired lease) are reclaimed deterministically. Release and finalize are
+    ownership-guarded by claim_worker_id, so a worker whose lease was
+    reclaimed cannot clear or overwrite the new owner's claim.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive integer")
@@ -317,10 +319,12 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
 
         try:
             if attempts >= MAX_ATTEMPTS:
-                _finalize_claimed(
+                if not _finalize_claimed(
                     conn, event_id, "failed_terminal",
-                    "max_attempts_exceeded", attempts, release=True,
-                )
+                    "max_attempts_exceeded", attempts,
+                    release=True, worker_id=worker_id,
+                ):
+                    continue  # Claim was reclaimed; the new owner finalizes.
                 report.attempted += 1
                 report.failed_terminal += 1
                 report.receipts.append(_final_row(conn, event_id))
@@ -328,10 +332,12 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
 
             memory_rows = _load_memory_rows(conn, row["memory_ids"])
             if not memory_rows:
-                _finalize_claimed(
+                if not _finalize_claimed(
                     conn, event_id, "failed_terminal",
-                    "memory_row_missing", attempts + 1, release=True,
-                )
+                    "memory_row_missing", attempts + 1,
+                    release=True, worker_id=worker_id,
+                ):
+                    continue  # Claim was reclaimed; the new owner finalizes.
                 report.attempted += 1
                 report.failed_terminal += 1
                 report.receipts.append(_final_row(conn, event_id))
@@ -356,15 +362,18 @@ def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
                 if severity[status] > severity[final_status]:
                     final_status, final_code = status, code
 
-            _finalize_claimed(
+            if not _finalize_claimed(
                 conn, event_id, final_status, final_code,
-                attempts + 1, release=True,
-            )
+                attempts + 1, release=True, worker_id=worker_id,
+            ):
+                continue  # Claim was reclaimed; the new owner finalizes.
         except Exception:
             # Crash during enrichment: release the claim so the receipt is
             # not stranded (its index_status stays as-is, still retryable).
+            # Ownership-guarded: if the claim was reclaimed meanwhile, this is
+            # a no-op and the new owner's claim stays intact.
             try:
-                _release_claim(conn, event_id)
+                _release_claim(conn, event_id, worker_id)
             except Exception:
                 pass
             raise
@@ -456,16 +465,22 @@ def _try_claim(
         raise
 
 
-def _release_claim(conn: sqlite3.Connection, event_id: str) -> None:
-    """Clear a claim so a crashed/finished worker does not strand the receipt."""
+def _release_claim(
+    conn: sqlite3.Connection, event_id: str, worker_id: str
+) -> None:
+    """Clear THIS worker's claim (ownership-guarded CAS).
+
+    A worker whose lease was reclaimed by another worker must not clear the
+    new owner's live claim; the WHERE clause makes the stale release a no-op.
+    """
     _begin_write(conn)
     try:
         conn.execute(
             """UPDATE ingest_receipts
                SET claim_worker_id = NULL,
                    claim_worker_lease = NULL
-               WHERE event_id = ?""",
-            (event_id,),
+               WHERE event_id = ? AND claim_worker_id = ?""",
+            (event_id, worker_id),
         )
         conn.commit()
     except Exception:
@@ -484,13 +499,20 @@ def _finalize_claimed(
     attempts: int,
     *,
     release: bool,
-) -> None:
-    """Move a claimed receipt to its terminal/retryable state and release the
-    claim in one short transaction."""
+    worker_id: str,
+) -> bool:
+    """Move THIS worker's claimed receipt to its terminal/retryable state and
+    release the claim in one short transaction.
+
+    Ownership-guarded CAS: the UPDATE applies only while the row is still
+    claimed by ``worker_id``. Returns True if this worker still owned the
+    claim (state was written); False if another worker reclaimed it, so the
+    caller must not report a receipt it no longer owns.
+    """
     now = _now_iso()
     _begin_write(conn)
     try:
-        conn.execute(
+        cur = conn.execute(
             """UPDATE ingest_receipts
                SET index_status = ?,
                    attempts = ?,
@@ -498,7 +520,7 @@ def _finalize_claimed(
                    last_error_at = ?,
                    updated_at = ?"""
             + (", claim_worker_id = NULL, claim_worker_lease = NULL" if release else "")
-            + """ WHERE event_id = ?""",
+            + """ WHERE event_id = ? AND claim_worker_id = ?""",
             (
                 index_status,
                 attempts,
@@ -506,9 +528,11 @@ def _finalize_claimed(
                 now if error_code else None,
                 now,
                 event_id,
+                worker_id,
             ),
         )
         conn.commit()
+        return cur.rowcount == 1
     except Exception:
         try:
             conn.rollback()

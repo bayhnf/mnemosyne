@@ -25,7 +25,7 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -629,8 +629,6 @@ def test_pending_original_remains_retryable_after_conflict(beam, vec_ready, monk
     """Exact sequence: raw commit leaves stored/pending; a conflict occurs;
     retry_pending_ingest() can still claim and finish the original without
     duplicate memory/sync rows and without stranding it terminal."""
-    import mnemosyne.core.inhale as inhale
-
     def _flaky_embed(texts):
         raise RuntimeError("embedding service down")
 
@@ -983,3 +981,227 @@ def test_delayed_worker_cannot_claim_terminalized_receipt(temp_db, vec_ready, mo
     assert row[0] == "stored"
     assert row[1] == "failed_terminal"
     assert row[2] == 99
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 3: ownership-guarded claim release/finalize (I-2)
+# ---------------------------------------------------------------------------
+
+
+def _pending_receipt(b, event_id, monkeypatch):
+    """Create a durable stored/pending receipt (crash during initial finalize).
+
+    Unlike the older crash tests, this does NOT call ``monkeypatch.undo()``:
+    the test and its fixtures share one monkeypatch instance, so undo() would
+    also tear down ``vec_ready``'s mocks in environments without real
+    fastembed/sqlite-vec, making the retry deterministically degraded.
+    """
+    import mnemosyne.core.inhale as inhale
+
+    monkeypatch.setattr(
+        inhale,
+        "_finalize_receipt",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError):
+        b.remember_event(_event(event_id=event_id))
+
+
+def test_stale_worker_cannot_release_other_workers_live_claim(
+    temp_db, vec_ready, monkeypatch
+):
+    """I-2: worker A overruns its 60s lease while still mid-enrichment; worker
+    B reclaims. A's crash-path release must not clear B's live claim."""
+    import mnemosyne.core.inhale as inhale
+
+    BeamMemory(session_id="i2rel", db_path=temp_db)
+    b = BeamMemory(session_id="i2rel", db_path=temp_db)
+    _pending_receipt(b, "evt-I2REL", monkeypatch)
+
+    now = inhale._now_epoch()
+    assert inhale._try_claim(
+        b.conn, "evt-I2REL", "worker-a",
+        inhale._iso_from_epoch(now + 60), inhale._iso_from_epoch(now),
+    ) is True
+
+    # A's lease expires; B reclaims deterministically while A is still alive.
+    late = inhale._iso_from_epoch(now + 3600)
+    assert inhale._try_claim(
+        b.conn, "evt-I2REL", "worker-b",
+        inhale._iso_from_epoch(now + 3660), late,
+    ) is True
+
+    # A's release must be ownership-guarded: B's live claim survives.
+    inhale._release_claim(b.conn, "evt-I2REL", "worker-a")
+    row = b.conn.execute(
+        "SELECT claim_worker_id, claim_worker_lease FROM ingest_receipts"
+        " WHERE event_id = 'evt-I2REL'"
+    ).fetchone()
+    assert row["claim_worker_id"] == "worker-b"
+    assert row["claim_worker_lease"] == inhale._iso_from_epoch(now + 3660)
+
+    # B can still finalize its own claim normally.
+    assert inhale._finalize_claimed(
+        b.conn, "evt-I2REL", "ready", None, 2,
+        release=True, worker_id="worker-b",
+    ) is True
+
+
+def test_stale_worker_cannot_overwrite_other_workers_ready_receipt(
+    temp_db, vec_ready, monkeypatch
+):
+    """I-2: B reclaims an expired claim, finalizes 'ready', and releases.
+    A's late degraded finalize must be a no-op that leaves B's truthful
+    receipt untouched."""
+    import mnemosyne.core.inhale as inhale
+
+    BeamMemory(session_id="i2fin", db_path=temp_db)
+    b = BeamMemory(session_id="i2fin", db_path=temp_db)
+    _pending_receipt(b, "evt-I2FIN", monkeypatch)
+
+    now = inhale._now_epoch()
+    assert inhale._try_claim(
+        b.conn, "evt-I2FIN", "worker-a",
+        inhale._iso_from_epoch(now + 60), inhale._iso_from_epoch(now),
+    ) is True
+    late = inhale._iso_from_epoch(now + 3600)
+    assert inhale._try_claim(
+        b.conn, "evt-I2FIN", "worker-b",
+        inhale._iso_from_epoch(now + 3660), late,
+    ) is True
+
+    # B finishes and finalizes the truthful ready state.
+    assert inhale._finalize_claimed(
+        b.conn, "evt-I2FIN", "ready", None, 2,
+        release=True, worker_id="worker-b",
+    ) is True
+
+    # A's late degraded result must not regress B's ready receipt.
+    finalized = inhale._finalize_claimed(
+        b.conn, "evt-I2FIN", "degraded", "embedding_failure", 3,
+        release=True, worker_id="worker-a",
+    )
+    assert finalized is False
+    row = b.conn.execute(
+        "SELECT index_status, attempts, last_error_code, claim_worker_id"
+        " FROM ingest_receipts WHERE event_id = 'evt-I2FIN'"
+    ).fetchone()
+    assert row["index_status"] == "ready"
+    assert row["attempts"] == 2
+    assert row["last_error_code"] is None
+    assert row["claim_worker_id"] is None  # B released its own claim
+
+
+def test_overrun_owner_can_finalize_own_claim_after_lease_expiry(
+    temp_db, vec_ready, monkeypatch
+):
+    """A worker whose lease expired but who still owns the claim must be able
+    to finalize its truthful result; only the lost-ownership case no-ops."""
+    import mnemosyne.core.inhale as inhale
+
+    BeamMemory(session_id="i2own", db_path=temp_db)
+    b = BeamMemory(session_id="i2own", db_path=temp_db)
+    _pending_receipt(b, "evt-I2OWN", monkeypatch)
+
+    now = inhale._now_epoch()
+    assert inhale._try_claim(
+        b.conn, "evt-I2OWN", "worker-a",
+        inhale._iso_from_epoch(now + 60), inhale._iso_from_epoch(now),
+    ) is True
+    # A finishes after its lease expired; no one reclaimed it.
+    assert inhale._finalize_claimed(
+        b.conn, "evt-I2OWN", "ready", None, 2,
+        release=True, worker_id="worker-a",
+    ) is True
+    row = b.conn.execute(
+        "SELECT index_status, attempts, claim_worker_id, claim_worker_lease"
+        " FROM ingest_receipts WHERE event_id = 'evt-I2OWN'"
+    ).fetchone()
+    assert row["index_status"] == "ready"
+    assert row["attempts"] == 2
+    assert row["claim_worker_id"] is None
+    assert row["claim_worker_lease"] is None
+
+
+def test_stale_lease_two_workers_keep_ready_receipt_and_truthful_reports(
+    temp_db, vec_ready, monkeypatch
+):
+    """Full two-worker stale-lease path: A claims, overruns its lease, and is
+    still enriching when B reclaims and finalizes 'ready'. A's late finalize
+    must not regress the receipt, and only the owning worker reports the
+    outcome."""
+    import mnemosyne.core.inhale as inhale
+
+    BeamMemory(session_id="i2race", db_path=temp_db)
+    b0 = BeamMemory(session_id="i2race", db_path=temp_db)
+    _pending_receipt(b0, "evt-I2RACE", monkeypatch)
+
+    real_index = inhale._index_memory
+    real_now = inhale._now_epoch
+    times: Dict[int, float] = {}
+    a_ident: Dict[str, Optional[int]] = {"v": None}
+    entered_enrichment = threading.Event()
+    release_worker_a = threading.Event()
+    exceptions: List[BaseException] = []
+    reports: Dict[str, Any] = {}
+
+    def fake_now() -> float:
+        return times.get(threading.get_ident(), real_now())
+    monkeypatch.setattr(inhale, "_now_epoch", fake_now)
+
+    def slow_index(beam, memory_id, content, source, timestamp):
+        # Only worker A blocks (B runs on wall-clock + 3600s).
+        if threading.get_ident() == a_ident["v"]:
+            entered_enrichment.set()
+            if not release_worker_a.wait(15):
+                raise RuntimeError("worker A enrichment not released")
+        return real_index(beam, memory_id, content, source, timestamp)
+
+    def worker_a():
+        try:
+            a_ident["v"] = threading.get_ident()
+            times[a_ident["v"]] = real_now()
+            monkeypatch.setattr(inhale, "_index_memory", slow_index)
+            b = BeamMemory(session_id="i2race-a", db_path=temp_db)
+            b.conn.execute("PRAGMA busy_timeout=10000")
+            reports["a"] = retry_pending_ingest(b)
+        except BaseException as exc:
+            exceptions.append(exc)
+
+    def worker_b():
+        try:
+            # A has claimed and entered enrichment before B may reclaim.
+            assert entered_enrichment.wait(15), "worker A never claimed"
+            times[threading.get_ident()] = real_now() + 3600  # A's lease expired
+            b = BeamMemory(session_id="i2race-b", db_path=temp_db)
+            b.conn.execute("PRAGMA busy_timeout=10000")
+            reports["b"] = retry_pending_ingest(b)
+        except BaseException as exc:
+            exceptions.append(exc)
+
+    ta = threading.Thread(target=worker_a)
+    tb = threading.Thread(target=worker_b)
+    ta.start()
+    tb.start()
+    tb.join(20)
+    release_worker_a.set()
+    ta.join(20)
+
+    assert not exceptions, exceptions
+    assert not ta.is_alive() and not tb.is_alive()
+    # B owns the outcome; A's lost-ownership pass reports nothing.
+    assert reports["b"].attempted == 1
+    assert reports["b"].succeeded == 1
+    assert reports["a"].attempted == 0
+
+    row = b0.conn.execute(
+        "SELECT index_status, attempts, claim_worker_id, claim_worker_lease"
+        " FROM ingest_receipts WHERE event_id = 'evt-I2RACE'"
+    ).fetchone()
+    assert row["index_status"] == "ready"
+    assert row["attempts"] == 2
+    assert row["claim_worker_id"] is None
+    assert row["claim_worker_lease"] is None
+    # Concurrent enrichment stays idempotent: no duplicate rows.
+    assert b0.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
+    assert b0.conn.execute("SELECT COUNT(*) FROM ingest_receipts").fetchone()[0] == 1
