@@ -1063,6 +1063,7 @@ def propose_harmony(
     # distinct failure reason rather than silently masking it.
     if plans:
         try:
+            failure_reason = "persistence_failed"
             beam.conn.execute("SAVEPOINT shmr_run")
             for row in plans:
                 beam.conn.execute(
@@ -1086,26 +1087,33 @@ def propose_harmony(
                         row["rationale"],
                     ),
                 )
+            failure_reason = "release_failed"
             beam.conn.execute("RELEASE SAVEPOINT shmr_run")
             total_persisted = len(plans)
-        except Exception as exc:
-            logger.warning("SHMR run %s rolled back: %s", run_id, exc, exc_info=False)
-            rollback_reason = str(exc)
+        except Exception:
+            # Content-free diagnostics (Task 14): the rolled-back path must
+            # not leak the raw exception, run_id, prompt, content, metadata,
+            # or any path into the result or the log. ``failure_reason`` was
+            # set to ``persistence_failed`` before the SAVEPOINT and flipped
+            # to ``release_failed`` immediately before RELEASE, so it already
+            # identifies which statement failed without any exception text.
+            logger.warning("SHMR run rolled back: %s", failure_reason, exc_info=False)
             try:
                 beam.conn.execute("ROLLBACK TO SAVEPOINT shmr_run")
                 beam.conn.execute("RELEASE SAVEPOINT shmr_run")
-            except Exception as rb_exc:
+            except Exception:
                 # Do NOT swallow a rollback failure. Surface it as a distinct
-                # reason so the caller knows the transaction state may be
-                # dirty, rather than silently claiming rolled_back.
-                rollback_reason = f"{exc} (rollback also failed: {rb_exc})"
+                # static code on degraded_reasons so the caller knows the
+                # transaction state may be dirty; the primary failure_reason
+                # remains the original failure, never the rollback failure.
+                degraded_reasons.append("rollback_also_failed")
             return {
                 "clusters_found": len(all_clusters),
                 "proposals_persisted": 0,
                 "proposals_rejected": total_rejected,
                 "duration_ms": int((time.perf_counter() - t0) * 1000),
                 "status": "rolled_back",
-                "failure_reason": rollback_reason,
+                "failure_reason": failure_reason,
                 "degraded_reasons": degraded_reasons,
             }
 

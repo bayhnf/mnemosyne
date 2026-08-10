@@ -20,6 +20,7 @@ real network calls. They define the contract for the new proposal-only API.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 
 import pytest
@@ -1511,4 +1512,197 @@ class TestDegradedReasons:
         assert result["status"] == "proposed", result
         assert result["degraded_reasons"] == [], (
             f"healthy run must have empty degraded_reasons, got {result['degraded_reasons']}"
+        )
+
+
+# ===========================================================================
+# Task 14: content-free rolled-back diagnostics
+# ===========================================================================
+#
+# The rolled-back path previously interpolated str(exc) into both
+# ``result["failure_reason"]`` and a WARNING log, violating the program-wide
+# content-free diagnostic contract. These tests pin the static-code repair:
+# ``failure_reason`` must be one of {persistence_failed, release_failed} and
+# ``rollback_also_failed`` is recorded in ``degraded_reasons``; no raw
+# exception text, canary, run_id, prompt, content, metadata, or path may
+# reach the returned dict or a log record on the rolled-back path.
+
+
+class TestRolledBackContentFree:
+    """Task 14: the rolled-back path must emit only static diagnostic codes.
+
+    Each test forces a specific statement in the savepoint block to raise a
+    distinctive synthetic canary string, then asserts the canary never
+    appears in the serialized result or captured WARNING logs. The status
+    vocabulary (proposed | no_convergence | insufficient_candidates |
+    rolled_back) and the public ``failure_reason: str`` key are preserved;
+    only the *value* becomes a static code.
+    """
+
+    @staticmethod
+    def _beam(tmp_path, session_id="rb14"):
+        return BeamMemory(session_id=session_id, db_path=tmp_path / f"{session_id}.db")
+
+    @staticmethod
+    def _seed(beam):
+        _seed_facts(
+            beam,
+            [
+                {
+                    "fact_id": "rb14-1",
+                    "subject": "wade",
+                    "predicate": "uses",
+                    "object": "python data analysis pipelines regularly",
+                },
+                {
+                    "fact_id": "rb14-2",
+                    "subject": "wade",
+                    "predicate": "uses",
+                    "object": "python data analysis scripts often",
+                },
+            ],
+        )
+
+    @staticmethod
+    def _llm():
+        return _RecordingLLM(
+            [
+                json.dumps(
+                    [
+                        {
+                            "subject": "wade",
+                            "predicate": "prefers",
+                            "object": "python",
+                            "confidence": 0.8,
+                            "action": "create",
+                            "target_source_id": None,
+                            "rationale": "r",
+                        }
+                    ]
+                )
+            ]
+        )
+
+    def test_insert_failure_returns_persistence_failed_and_no_rows(
+        self, tmp_path, monkeypatch
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = self._beam(tmp_path)
+        self._seed(beam)
+        original_execute = beam.conn.execute
+        canary = "CANARY_PERSIST_ZEBRA"
+
+        def failing_execute(sql, *params):
+            if isinstance(sql, str) and "INSERT INTO shmr_proposals" in sql:
+                raise sqlite3.OperationalError(canary)
+            return original_execute(sql, *params)
+
+        monkeypatch.setattr(beam.conn, "execute", failing_execute)
+        result = shmr.propose_harmony(
+            beam, llm_call=self._llm(), similarity_threshold=0.3
+        )
+
+        assert result["status"] == "rolled_back", result
+        assert result["failure_reason"] == "persistence_failed", result
+        rows = beam.conn.execute("SELECT * FROM shmr_proposals").fetchall()
+        assert len(rows) == 0, "rolled-back run must leave zero proposal rows"
+        assert canary not in json.dumps(result, default=str), (
+            "raw exception canary leaked into serialized result"
+        )
+
+    def test_release_failure_returns_release_failed(self, tmp_path, monkeypatch):
+        _force_offline_embeddings(monkeypatch)
+        beam = self._beam(tmp_path, "rb14rel")
+        self._seed(beam)
+        original_execute = beam.conn.execute
+        canary = "CANARY_RELEASE_FALCON"
+
+        def failing_execute(sql, *params):
+            # Let INSERTs succeed; fail only the first RELEASE SAVEPOINT
+            # (the durability point at the end of the savepoint block).
+            if isinstance(sql, str) and sql.strip().upper().startswith(
+                "RELEASE SAVEPOINT"
+            ):
+                raise sqlite3.OperationalError(canary)
+            return original_execute(sql, *params)
+
+        monkeypatch.setattr(beam.conn, "execute", failing_execute)
+        result = shmr.propose_harmony(
+            beam, llm_call=self._llm(), similarity_threshold=0.3
+        )
+
+        assert result["status"] == "rolled_back", result
+        assert result["failure_reason"] == "release_failed", result
+        assert canary not in json.dumps(result, default=str), (
+            "raw exception canary leaked into serialized result"
+        )
+
+    def test_rollback_failure_appends_static_code_and_keeps_primary_reason(
+        self, tmp_path, monkeypatch
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = self._beam(tmp_path, "rb14both")
+        self._seed(beam)
+        original_execute = beam.conn.execute
+        insert_canary = "CANARY_INSERT_BISON"
+        rollback_canary = "CANARY_ROLLBACK_KITE"
+
+        def failing_execute(sql, *params):
+            s = sql.strip().upper() if isinstance(sql, str) else ""
+            if isinstance(sql, str) and "INSERT INTO shmr_proposals" in sql:
+                raise sqlite3.OperationalError(insert_canary)
+            if s.startswith("ROLLBACK TO SAVEPOINT"):
+                raise sqlite3.OperationalError(rollback_canary)
+            return original_execute(sql, *params)
+
+        monkeypatch.setattr(beam.conn, "execute", failing_execute)
+        result = shmr.propose_harmony(
+            beam, llm_call=self._llm(), similarity_threshold=0.3
+        )
+
+        assert result["status"] == "rolled_back", result
+        # Primary failure_reason must reflect the original INSERT failure,
+        # not the rollback failure; the rollback failure is surfaced via
+        # degraded_reasons as a static code.
+        assert result["failure_reason"] == "persistence_failed", result
+        reasons = result.get("degraded_reasons", [])
+        assert "rollback_also_failed" in reasons, (
+            f"expected rollback_also_failed in degraded_reasons, got {reasons}"
+        )
+        blob = json.dumps(result, default=str)
+        assert insert_canary not in blob, "INSERT canary leaked into result"
+        assert rollback_canary not in blob, "rollback canary leaked into result"
+
+    def test_rollback_warning_log_contains_no_canary_or_exception_text(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        _force_offline_embeddings(monkeypatch)
+        beam = self._beam(tmp_path, "rb14log")
+        self._seed(beam)
+        original_execute = beam.conn.execute
+        canary = "CANARY_LOG_OTTER"
+        # A second distinctive secret-like token embedded in an exception
+        # message, to ensure no fragment of raw exception text is logged.
+        secret = "SUPER_SECRET_PATH/etc/shadow"
+
+        def failing_execute(sql, *params):
+            if isinstance(sql, str) and "INSERT INTO shmr_proposals" in sql:
+                raise sqlite3.OperationalError(f"{canary} :: {secret}")
+            return original_execute(sql, *params)
+
+        monkeypatch.setattr(beam.conn, "execute", failing_execute)
+        with caplog.at_level(logging.WARNING, logger="mnemosyne.shmr"):
+            result = shmr.propose_harmony(
+                beam, llm_call=self._llm(), similarity_threshold=0.3
+            )
+        assert result["status"] == "rolled_back", result
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warning_records, "expected at least one WARNING on rolled-back path"
+        rendered = "\n".join(
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        )
+        assert canary not in rendered, f"canary leaked into WARNING log: {rendered!r}"
+        assert secret not in rendered, (
+            f"raw exception text leaked into WARNING log: {rendered!r}"
         )
