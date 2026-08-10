@@ -271,6 +271,160 @@ def remember_turn(beam, turn: TurnEvent) -> IngestReceipt:
     return remember_event(beam, turn)
 
 
+
+def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]:
+    """Durably ingest multiple turns atomically in one SQLite transaction.
+
+    All turns whose validation passes are inserted (working_memory row +
+    ingest_receipts row + sync event) inside a single transaction. If any
+    insert fails, the entire batch is rolled back -- no partial state is
+    left durable. Validation rejections are returned as ``rejected`` receipts
+    without entering the transaction (a rejected event has no partial state,
+    matching the single-event contract).
+
+    Indexing/enrichment runs per-event outside the atomic transaction after
+    the commit, so a vector-store failure leaves the receipt retryable
+    (``pending`` / ``failed_retryable``) but does not un-roll the durable
+    memory row.
+
+    Callers that need true multi-event atomicity (e.g. a Hermes sync_turn
+    with both user+assistant roles available) should use this instead of
+    calling ``remember_turn`` in a loop, which commits each event separately
+    and cannot roll back a first-side event when the second side fails.
+    """
+    if not isinstance(turns, list):
+        raise TypeError("turns must be a list")
+    for turn in turns:
+        if not isinstance(turn, TurnEvent):
+            raise TypeError("each turn must be a TurnEvent")
+
+    # Phase 1: validate all events. Rejected events return a rejected
+    # receipt and are skipped -- they never enter the transaction (a
+    # corrected resubmission with the same event id must be able to
+    # succeed, so a rejected key is never burned).
+    valid_turns: List[TurnEvent] = []
+    receipts: List[IngestReceipt] = []
+    for turn in turns:
+        errors = _validate_event(turn)
+        if errors:
+            receipts.append(_reject(turn, errors))
+        else:
+            valid_turns.append(turn)
+
+    if not valid_turns:
+        return receipts
+
+    conn = beam.conn
+    _assert_inhale_transaction_context(conn)
+    engine = _get_sync_engine(beam)
+    now = _now_iso()
+    # Track the memory rows + positions so indexing runs after commit.
+    pending_index: List[tuple] = []
+
+    _begin_write(conn)
+    try:
+        for idx, turn in enumerate(valid_turns):
+            payload_hash = _payload_hash(turn)
+            row = conn.execute(
+                "SELECT * FROM ingest_receipts WHERE event_id = ?",
+                (turn.event_id,),
+            ).fetchone()
+            if row is not None:
+                if row["payload_hash"] == payload_hash:
+                    # Idempotent replay: record the duplicate receipt at this
+                    # position; nothing to insert.
+                    receipts.append(_receipt_from_row(row, status="duplicate"))
+                    continue
+                # Conflict: record it in the audit trail but do NOT mutate
+                # the original lifecycle row.
+                conn.execute(
+                    """INSERT INTO ingest_conflicts
+                       (event_id, stored_payload_hash, conflicting_payload_hash,
+                        observed_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (turn.event_id, row["payload_hash"], payload_hash, now),
+                )
+                logger.warning(
+                    "ingest conflict event_id=%r: stored payload_hash=%s, "
+                    "conflicting payload_hash=%s (original receipt untouched)",
+                    turn.event_id, row["payload_hash"], payload_hash,
+                )
+                receipts.append(_conflict_receipt(row, payload_hash, now))
+                continue
+
+            memory_id = _memory_id_for_event(turn.event_id)
+            metadata_json = json.dumps(
+                _memory_metadata(turn), sort_keys=True, default=str
+            )
+            conn.execute(
+                """INSERT INTO working_memory
+                   (id, content, source, timestamp, session_id, importance,
+                    metadata_json, veracity, memory_type, trust_tier,
+                    author_id, author_type, channel_id, scope)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    memory_id, turn.content, turn.producer, turn.occurred_at,
+                    turn.session_id, 0.5, metadata_json, "unknown", None,
+                    _beam_mod._source_to_trust_tier(turn.producer),
+                    turn.actor_id, turn.producer, turn.project_id, "session",
+                ),
+            )
+            conn.execute(
+                """INSERT INTO ingest_receipts
+                   (event_id, payload_hash, memory_ids, status, index_status,
+                    attempts, last_error_code, last_error_at, created_at,
+                    updated_at, metadata_json)
+                   VALUES (?, ?, ?, 'stored', 'pending', 1, NULL, NULL, ?, ?, ?)""",
+                (
+                    turn.event_id, payload_hash, json.dumps([memory_id]),
+                    now, now,
+                    json.dumps({"_ingest": _provenance(turn)},
+                               sort_keys=True, default=str),
+                ),
+            )
+            engine.log_event(
+                memory_id, "CREATE",
+                payload=_sync_payload(turn, metadata_json), commit=False,
+            )
+            pending_index.append((idx, turn, memory_id))
+            receipts.append(None)  # placeholder; filled after commit
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+
+    # Phase 2: index/enrich each newly-stored receipt outside the atomic
+    # transaction. A failure here leaves the receipt retryable (pending /
+    # failed_retryable) but does NOT un-roll the durable row.
+    for pos, turn, memory_id in pending_index:
+        try:
+            index_status, error_code = _index_memory(
+                beam, memory_id, turn.content, turn.producer, turn.occurred_at,
+            )
+            _finalize_receipt(beam, turn.event_id, index_status, error_code, 1)
+        except Exception:
+            try:
+                _finalize_receipt(
+                    beam, turn.event_id, "failed_retryable",
+                    "indexing_failed", 1,
+                )
+            except Exception:
+                pass
+            raise
+        receipts[pos] = _receipt_from_row(
+            conn.execute(
+                "SELECT * FROM ingest_receipts WHERE event_id = ?",
+                (turn.event_id,),
+            ).fetchone()
+        )
+
+    beam._invalidate_query_cache_after_remember_commit()
+    return receipts
+
+
 def retry_pending_ingest(beam, limit: int = 100) -> RetryReport:
     """Re-run indexing/enrichment for stored receipts that are not ready.
 

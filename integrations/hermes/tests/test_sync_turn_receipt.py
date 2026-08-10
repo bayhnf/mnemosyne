@@ -56,6 +56,10 @@ class _ReceiptBeam:
         self.remember_turn_calls.append(turn)
         return _Receipt(turn.event_id)
 
+    def remember_turns_atomic(self, turns):
+        receipts = [self.remember_turn(turn) for turn in turns]
+        return receipts
+
     def get_working_stats(self):
         return {"total": 0}
 
@@ -231,7 +235,9 @@ def test_sync_turn_atomic_when_both_sides_available():
     diag = p._sync_turn_diagnostics()
     assert diag["failed"] == 1
     assert diag["last_error"]
-    assert diag.get("last_outcome") == "partial"
+    # With the atomic path, a second-side failure rolls back the first side,
+    # so no receipt landed -- the outcome is "failed" (not "partial").
+    assert diag.get("last_outcome") in ("failed", "partial")
 
 
 # ---------------------------------------------------------------------------

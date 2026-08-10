@@ -678,6 +678,55 @@ def _native_remember_turn(beam: Any):
     return remember_turn if callable(remember_turn) else None
 
 
+
+
+# Receipt statuses that count as a successful durable store. Everything else
+# (rejected, conflict) is surfaced as a structured failure so a non-success
+# ingest is never silently reported as "stored".
+_OK_RECEIPT_STATUSES = frozenset({"stored", "duplicate"})
+
+
+def _sync_turn_actor_fallback(beam) -> str:
+    """Resolve a non-empty actor_id for native Inhale provenance.
+
+    BeamMemory defaults ``author_id=None`` when constructed without explicit
+    provenance (the Hermes provider default path). Inhale requires a non-empty
+    ``actor_id``, so without a fallback every default-construction deployment
+    silently loses turn memory to validation rejections. Fall back to the
+    stable session id so the event is at least attributable to the session
+    when no explicit author identity is configured.
+    """
+    actor = getattr(beam, "author_id", "") or ""
+    if actor:
+        return actor
+    return getattr(beam, "session_id", "") or "hermes"
+
+
+def _sync_turn_outcome(receipts: list) -> str:
+    """Map receipt statuses to a visible sync_turn outcome.
+
+    ``stored`` only when every receipt is a success (stored/duplicate).
+    ``partial`` when at least one succeeded and at least one did not.
+    ``failed`` when none succeeded.
+    """
+    if not receipts:
+        return "stored"
+    ok = sum(
+        1 for r in receipts
+        if getattr(r, "status", "") in _OK_RECEIPT_STATUSES
+    )
+    if ok == len(receipts):
+        return "stored"
+    return "partial" if ok else "failed"
+
+
+def _sync_turn_has_failed_receipts(receipts: list) -> bool:
+    """True when any receipt is a non-success (rejected/conflict)."""
+    return any(
+        getattr(r, "status", "") not in _OK_RECEIPT_STATUSES
+        for r in receipts
+    )
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -735,6 +784,19 @@ def _coerce_optional_int(value: Any, default: Optional[int]) -> Optional[int]:
 def _parse_env_optional_int(key: str, default: Optional[int]) -> Optional[int]:
     """Read a non-negative int env var; negative values disable the cap."""
     return _coerce_optional_int(os.environ.get(key), default)
+
+
+class _SyncTurnReceiptError(RuntimeError):
+    """Raised when one or more native ingest receipts are non-success.
+
+    Carries the receipts so the ``sync_turn`` except block can surface them in
+    diagnostics. This ensures a ``rejected``/``conflict`` receipt is never
+    silently reported as ``stored``.
+    """
+
+    def __init__(self, message, receipts=None):
+        super().__init__(message)
+        self.receipts = receipts or []
 
 
 class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
@@ -1775,9 +1837,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 durable_operation = beam_session_id == durable_session_id
                 # Snapshot scope BEFORE any ingest so a rebind during the
                 # call cannot mutate the provenance recorded on the receipts.
+                # actor_id falls back to the session id when the beam has no
+                # explicit author (the default BeamMemory construction path):
+                # Inhale requires a non-empty actor_id, so without this every
+                # default deployment silently loses turn memory to rejections.
                 scope_snapshot = {
                     "session_id": beam_session_id or durable_session_id or "",
-                    "actor_id": getattr(beam, "author_id", "") or "",
+                    "actor_id": _sync_turn_actor_fallback(beam),
                     "producer": getattr(beam, "author_type", "") or "hermes",
                     "project_id": getattr(beam, "channel_id", "") or "",
                 }
@@ -1787,24 +1853,30 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 turn_id = _sync_turn_turn_id(
                     scope_snapshot["session_id"], user_content, assistant_content,
                 )
+                # Collect eligible (role, content) pairs so the native path
+                # can ingest them atomically in one transaction.
+                eligible = []
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    rc = self._sync_turn_ingest_one(
-                        beam, "user", f"[USER] {uc}", scope_snapshot, turn_id,
-                    )
-                    if rc is not None:
-                        receipts.append(rc)
+                    eligible.append(("user", f"[USER] {uc}"))
                     # Check for identity-significant signals in user content
                     self._capture_identity_signals(user_content)
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    rc = self._sync_turn_ingest_one(
-                        beam, "assistant", f"[ASSISTANT] {ac}", scope_snapshot, turn_id,
+                    eligible.append(("assistant", f"[ASSISTANT] {ac}"))
+                if eligible:
+                    receipts = self._sync_turn_ingest(
+                        beam, eligible, scope_snapshot, turn_id,
                     )
-                    if rc is not None:
-                        receipts.append(rc)
+                    # A rejected/conflict receipt is a structured failure that
+                    # must never be silently reported as stored.
+                    if _sync_turn_has_failed_receipts(receipts):
+                        raise _SyncTurnReceiptError(
+                            "one or more receipts were not stored",
+                            receipts,
+                        )
                 if durable_operation:
                     self._turn_count += 1
                     should_auto_sleep = (
@@ -1819,7 +1891,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["completed"] += 1
                 self._sync_turn_telemetry["last_error"] = None
-                self._sync_turn_telemetry["last_outcome"] = "stored"
+                self._sync_turn_telemetry["last_outcome"] = _sync_turn_outcome(
+                    receipts
+                )
                 self._sync_turn_telemetry["last_receipts"] = [
                     self._receipt_summary(r) for r in receipts
                 ]
@@ -1827,15 +1901,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             with self._sync_turn_lock:
                 self._sync_turn_telemetry["failed"] += 1
                 self._sync_turn_telemetry["last_error"] = self._sanitize_sync_turn_error(e)
-                # Structured visible outcome: ``partial`` when at least one
-                # receipt was recorded before the failure, else ``failed``.
-                # ponytail: ceiling = individual receipts remain the durability
-                # authority (Inhale rejects caller-owned transactions, so we
-                # cannot wrap both in one SQL transaction). Upgrade path: a
-                # coordinated multi-event atomic primitive in core Inhale.
-                self._sync_turn_telemetry["last_outcome"] = (
-                    "partial" if receipts else "failed"
-                )
+                # Structured visible outcome based on receipt statuses. When the
+                # atomic primitive was used, a second-side failure rolled back
+                # the first side, so ``receipts`` reflects what actually
+                # landed (nothing on full rollback).
+                self._sync_turn_telemetry["last_outcome"] = _sync_turn_outcome(
+                    receipts
+                ) if receipts else "failed"
                 self._sync_turn_telemetry["last_receipts"] = [
                     self._receipt_summary(r) for r in receipts
                 ]
@@ -1862,6 +1934,76 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     snapshot["failed"],
                     snapshot["pending_queue_length"],
                 )
+
+    def _sync_turn_ingest(self, beam, eligible, scope_snapshot, turn_id):
+        """Ingest all eligible roles, returning a list of receipts.
+
+        When the native Inhale ``remember_turn`` API is available and there
+        is more than one eligible role, the events are ingested atomically
+        via ``remember_turns_atomic``: all events commit in one SQLite
+        transaction, so a failure on any event rolls back every prior event
+        in the batch. For a single role, the per-event ``remember_turn`` is
+        used directly. When the native API is unavailable, the legacy
+        ``remember()`` path is used per-role (no atomicity, preserved for
+        backward compatibility with older Mnemosyne deployments).
+        """
+        remember_turn = _native_remember_turn(beam)
+        if remember_turn is not None:
+            try:
+                from mnemosyne.core.inhale import (
+                    TurnEvent, remember_turns_atomic,
+                )
+            except Exception:
+                TurnEvent = None
+                remember_turns_atomic = None
+            if TurnEvent is not None:
+                turns = [
+                    TurnEvent(
+                        event_id=_sync_turn_event_id(
+                            scope_snapshot["producer"] or "hermes",
+                            scope_snapshot["session_id"], turn_id, role,
+                        ),
+                        producer=scope_snapshot["producer"] or "hermes",
+                        actor_id=scope_snapshot["actor_id"],
+                        project_id=scope_snapshot["project_id"],
+                        session_id=scope_snapshot["session_id"],
+                        turn_id=turn_id,
+                        role=role,
+                        content=content,
+                        content_hash=_sync_turn_content_hash(content),
+                        occurred_at=_sync_turn_occurred_at(),
+                    )
+                    for role, content in eligible
+                ]
+                # Atomic multi-event ingest: all-or-nothing within one
+                # SQLite transaction. A second-side failure rolls back the
+                # first side, so no partial state is left durable. Prefer a
+                # beam-level method when the class declares one (test doubles,
+                # future BeamMemory delegation); otherwise use the module
+                # function directly.
+                beam_atomic = getattr(type(beam), "remember_turns_atomic", None)
+                if (
+                    len(turns) > 1
+                    and callable(beam_atomic)
+                    and remember_turns_atomic is not None
+                ):
+                    return beam.remember_turns_atomic(turns)
+                if len(turns) > 1 and remember_turns_atomic is not None:
+                    return remember_turns_atomic(beam, turns)
+                # Single role (or atomic unavailable on this core): use the
+                # per-event native API directly.
+                return [remember_turn(turns[0])]
+        # Legacy fallback: no receipts, preserve the original remember() shape.
+        for role, content in eligible:
+            importance = 0.5 if role == "user" else 0.15
+            beam.remember(
+                content=content,
+                source="conversation",
+                importance=importance,
+                scope=self._default_scope,
+                extract_entities=True,
+            )
+        return []
 
     def _sync_turn_ingest_one(self, beam, role: str, content: str,
                               scope_snapshot: Dict[str, str], turn_id: str):
