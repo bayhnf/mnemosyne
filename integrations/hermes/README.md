@@ -35,7 +35,7 @@ Mnemosyne adds structured, local-first, agent-native memory to Hermes through th
 It gives Hermes:
 
 - **Automatic capture**: every turn, in the background, after the response is sent. Conversation, decisions, tool calls, outcomes.
-- **Hybrid search**: vector similarity + FTS5 full-text + importance scoring. All tunable per-query. Bias toward recency, relevance, or both.
+- **Hybrid search**: vector similarity + FTS5 full-text + importance scoring. All tunable per-query. Bias toward recency, relevance, or both. Vector embeddings are optional; without them recall falls back to deterministic keyword + importance scoring.
 - **Episodic consolidation**: `mnemosyne_sleep` compresses old working memories into long-term summaries so the working set stays small and recall stays sharp.
 - **Knowledge graph**: subject-predicate-object triples with BFS graph traversal. Link memories semantically.
 - **Multi-agent validation**: agents can attest, update, or invalidate each other's memories with provenance tracking.
@@ -60,7 +60,7 @@ Mnemosyne runs on three stages:
 
 ### 1. Capture
 
-After Hermes completes a turn, the Mnemosyne provider stores the full interaction (user message, assistant response, tool calls, and available execution context) in a local SQLite database with vector embeddings.
+After Hermes completes a turn, the Mnemosyne provider stores the full interaction (user message, assistant response, tool calls, and available execution context) in a local SQLite database. Vector embeddings are optional (the `embeddings` extra); without them the lane stays fully functional with deterministic degraded recall.
 
 Each memory gets tagged with importance (0.0-1.0), scope (session or global), veracity (stated, inferred, tool, or imported), and optional metadata. Memories can carry expiration dates and named entities for fuzzy recall.
 
@@ -70,7 +70,7 @@ This is how Hermes builds memory from what it says *and* what it does.
 
 Recall is intentional. Agents decide when to recall, what scope, and how many results. There is no automatic retrieval dumping context into every prompt.
 
-When `mnemosyne_recall` fires, Mnemosyne runs hybrid search: vector similarity finds semantic matches, FTS5 full-text finds keyword matches, and importance scoring boosts what matters. All three weights are tunable per-query so you can bias toward recency, relevance, or both.
+When `mnemosyne_recall` fires, Mnemosyne runs hybrid search: vector similarity finds semantic matches, FTS5 full-text finds keyword matches, and importance scoring boosts what matters. All three weights are tunable per-query so you can bias toward recency, relevance, or both. If vector support (`sqlite-vec` / `fastembed`) is unavailable, recall deterministically uses the keyword + importance lane and remains fully functional.
 
 Returned context can include prior decisions, constraints, failure modes, project patterns, and execution outcomes: without stuffing irrelevant history into the prompt.
 

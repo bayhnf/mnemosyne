@@ -12,13 +12,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib
-import json
-import os
 import sys
 import tempfile
-import threading
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -158,7 +154,6 @@ def test_real_beam_with_provenance_stores_sync_turn(real_beam):
     """When provenance is populated, a real BeamMemory must store both roles
     and report last_outcome='stored' with real receipt rows."""
     from mnemosyne.core import beam as beam_module
-    from mnemosyne.core import inhale as inhale_module
 
     beam_module._embeddings.available = lambda: False
 
@@ -178,6 +173,47 @@ def test_real_beam_with_provenance_stores_sync_turn(real_beam):
     assert len(receipt_rows) == 2
     statuses = [r["status"] for r in receipt_rows]
     assert all(s in ("stored", "duplicate") for s in statuses), statuses
+
+
+def test_real_beam_without_sqlite_vec_stores_degraded_and_recalls_bounded(monkeypatch):
+    """With sqlite-vec unavailable, sync_turn must still persist both sides
+    (degraded receipts) and bounded recall must return lexical results."""
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core.beam import BeamMemory
+
+    monkeypatch.setattr(beam_module, "_SQLITE_VEC_AVAILABLE", False)
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
+
+    db_path = Path(tempfile.mkdtemp()) / "no_vec.db"
+    beam = BeamMemory(
+        session_id="hermes_default",
+        db_path=db_path,
+        author_id="actor-no-vec",
+        author_type="hermes",
+    )
+    try:
+        p = _provider_with_beam(beam)
+        p.sync_turn("zephyr protocol handshake alpha", "reply confirming zephyr handshake")
+        p.sync_turn("second turn quantum ledger", "reply on quantum ledger")
+        diag = p._sync_turn_diagnostics()
+
+        assert diag.get("last_outcome") == "stored", (
+            f"expected stored without sqlite-vec; outcome={diag.get('last_outcome')} "
+            f"receipts={diag.get('last_receipts')}"
+        )
+        assert len(diag.get("last_receipts") or []) == 2
+        assert all(r["status"] == "stored" for r in diag["last_receipts"])
+        assert all(r["index_status"] == "degraded" for r in diag["last_receipts"])
+
+        results = beam.recall("zephyr protocol", top_k=5)
+        assert results, "lexical recall must still return the stored turn"
+        assert len(results) <= 5
+        assert any("zephyr" in (r.get("content") or "") for r in results)
+    finally:
+        try:
+            beam.conn.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

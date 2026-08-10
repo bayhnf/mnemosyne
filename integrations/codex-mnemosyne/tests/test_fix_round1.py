@@ -34,22 +34,38 @@ WORKTREE_ROOT = os.path.dirname(os.path.dirname(PLUGIN_ROOT))
 
 
 def _run(
-    script: str, payload, env: dict, cwd: str = "/tmp"
+    script: str,
+    payload,
+    env: dict,
+    cwd: str = "/tmp",
+    *,
+    inject_worktree: bool = True,
+    no_site: bool = False,
 ) -> tuple[int, dict | None, str, str]:
-    """Run a hook with raw stdin (may be non-object JSON). Returns (rc, parsed, out, err)."""
+    """Run a hook with raw stdin (may be non-object JSON). Returns (rc, parsed, out, err).
+
+    By default PYTHONPATH is prefixed with the worktree root to simulate the
+    installed-package case. With `no_site`, the hook runs under `python -S`
+    with no PYTHONPATH, so a pip-installed mnemosyne is genuinely unimportable
+    in that interpreter even when pytest itself runs inside an installed env.
+    """
     full = dict(os.environ)
     full.update(env)
-    # Simulate installed mnemosyne package unless the test explicitly requests
-    # the absent-package path.
-    if env.get("MNEMOSYNE_TEST_NO_MNEMOSYNE") != "1":
+    if inject_worktree and not no_site:
         prior = full.get("PYTHONPATH", "")
         full["PYTHONPATH"] = WORKTREE_ROOT + (os.pathsep + prior if prior else "")
+    if no_site:
+        full.pop("PYTHONPATH", None)
     if isinstance(payload, (dict, list)):
         raw = json.dumps(payload)
     else:
         raw = payload  # pre-serialized string (e.g. a JSON array or string)
+    command = [sys.executable]
+    if no_site:
+        command.append("-S")
+    command.append(os.path.join(HOOKS_DIR, script))
     proc = subprocess.run(
-        [sys.executable, os.path.join(HOOKS_DIR, script)],
+        command,
         input=raw,
         capture_output=True,
         text=True,
@@ -634,28 +650,21 @@ class TestInstalledPlugin(_Base):
 
     def test_absent_mnemosyne_package_emits_actionable_warning(self) -> None:
         """When the mnemosyne package is not importable, emit a safe actionable warning."""
-        empty = tempfile.mkdtemp(prefix="mnem-empty-pythonpath-")
         env = self._env(
             PLUGIN_DATA=os.path.join(self.data_dir, "pd"),
-            MNEMOSYNE_TEST_NO_MNEMOSYNE="1",
         )
-        env["PYTHONPATH"] = empty
         code, out, _out, err = _run(
             "user_prompt_submit.py",
             {"session_id": "s1", "turn_id": "t1", "prompt": "hello", "cwd": "/tmp"},
             env,
+            no_site=True,
         )
-        try:
-            self.assertEqual(code, 0, "must fail-open even if package absent")
-            msg = (out or {}).get("systemMessage", "")
-            self.assertTrue(msg, "must emit a visible warning when package absent")
-            lower = msg.lower()
-            self.assertIn("mnemosyne", lower, "warning must name mnemosyne")
-            self.assertIn(
-                "install", lower, "warning must be actionable (mention install)"
-            )
-        finally:
-            shutil.rmtree(empty, ignore_errors=True)
+        self.assertEqual(code, 0, "must fail-open even if package absent")
+        msg = (out or {}).get("systemMessage", "")
+        self.assertTrue(msg, "must emit a visible warning when package absent")
+        lower = msg.lower()
+        self.assertIn("mnemosyne", lower, "warning must name mnemosyne")
+        self.assertIn("install", lower, "warning must be actionable (mention install)")
 
 
 if __name__ == "__main__":
@@ -752,11 +761,13 @@ class TestSessionEndSlowIngest(_Base):
             slow_env = self._env(
                 MNEMOSYNE_CODEX_ACTOR_ID="alice", MNEMOSYNE_CODEX_PROJECT_ID="projX"
             )
-            slow_env["MNEMOSYNE_TEST_NO_MNEMOSYNE"] = "1"
             slow_env["PYTHONPATH"] = fake_root
             start = time.monotonic()
             code, out, _o, err = _run(
-                "session_end.py", {"session_id": "s1", "cwd": "/tmp"}, slow_env
+                "session_end.py",
+                {"session_id": "s1", "cwd": "/tmp"},
+                slow_env,
+                inject_worktree=False,
             )
             elapsed = time.monotonic() - start
             # Task 8 official hook contract: retained rows => nonzero exit.

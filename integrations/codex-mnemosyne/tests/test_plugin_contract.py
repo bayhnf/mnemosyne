@@ -98,6 +98,31 @@ class TestHooksManifest(unittest.TestCase):
                         "python3", cmd, f"{event_name} must use python3, got: {cmd}"
                     )
 
+    def test_all_hook_commands_declare_windows_variants(self) -> None:
+        """Every hook also declares a native Windows command via `python`."""
+        for event_name, entries in self.hooks.items():
+            for entry in entries:
+                for hook in entry["hooks"]:
+                    win_cmd = hook.get("commandWindows", "")
+                    self.assertTrue(
+                        win_cmd.startswith("python "),
+                        f"{event_name} must declare commandWindows with "
+                        f"python, got: {win_cmd!r}",
+                    )
+
+    def test_windows_command_runs_the_same_hook_script(self) -> None:
+        """The Windows command targets the same hook file as the POSIX one."""
+        for event_name, entries in self.hooks.items():
+            for entry in entries:
+                for hook in entry["hooks"]:
+                    script = hook["command"].split()[-1]
+                    win_cmd = hook.get("commandWindows", "")
+                    self.assertTrue(
+                        win_cmd.endswith(script),
+                        f"{event_name} commandWindows must target {script}, "
+                        f"got: {win_cmd!r}",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

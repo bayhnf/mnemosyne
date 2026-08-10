@@ -12,7 +12,7 @@ authors = [{name = "Abdias J", email = "abdi.moya@gmail.com"}]
 requires-python = ">=3.10"
 keywords = ["hermes-agent", "memory", "mnemosyne", "ai-agents", "local-first", "long-term-memory"]
 dependencies = [
-    "mnemosyne-memory[embeddings]>=3.11.1",
+    "mnemosyne-memory>=3.11.1",
     "PyYAML>=6.0",
 ]
 classifiers = [

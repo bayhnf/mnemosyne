@@ -112,6 +112,9 @@ Environment variables (all optional). In an installed plugin, Codex sets
   Unacknowledged events are always retained. No exception text, ids,
   content, hashes, scope, or paths are ever exposed.
 - **stdlib JSON only.** No third-party dependencies in the hook path.
+- **Cross-platform commands.** Every hook declares both `command`
+  (`python3`, POSIX) and `commandWindows` (`python`, native Windows), both
+  targeting the same `${PLUGIN_ROOT}/hooks/<file>.py` script.
 - **Mnemosyne is the sole memory provider.** Built-in Codex memory stays
   disabled. This plugin adds no MCP tools.
 
