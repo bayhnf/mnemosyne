@@ -759,7 +759,8 @@ class TestSessionEndSlowIngest(_Base):
                 "session_end.py", {"session_id": "s1", "cwd": "/tmp"}, slow_env
             )
             elapsed = time.monotonic() - start
-            self.assertEqual(code, 0, "SessionEnd must exit 0 (fail-open)")
+            # Task 8 official hook contract: retained rows => nonzero exit.
+            self.assertNotEqual(code, 0, "retained rows must exit nonzero")
             self.assertLess(
                 elapsed,
                 3.0,

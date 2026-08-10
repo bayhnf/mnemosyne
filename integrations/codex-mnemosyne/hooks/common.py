@@ -403,6 +403,13 @@ _MSG_QUEUE_FULL = (
 )
 _MSG_SESSION_END_PENDING = "Mnemosyne session end: some events remain pending delivery."
 _MSG_SESSION_END_DELIVERED = "Mnemosyne session end complete."
+# Static, content-free diagnostics for SessionEnd stderr (Task 8 official hook
+# contract). SessionEnd output is advisory and systemMessage is not supported
+# for it, so failures are surfaced as static stderr + nonzero exit only.
+_DIAG_SESSION_END_RETAINED = (
+    "mnemosyne: session end flush incomplete; some events retained.\n"
+)
+_DIAG_SESSION_END_UNAVAILABLE = "mnemosyne: session end status unavailable.\n"
 
 
 def message_package_absent() -> str:
@@ -431,6 +438,16 @@ def message_session_end_pending() -> str:
 
 def message_session_end_delivered() -> str:
     return _MSG_SESSION_END_DELIVERED
+
+
+def diag_session_end_retained() -> str:
+    """Static, content-free stderr diagnostic for retained spool rows."""
+    return _DIAG_SESSION_END_RETAINED
+
+
+def diag_session_end_unavailable() -> str:
+    """Static, content-free stderr diagnostic when the flush itself raises."""
+    return _DIAG_SESSION_END_UNAVAILABLE
 
 
 # ---------------------------------------------------------------------------
@@ -510,17 +527,59 @@ def spool_put(path: str, event_dict: Dict[str, Any]) -> str:
 
 
 def spool_count(path: str) -> int:
-    if not os.path.exists(path):
-        return 0
+    """Best-effort row count (never raises). Returns 0 on absence or error.
+
+    Kept for existing best-effort callers. SessionEnd's success/retained
+    decision must NOT use this: a corrupt/uninspectable spool also yields 0
+    here, which would silently represent it as success. Use
+    ``spool_inspect_state`` for any decision that must distinguish empty from
+    corrupt.
+    """
+    count, _inspectable = spool_inspect_state(path)
+    return count
+
+
+def spool_inspect_state(path: str) -> Tuple[int, bool]:
+    """Strict spool inspection. Returns (row_count, inspectable).
+
+    - Confirmed absent (ENOENT / FileNotFoundError) or zero-byte file:
+      ``(0, True)`` — a genuine empty state is inspectable and successful.
+    - Valid SQLite with the spool table: ``(count, True)``.
+    - Corrupt / unreadable / not-SQLite, OR a path that exists but cannot be
+      traversed/stat'd/opened (EACCES, ELOOP, ...): ``(0, False)`` — the
+      caller must treat this as "status unavailable", never as success.
+
+    Never raises. Classification is by the OSError subclass, NOT by
+    ``os.path.exists`` (which returns False on EACCES during stat/traverse
+    and would conflate an inaccessible-existing path with a genuinely absent
+    one). ponytail: ceiling = a SQLite file that opens but has no
+    spooled_events table (e.g. a different schema); we treat a missing table
+    as 0 inspectable rows rather than corrupt, matching _ensure_spool's
+    additive-schema contract. Upgrade path: if the schema ever becomes
+    load-bearing for correctness, validate the column set here too.
+    """
+    # Stat with error classification. os.path.exists() is deliberately
+    # avoided: it swallows ALL OSErrors (incl. EACCES) and returns False,
+    # conflating "exists but inaccessible" with "confirmed absent".
+    try:
+        if os.path.getsize(path) == 0:
+            return 0, True
+    except FileNotFoundError:
+        # Confirmed absent (ENOENT) — genuine empty state, success.
+        return 0, True
+    except OSError:
+        # Exists-or-unknown but cannot be stat'd (EACCES on parent dir,
+        # ELOOP, ENOTDIR, ...). Must NOT be treated as absent.
+        return 0, False
     try:
         conn = sqlite3.connect(path)
         try:
             row = conn.execute("SELECT COUNT(*) FROM spooled_events").fetchone()
-            return int(row[0]) if row else 0
+            return (int(row[0]) if row else 0), True
         finally:
             conn.close()
     except Exception:
-        return 0
+        return 0, False
 
 
 def _deadline_remaining(start: float, budget_s: float) -> float:

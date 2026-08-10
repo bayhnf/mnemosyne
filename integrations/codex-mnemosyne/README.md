@@ -14,7 +14,7 @@ bounded recall:
 | `SessionStart` (startup, resume, clear, compact) | Bounded recall of identity/preferences (≤6 items / ≤800 tokens), injected as `additionalContext`. Performs no ingest. |
 | `UserPromptSubmit` | Durably ingests the prompt with a stable event ID, then bounded recall (≤8 items / ≤1200 tokens) |
 | `Stop` | Durably ingests the acknowledged assistant message. Does **not** parse transcripts |
-| `SessionEnd` | Flushes the transport-only spool under a hard 2-second deadline (well within Codex's 3-second ceiling) |
+| `SessionEnd` | Flushes the transport-only spool under a hard 2-second deadline (well within Codex's 3-second ceiling). Output is advisory (`systemMessage` is not supported for SessionEnd): on retained rows or a flush error it exits **nonzero** with a static, content-free stderr diagnostic so Codex reports the hook failure |
 
 ## Prerequisites
 
@@ -101,13 +101,39 @@ Environment variables (all optional). In an installed plugin, Codex sets
   terminal retry state (8 attempts) so an outage cannot grow without bound
   or retry indefinitely. Corrupt rows are retained, never silently deleted.
   All deletion is ack-only.
-- **Bounded SessionEnd.** Returns before the 3-second Codex ceiling even if a
-  native ingest attempt is slow or hung, using a subprocess hard deadline. Does
-  not rely solely on Codex forcibly killing the hook. Unacknowledged events
-  are always retained.
+- **Bounded SessionEnd (official hook contract).** Returns before the
+  3-second Codex ceiling even if a native ingest attempt is slow or hung,
+  using a subprocess hard deadline. `systemMessage` is not supported for
+  SessionEnd, so failures are surfaced as a static, content-free stderr
+  diagnostic plus a **nonzero exit** (so Codex reports the hook failure):
+  - empty / fully-acknowledged flush → exit 0;
+  - retained pending or terminal rows → static stderr, nonzero exit;
+  - flush raises → distinct static "status unavailable" stderr, nonzero exit.
+  Unacknowledged events are always retained. No exception text, ids,
+  content, hashes, scope, or paths are ever exposed.
 - **stdlib JSON only.** No third-party dependencies in the hook path.
 - **Mnemosyne is the sole memory provider.** Built-in Codex memory stays
   disabled. This plugin adds no MCP tools.
+
+## Desktop manual verification
+
+The plugin runs as non-managed hooks: Codex reviews and trusts each hook
+through `/hooks` before it runs, and trust is tied to the current hook
+definition hash. To verify the four lifecycle hooks
+(`SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`) on the desktop app:
+
+1. **Restart** the Codex desktop app (cold start, so it picks up the plugin).
+2. Select the **repo marketplace** entry that exposes `codex-mnemosyne`.
+3. **Install** and **enable** the plugin.
+4. Open **`/hooks`** and review/trust the plugin's current hooks (trust is
+   hash-bound, so re-trust after any hook change).
+5. Start a **new session** and exercise the four lifecycle hooks
+   (`SessionStart` on startup, `UserPromptSubmit` on a prompt, `Stop` on the
+   assistant reply, and `SessionEnd` when the session closes).
+
+This manual gate is intentional: it never makes a false "installed/trusted"
+claim, and it never touches global Codex configuration, `CODEX_HOME`,
+marketplace/cache directories, or transcripts.
 
 ## Testing
 

@@ -446,8 +446,15 @@ class TestSessionEndHardDeadline(_Base):
             ),
         )
         elapsed = time.monotonic() - start
-        self.assertEqual(code, 0, f"SessionEnd must exit 0: {stderr}")
+        # Task 8 official hook contract: retained rows => nonzero exit with a
+        # static, content-free stderr diagnostic (no systemMessage), elapsed < 3s.
+        self.assertNotEqual(code, 0, "retained rows must exit nonzero")
         self.assertLess(elapsed, 3.0, f"SessionEnd took {elapsed:.2f}s")
+        self.assertIsNone(
+            (out or {}).get("systemMessage"),
+            "SessionEnd must not emit systemMessage",
+        )
+        self.assertTrue(stderr.strip(), "must write a static diagnostic to stderr")
         # Unacked rows must be retained
         conn = sqlite3.connect(self.spool_path)
         after = conn.execute("SELECT COUNT(*) FROM spooled_events").fetchone()[0]
