@@ -59,18 +59,15 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 _MEMORY_EVENTS_INDICES = [
     (
         "idx_me_timestamp",
-        "CREATE INDEX IF NOT EXISTS idx_me_timestamp "
-        "ON memory_events(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)",
     ),
     (
         "idx_me_memory_id",
-        "CREATE INDEX IF NOT EXISTS idx_me_memory_id "
-        "ON memory_events(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)",
     ),
     (
         "idx_me_device_id",
-        "CREATE INDEX IF NOT EXISTS idx_me_device_id "
-        "ON memory_events(device_id)",
+        "CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)",
     ),
 ]
 
