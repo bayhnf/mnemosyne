@@ -88,6 +88,43 @@ RECALL_SCHEMA = {
                 "description": "If true, return a structured per-query recall explain trace. Default false.",
                 "default": False,
             },
+
+            # Bounded recall extensions (Task 6B). When ANY of these is present
+            # the handler takes the bounded RecallEnvelope path with hard token
+            # caps; when all are absent, behavior is unchanged (legacy list).
+            "producer": {
+                "type": "string",
+                "description": "Restrict to memories from this producer (author_type, e.g. 'human'/'agent'/'system'). Bounded path only.",
+            },
+            "actor": {
+                "type": "string",
+                "description": "Restrict to memories from this actor (author_id). Bounded path only.",
+            },
+            "project": {
+                "type": "string",
+                "description": "Restrict to memories from this project (channel_id). Bounded path only.",
+            },
+            "session": {
+                "type": "string",
+                "description": "Restrict to memories from this session (session_id). Bounded path only.",
+            },
+            "max_tokens": {
+                "type": "integer",
+                "description": "Hard cap on total rendered-context tokens for bounded recall. Forces the bounded path.",
+            },
+            "max_item_tokens": {
+                "type": "integer",
+                "description": "Hard cap on tokens per returned item for bounded recall. Forces the bounded path.",
+            },
+            "top_k_bounded": {
+                "type": "integer",
+                "description": "Maximum result count for bounded recall (distinct from legacy 'limit'). Forces the bounded path.",
+            },
+            "include_shared": {
+                "type": "boolean",
+                "description": "Merge the shared surface DB into bounded recall results. Default false. Forces the bounded path.",
+                "default": False,
+            },
         },
         "required": ["query"],
     },
@@ -855,17 +892,249 @@ HYGIENE_CLEAN_SCHEMA = {
     },
 }
 
+
+# ---------------------------------------------------------------------------
+# Native Inhale / Exhale / Dream / Reclaim endpoints (Task 6B)
+# ---------------------------------------------------------------------------
+
+INGEST_SCHEMA = {
+    "name": "mnemosyne_ingest",
+    "description": (
+        "Durably ingest one event with a receipt-backed idempotency key "
+        "(Inhale). Returns a content-free receipt: event_id, status "
+        "(stored|duplicate|conflict|rejected), index_status, attempts, and "
+        "structured error code. NEVER echoes raw content or content_hash in "
+        "the result. Duplicate event_id with identical payload is a no-op; "
+        "event_id reuse with a different payload yields status=conflict and "
+        "leaves the original receipt untouched."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "Stable external event id used for idempotency."},
+            "producer": {"type": "string", "description": "Producer type (who/what produced the event: human, agent, system, legacy)."},
+            "actor_id": {"type": "string", "description": "Identity of the producing actor instance."},
+            "project_id": {"type": "string", "description": "Project/channel identifier."},
+            "session_id": {"type": "string", "description": "Session the event belongs to."},
+            "turn_id": {"type": "string", "description": "Turn identifier within the session."},
+            "role": {"type": "string", "description": "Conversation role: user, assistant, system, tool."},
+            "content": {"type": "string", "description": "Event content to ingest."},
+            "occurred_at": {"type": "string", "description": "ISO timestamp marking when the event occurred."},
+            "metadata": {"type": "object", "description": "Optional metadata object.", "default": {}},
+        },
+        "required": ["event_id", "producer", "actor_id", "project_id",
+                     "session_id", "turn_id", "role", "content", "occurred_at"],
+    },
+}
+
+INGEST_STATUS_SCHEMA = {
+    "name": "mnemosyne_ingest_status",
+    "description": (
+        "Show content-free ingest receipt status. Returns one row per receipt "
+        "with event_id, status, index_status, attempts, and structured error "
+        "fields. Never includes content, content_hash, or payload."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "event_id": {"type": "string", "description": "Optional: look up a single event by id."},
+            "limit": {"type": "integer", "description": "Max receipts to return. Default 100.", "default": 100},
+        },
+    },
+}
+
+INGEST_RETRY_SCHEMA = {
+    "name": "mnemosyne_ingest_retry",
+    "description": (
+        "Re-run indexing for non-ready ingest receipts without duplicating "
+        "memory. Returns a content-free RetryReport: attempted, succeeded, "
+        "degraded, failed_retryable, failed_terminal counts."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Max receipts to retry. Default 100.", "default": 100},
+        },
+    },
+}
+
+DREAM_PLAN_SCHEMA = {
+    "name": "mnemosyne_dream_plan",
+    "description": (
+        "Plan a Dream run over a scoped slice of memory and persist it for "
+        "review (Dream lifecycle). Returns a content-free projection: run_id, "
+        "state, manifest_hash, checkpoint, error_code, and receipt role/status "
+        "counts. NEVER exposes raw scope, manifest JSON, actions, before/after "
+        "images, or unbounded failure text."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session to scope the plan to (required)."},
+            "actor_id": {"type": "string", "description": "Optional actor scope filter."},
+            "producer": {"type": "string", "description": "Optional producer scope filter."},
+            "project_id": {"type": "string", "description": "Optional project scope filter."},
+            "request_id": {"type": "string", "description": "Optional idempotency key; reuse returns the existing run."},
+        },
+        "required": ["session_id"],
+    },
+}
+
+DREAM_STATUS_SCHEMA = {
+    "name": "mnemosyne_dream_status",
+    "description": (
+        "Read the durable state of a Dream run. Content-free projection "
+        "identical to dream_plan. Pure read; safe to call any time."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string", "description": "Dream run id returned by dream_plan."},
+        },
+        "required": ["run_id"],
+    },
+}
+
+DREAM_REVIEW_SCHEMA = {
+    "name": "mnemosyne_dream_review",
+    "description": (
+        "Submit a reviewer PASS/FAIL receipt for a Dream run via the one "
+        "native receipt path. Role is fixed to 'reviewer' by the handler "
+        "(never caller-controllable). Verdict must be PASS or FAIL. A PASS "
+        "moves the run toward ready once an independent verifier also PASSes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string", "description": "Dream run id to review."},
+            "actor_id": {"type": "string", "description": "Reviewer actor identity (must differ from the verifier actor)."},
+            "verdict": {"type": "string", "enum": ["PASS", "FAIL"], "description": "Review verdict."},
+            "manifest_hash": {"type": "string", "description": "Optional manifest hash bind; defaults to the durable run's hash."},
+            "reason_code": {"type": "string", "default": "ok", "description": "Structured reason code (default 'ok')."},
+        },
+        "required": ["run_id", "actor_id", "verdict"],
+    },
+}
+
+DREAM_VERIFY_SCHEMA = {
+    "name": "mnemosyne_dream_verify",
+    "description": (
+        "Submit an independent verifier PASS/FAIL receipt. Role is fixed to "
+        "'verifier' by the handler. The verifier actor_id MUST differ from "
+        "the reviewer actor_id; a duplicate actor is rejected."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string", "description": "Dream run id to verify."},
+            "actor_id": {"type": "string", "description": "Verifier actor identity (must differ from reviewer)."},
+            "verdict": {"type": "string", "enum": ["PASS", "FAIL"], "description": "Verify verdict."},
+            "manifest_hash": {"type": "string", "description": "Optional manifest hash bind; defaults to the durable run's hash."},
+            "reason_code": {"type": "string", "default": "ok", "description": "Structured reason code (default 'ok')."},
+        },
+        "required": ["run_id", "actor_id", "verdict"],
+    },
+}
+
+DREAM_RESUME_SCHEMA = {
+    "name": "mnemosyne_dream_resume",
+    "description": (
+        "Resolve a Dream run from its checkpoint after a crash or "
+        "after-commit-before-response interruption, without double-applying. "
+        "Idempotent."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string", "description": "Dream run id to resume."},
+        },
+        "required": ["run_id"],
+    },
+}
+
+DREAM_APPLY_SCHEMA = {
+    "name": "mnemosyne_dream_apply",
+    "description": (
+        "Apply a Dream run that has reached 'ready' (dual PASS receipts). "
+        "Atomically mutates canonical facts inside one Dream-owned "
+        "transaction; revalidates source hashes immediately before commit. "
+        "Idempotent."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string", "description": "Dream run id to apply."},
+        },
+        "required": ["run_id"],
+    },
+}
+
+DREAM_UNDO_SCHEMA = {
+    "name": "mnemosyne_dream_undo",
+    "description": (
+        "Undo an applied Dream run by restoring from THIS run's before-images "
+        "only (never another run's output). Second undo returns already_undone. "
+        "Idempotent."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {"type": "string", "description": "Dream run id to undo."},
+        },
+        "required": ["run_id"],
+    },
+}
+
+RECLAIM_ORPHANS_SCHEMA = {
+    "name": "mnemosyne_reclaim_orphans",
+    "description": (
+        "Clear stale sleep claims that have no episodic summary (safe-default "
+        "orphan reclaim). DRY-RUN BY DEFAULT: pass apply=true to mutate. "
+        "Returns reclaimed/candidates counts only; never row content."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "apply": {"type": "boolean", "description": "Opt-in to mutation. Default false (dry-run).", "default": False},
+            "stale_after_seconds": {"type": "integer", "description": "Age at which a claim is considered stale. Default 3600.", "default": 3600},
+            "limit": {"type": "integer", "description": "Max claims to scan. Default 1000.", "default": 1000},
+        },
+    },
+}
+
+
+
+# ---------------------------------------------------------------------------
+# readOnly metadata (Task 6B): curated set of pure-read tool names.
+# mcp_tools.TOOLS applies ``readOnly`` from this set when building the
+# MCP-consumed tool list, so canonical schema dicts stay byte-equal to the
+# provider copies (test_hermes_provider_parity). New read tools: add here.
+# ---------------------------------------------------------------------------
+READ_ONLY_TOOLS = frozenset({
+    "mnemosyne_recall", "mnemosyne_shared_recall", "mnemosyne_shared_stats",
+    "mnemosyne_stats", "mnemosyne_get", "mnemosyne_triple_query",
+    "mnemosyne_recall_canonical", "mnemosyne_scratchpad_read",
+    "mnemosyne_diagnose", "mnemosyne_graph_query", "mnemosyne_sync_status",
+    "mnemosyne_persona_list", "mnemosyne_hygiene_audit",
+    "mnemosyne_ingest_status", "mnemosyne_dream_status",
+})
+
+
 ALL_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     REMEMBER_SCHEMA, RECALL_SCHEMA,
     SHARED_REMEMBER_SCHEMA, SHARED_RECALL_SCHEMA, SHARED_FORGET_SCHEMA, SHARED_STATS_SCHEMA,
     SLEEP_SCHEMA, STATS_SCHEMA,
     INVALIDATE_SCHEMA, VALIDATE_SCHEMA, GET_SCHEMA,
     TRIPLE_ADD_SCHEMA, TRIPLE_QUERY_SCHEMA, TRIPLE_END_SCHEMA,
-    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA,
+    REMEMBER_CANONICAL_SCHEMA, RECALL_CANONICAL_SCHEMA, FORGET_CANONICAL_SCHEMA,
     SCRATCHPAD_WRITE_SCHEMA, SCRATCHPAD_READ_SCHEMA, SCRATCHPAD_CLEAR_SCHEMA,
     EXPORT_SCHEMA, UPDATE_SCHEMA, FORGET_SCHEMA, BATCH_SCHEMA, IMPORT_SCHEMA, DIAGNOSE_SCHEMA,
     GRAPH_QUERY_SCHEMA, GRAPH_LINK_SCHEMA,
     SYNC_PUSH_SCHEMA, SYNC_PULL_SCHEMA, SYNC_STATUS_SCHEMA,
     PERSONA_PROMOTE_SCHEMA, PERSONA_DEMOTE_SCHEMA, PERSONA_LIST_SCHEMA, PERSONA_REINFORCE_SCHEMA,
     HYGIENE_AUDIT_SCHEMA, HYGIENE_CLEAN_SCHEMA,
+    INGEST_SCHEMA, INGEST_STATUS_SCHEMA, INGEST_RETRY_SCHEMA,
+    DREAM_PLAN_SCHEMA, DREAM_STATUS_SCHEMA, DREAM_REVIEW_SCHEMA,
+    DREAM_VERIFY_SCHEMA, DREAM_RESUME_SCHEMA, DREAM_APPLY_SCHEMA,
+    DREAM_UNDO_SCHEMA, RECLAIM_ORPHANS_SCHEMA,
 ]

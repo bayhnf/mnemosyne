@@ -15,9 +15,13 @@ import pytest
 from mnemosyne import doctor
 from mnemosyne.doctor import (
     DoctorReport,
+    DreamHealthAdapter,
     Finding,
+    IngestReceiptHealthAdapter,
+    ProposalContainmentAdapter,
     ReferenceContractRegistry,
     RuntimeDiagnosticsAdapter,
+    SleepClaimHealthAdapter,
     SQLiteHealthAdapter,
     VectorCoverageAdapter,
     RepairCandidate,
@@ -53,19 +57,23 @@ def _queryable_vec0_fixture(
     factory=sqlite3.Connection,
     vector_table="vec_working",
     verify_capability=True,
+    with_shadow_tables=True,
 ):
     """Simulate a vec0 DDL while retaining a queryable normal-table cache.
 
     sqlite-vec is intentionally not a test dependency.  Rewriting the catalog
     DDL after a normal table exists lets this connection prove both parts of
-    the doctor contract: metadata says vec0 and the exact table query is
-    usable.  A reopened connection correctly treats the same fixture as an
-    unavailable vec0 extension, which is covered separately below.
+    the doctor contract: metadata says vec0, its required backing tables are
+    present, and the exact table query is usable.  A shadowless fixture models
+    a corrupt vec0 catalog row and must be rejected before any vec-table read.
     """
 
     db_path = tmp_path / "queryable-vec0.db"
     conn = sqlite3.connect(db_path, factory=factory)
     conn.executescript(ddl_and_rows)
+    if with_shadow_tables:
+        for suffix in ("_chunks", "_rowids", "_info"):
+            conn.execute(f'CREATE TABLE "{vector_table}{suffix}" (id INTEGER)')
     conn.execute("PRAGMA writable_schema = ON")
     conn.execute(
         "UPDATE sqlite_master SET sql = "
@@ -119,7 +127,7 @@ def test_open_readonly_doctor_db_rejects_schema_and_data_writes(tmp_path):
 
 
 def test_optional_sqlite_vec_load_keeps_doctor_connection_write_protected(tmp_path):
-    sqlite_vec = pytest.importorskip("sqlite_vec")
+    pytest.importorskip("sqlite_vec")
     db_path = tmp_path / "doctor.db"
     sqlite3.connect(db_path).close()
 
@@ -653,6 +661,23 @@ class _VecEpisodesCountErrorConnection(sqlite3.Connection):
     def execute(self, sql, parameters=()):
         if sql.startswith("SELECT 1 FROM (SELECT 1 FROM vec_episodes) LIMIT ?"):
             raise sqlite3.OperationalError("vec count failure with private embedding")
+        return super().execute(sql, parameters)
+
+
+class _UnsafeCorruptVec0ReadConnection(sqlite3.Connection):
+    """Fail if Doctor dereferences a vec0 table whose backing schema is missing."""
+
+    vec_reads: list[str]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vec_reads = []
+
+    def execute(self, sql, parameters=()):
+        normalized = " ".join(sql.lower().split())
+        if "from vec_working" in normalized or 'from "vec_working"' in normalized:
+            self.vec_reads.append(sql)
+            raise AssertionError("unsafe corrupt vec0 table read")
         return super().execute(sql, parameters)
 
 
@@ -1265,6 +1290,32 @@ def test_vector_coverage_ignores_a_normal_table_named_vec_working(tmp_path):
     assert "private embedding_json" not in json.dumps(working)
 
 
+def test_vector_coverage_does_not_dereference_corrupt_vec0_without_backing_tables(tmp_path):
+    """A vec0 catalog row needs backing tables before Doctor may read it."""
+
+    conn = _queryable_vec0_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live');
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        """,
+        factory=_UnsafeCorruptVec0ReadConnection,
+        verify_capability=False,
+        with_shadow_tables=False,
+    )
+    try:
+        working = VectorCoverageAdapter(conn).inspect().metrics["working"]
+        assert conn.vec_reads == []
+    finally:
+        conn.close()
+
+    assert working["status"] == "unavailable"
+    assert working["vec0_status"] == STATUS_PRESENT_BUT_UNLOADABLE
+
+
 def test_vector_coverage_does_not_claim_working_coverage_after_confirmed_vec0_read_error(tmp_path):
     conn = _queryable_vec0_fixture(
         tmp_path,
@@ -1366,3 +1417,328 @@ def test_vector_coverage_treats_unloadable_vec0_as_degraded_not_corrupt(tmp_path
     assert coverage["working"]["vec0_status"] == STATUS_PRESENT_BUT_UNLOADABLE
     assert coverage["working"]["error_class"] == "operational_error"
     assert set(coverage["working"]) == {"status", "vec0_status", "error_class"}
+
+
+
+def test_ingest_receipt_health_adapter_reports_pending_failed_conflicts_and_stale_claims(tmp_path):
+    conn = _readonly_fixture(
+        tmp_path,
+        """
+        CREATE TABLE ingest_receipts (
+          event_id TEXT PRIMARY KEY, payload_hash TEXT, memory_ids TEXT,
+          status TEXT, index_status TEXT, attempts INTEGER, created_at TEXT,
+          updated_at TEXT, claim_worker_id TEXT, claim_worker_lease TEXT
+        );
+        CREATE TABLE ingest_conflicts (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT,
+          stored_payload_hash TEXT, conflicting_payload_hash TEXT, observed_at TEXT
+        );
+        INSERT INTO ingest_receipts VALUES
+          ('ev-1', 'payload-hash-1', '[]', 'stored', 'pending', 0,
+           '2026-01-01T00:00:00', '2026-01-01T00:00:00', NULL, NULL),
+          ('ev-2', 'payload-hash-2', '[]', 'stored', 'failed_terminal', 3,
+           '2026-01-02T00:00:00', '2026-01-02T00:00:00', NULL, NULL),
+          ('ev-3', 'payload-hash-3', '[]', 'stored', 'ready', 1,
+           '2026-01-03T00:00:00', '2026-01-03T00:00:00', 'worker-9',
+           '2020-01-01T00:00:00');
+        INSERT INTO ingest_conflicts
+          (event_id, stored_payload_hash, conflicting_payload_hash, observed_at)
+          VALUES ('ev-1', 'payload-hash-1', 'other-payload-hash', '2026-02-01T00:00:00');
+        """
+    )
+    try:
+        result = IngestReceiptHealthAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["status"] == "checked"
+    assert result.metrics["pending_or_failed"] == 2
+    assert result.metrics["by_index_status"] == {
+        "pending": 1,
+        "ready": 1,
+        "degraded": 0,
+        "failed_retryable": 0,
+        "failed_terminal": 1,
+    }
+    assert result.metrics["conflicts"] == 1
+    assert result.metrics["stale_receipt_claims"] == 1
+    assert result.metrics["oldest_pending_created_at"] == "2026-01-01T00:00:00"
+    assert result.metrics["oldest_pending_age_seconds"] is not None
+    assert [finding.code for finding in result.findings] == [
+        "ingest.pending_or_failed",
+        "ingest.receipt_conflicts",
+        "ingest.stale_receipt_claims",
+    ]
+    assert "payload-hash" not in json.dumps(result.metrics)
+
+
+def test_ingest_receipt_health_adapter_bounds_scans_and_unknown_index_enums(tmp_path):
+    db_path = tmp_path / "receipts-bounded.db"
+    writable = sqlite3.connect(db_path)
+    writable.executescript(
+        """
+        CREATE TABLE ingest_receipts (
+          event_id TEXT PRIMARY KEY, payload_hash TEXT, memory_ids TEXT,
+          status TEXT, index_status TEXT, attempts INTEGER, created_at TEXT,
+          updated_at TEXT, claim_worker_id TEXT, claim_worker_lease TEXT
+        );
+        """
+    )
+    for index in range(11):
+        writable.execute(
+            "INSERT INTO ingest_receipts VALUES (?, 'hash', '[]', 'stored', 'pending', 0, "
+            "'2026-01-01T00:00:00', '2026-01-01T00:00:00', NULL, NULL)",
+            (f"ev-{index}",),
+        )
+    writable.execute(
+        "INSERT INTO ingest_receipts VALUES ('ev-weird', 'hash', '[]', 'stored', 'weird_state', 0, "
+        "'2026-01-01T00:00:00', '2026-01-01T00:00:00', NULL, NULL)"
+    )
+    writable.commit()
+    writable.close()
+
+    readonly = open_readonly_doctor_db(db_path)
+    try:
+        result = IngestReceiptHealthAdapter(readonly, scan_limit=11).inspect()
+    finally:
+        readonly.close()
+
+    assert result.metrics["status"] == "scan_limited"
+    assert result.metrics["pending_or_failed"] == 11
+    assert result.metrics["by_index_status"]["pending"] == 11
+    assert result.metrics["non_enum_index_statuses"] == 1
+    assert result.metrics["truncated"] is True
+
+
+def test_sleep_claim_health_adapter_counts_stale_orphan_claims(tmp_path):
+    conn = _readonly_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (
+          id TEXT PRIMARY KEY, consolidated_at TEXT, consolidation_claimed_at TEXT
+        );
+        CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, summary_of TEXT);
+        INSERT INTO working_memory VALUES
+          ('stale-1', '2026-01-01T00:00:00', '2020-01-01T00:00:00'),
+          ('stale-2', '2026-01-01T00:00:00', '2020-01-01T00:00:00'),
+          ('covered', '2026-01-01T00:00:00', '2020-01-01T00:00:00'),
+          ('recent', '2026-01-01T00:00:00', strftime('%Y-%m-%dT%H:%M:%S', 'now', '+1 day'));
+        INSERT INTO episodic_memory VALUES ('ep-1', ',covered,');
+        """
+    )
+    try:
+        result = SleepClaimHealthAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics == {
+        "status": "checked",
+        "stale_orphan_claim_candidates": 2,
+        "stale_after_seconds": 3600,
+    }
+    assert [finding.code for finding in result.findings] == ["sleep.stale_orphan_claims"]
+
+
+def test_dream_health_adapter_counts_non_terminal_runs_without_manifest_content(tmp_path):
+    conn = _readonly_fixture(
+        tmp_path,
+        """
+        CREATE TABLE dream_runs (
+          run_id TEXT PRIMARY KEY, state TEXT NOT NULL, created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL, manifest_hash TEXT NOT NULL
+        );
+        INSERT INTO dream_runs VALUES
+          ('r1', 'planning', '2026-01-01T00:00:00', '2026-01-01T00:00:00', 'manifest-hash-1'),
+          ('r2', 'awaiting_approval', '2026-01-02T00:00:00', '2026-01-02T00:00:00', 'manifest-hash-2'),
+          ('r3', 'applied', '2026-01-03T00:00:00', '2026-01-03T00:00:00', 'manifest-hash-3'),
+          ('r4', 'rejected', '2026-01-04T00:00:00', '2026-01-04T00:00:00', 'manifest-hash-4'),
+          ('r5', 'failed_retryable', '2026-01-05T00:00:00', '2026-01-05T00:00:00', 'manifest-hash-5');
+        """
+    )
+    try:
+        result = DreamHealthAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics["status"] == "checked"
+    assert result.metrics["non_terminal_runs"] == 3
+    assert result.metrics["by_state"] == {
+        "planning": 1,
+        "awaiting_approval": 1,
+        "ready": 0,
+        "applying": 0,
+        "applied": 1,
+        "undoing": 0,
+        "undone": 0,
+        "rejected": 1,
+        "failed_retryable": 1,
+        "failed_terminal": 0,
+    }
+    assert result.metrics["oldest_non_terminal_created_at"] == "2026-01-01T00:00:00"
+    assert result.metrics["oldest_non_terminal_age_seconds"] is not None
+    assert [finding.code for finding in result.findings] == ["dream.non_terminal_runs"]
+    assert "manifest-hash" not in json.dumps(result.metrics)
+
+
+def test_proposal_containment_adapter_flags_leakage_without_content(tmp_path):
+    conn = _readonly_fixture(
+        tmp_path,
+        """
+        CREATE TABLE working_memory (
+          id TEXT PRIMARY KEY, source TEXT, metadata_json TEXT, consolidated_at TEXT,
+          superseded_by TEXT, recall_count INTEGER, last_recalled TEXT
+        );
+        INSERT INTO working_memory VALUES
+          ('p1', 'sleep_model_refresh_proposal',
+           '{"status": "pending", "category": "c", "name": "n", "body": "private proposal body"}',
+           NULL, NULL, 0, NULL),
+          ('p2', 'sleep_model_refresh_proposal',
+           '{"status": "pending", "category": "c", "name": "n", "body": "private leaked body"}',
+           NULL, NULL, 2, '2026-01-01T00:00:00'),
+          ('p3', 'sleep_model_refresh_proposal',
+           '{"status": "applied", "category": "c", "name": "n", "body": "private applied body"}',
+           NULL, NULL, 0, NULL),
+          ('plain', 'heartbeat', '{}', NULL, NULL, 0, NULL);
+        """
+    )
+    try:
+        result = ProposalContainmentAdapter(conn).inspect()
+    finally:
+        conn.close()
+
+    assert result.metrics == {
+        "status": "checked",
+        "proposal_rows": 3,
+        "pending_proposals": 2,
+        "contained_proposals": 1,
+        "leakage_candidates": 1,
+    }
+    assert [finding.code for finding in result.findings] == ["proposal.leakage"]
+    assert "private proposal body" not in json.dumps(result.metrics)
+    assert "private leaked body" not in json.dumps(result.metrics)
+
+
+def test_new_health_adapters_report_not_configured_on_legacy_schema(tmp_path):
+    conn = _readonly_fixture(tmp_path, "CREATE TABLE working_memory (id TEXT PRIMARY KEY);")
+    try:
+        adapters = (
+            IngestReceiptHealthAdapter(conn),
+            SleepClaimHealthAdapter(conn),
+            DreamHealthAdapter(conn),
+            ProposalContainmentAdapter(conn),
+        )
+        for adapter in adapters:
+            assert adapter.inspect().metrics["status"] == "not_configured"
+    finally:
+        conn.close()
+
+
+def test_build_doctor_report_adds_safe_health_sections_and_never_mutates_db(tmp_path):
+    db_path = tmp_path / "health.db"
+    writable = sqlite3.connect(db_path)
+    writable.executescript(
+        """
+        CREATE TABLE working_memory (
+          id TEXT PRIMARY KEY, source TEXT, metadata_json TEXT, consolidated_at TEXT,
+          consolidation_claimed_at TEXT, superseded_by TEXT, recall_count INTEGER,
+          last_recalled TEXT
+        );
+        CREATE TABLE episodic_memory (id TEXT PRIMARY KEY, summary_of TEXT);
+        CREATE TABLE ingest_receipts (
+          event_id TEXT PRIMARY KEY, payload_hash TEXT, memory_ids TEXT,
+          status TEXT, index_status TEXT, attempts INTEGER, created_at TEXT,
+          updated_at TEXT, claim_worker_id TEXT, claim_worker_lease TEXT
+        );
+        CREATE TABLE ingest_conflicts (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT,
+          stored_payload_hash TEXT, conflicting_payload_hash TEXT, observed_at TEXT
+        );
+        CREATE TABLE dream_runs (
+          run_id TEXT PRIMARY KEY, state TEXT NOT NULL, created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL, manifest_hash TEXT NOT NULL
+        );
+        INSERT INTO working_memory VALUES
+          ('p1', 'sleep_model_refresh_proposal',
+           '{"status": "pending", "body": "private proposal body"}',
+           NULL, NULL, NULL, 3, '2026-01-01T00:00:00'),
+          ('plain', 'heartbeat', '{}', NULL, NULL, NULL, 0, NULL);
+        INSERT INTO ingest_receipts VALUES
+          ('ev-1', 'payload-secret-hash', '[]', 'stored', 'pending', 0,
+           '2026-01-01T00:00:00', '2026-01-01T00:00:00', NULL, NULL);
+        INSERT INTO ingest_conflicts
+          (event_id, stored_payload_hash, conflicting_payload_hash, observed_at)
+          VALUES ('ev-1', 'payload-secret-hash', 'conflicting-secret-hash', '2026-02-01T00:00:00');
+        INSERT INTO dream_runs VALUES
+          ('r1', 'awaiting_approval', '2026-01-01T00:00:00', '2026-01-01T00:00:00', 'manifest-secret-hash');
+        """
+    )
+    writable.commit()
+    writable.close()
+    before = db_path.read_bytes()
+
+    report = build_doctor_report("default", db_path, scan_limit=10)
+    payload = doctor_report_payload(report)
+
+    assert db_path.read_bytes() == before
+    assert payload["execution"] == {"dry_run": True, "query_only": True, "read_only": True}
+    assert payload["ingest_receipts"]["status"] == "checked"
+    assert payload["ingest_receipts"]["pending_or_failed"] == 1
+    assert payload["ingest_receipts"]["conflicts"] == 1
+    assert payload["sleep_claims"]["status"] == "checked"
+    assert payload["sleep_claims"]["stale_orphan_claim_candidates"] == 0
+    assert payload["dream_health"]["non_terminal_runs"] == 1
+    assert payload["proposal_containment"]["leakage_candidates"] == 1
+    assert payload["recovery_integrity"]["status"] in {"ok", "warning"}
+    serialized = json.dumps(payload)
+    for secret in ("private proposal body", "payload-secret-hash", "manifest-secret-hash"):
+        assert secret not in serialized
+
+
+def test_recovery_integrity_warns_on_unloadable_vector_index(tmp_path):
+    db_path = tmp_path / "recovery-vec.db"
+    writable = sqlite3.connect(db_path)
+    writable.executescript(
+        """
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_embeddings (memory_id TEXT PRIMARY KEY, embedding_json TEXT);
+        CREATE TABLE vec_working (id INTEGER PRIMARY KEY);
+        INSERT INTO working_memory VALUES ('working-live');
+        INSERT INTO memory_embeddings VALUES ('working-live', '[0]');
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_master SET sql =
+          'CREATE VIRTUAL TABLE vec_working USING vec0(embedding float[3])'
+          WHERE name = 'vec_working';
+        PRAGMA writable_schema = OFF;
+        """
+    )
+    writable.commit()
+    writable.close()
+
+    payload = doctor_report_payload(build_doctor_report("default", db_path))
+    recovery = payload["recovery_integrity"]
+    assert recovery["sqlite_quick_check"] == "ok"
+    assert recovery["foreign_keys"] == "ok"
+    assert recovery["vector_index"] == "unavailable"
+    assert recovery["status"] == "warning"
+
+
+def test_recovery_integrity_reports_foreign_key_violations_as_error(tmp_path):
+    conn = _readonly_fixture(
+        tmp_path,
+        """
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE working_memory (id TEXT PRIMARY KEY);
+        CREATE TABLE memory_embeddings (memory_id TEXT REFERENCES working_memory(id));
+        INSERT INTO memory_embeddings VALUES ('missing');
+        """
+    )
+    try:
+        sqlite_health = SQLiteHealthAdapter(conn).inspect().metrics
+        references = ReferenceContractRegistry(conn).inspect().metrics
+        vector_coverage = VectorCoverageAdapter(conn).inspect().metrics
+    finally:
+        conn.close()
+
+    recovery = doctor._recovery_integrity_metrics(sqlite_health, references, vector_coverage)
+    assert recovery["foreign_keys"] == "violations"
+    assert recovery["status"] == "error"

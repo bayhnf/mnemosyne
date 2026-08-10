@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 import pytest
@@ -241,3 +242,98 @@ def test_cli_diagnose_skipped_repair_dry_run_does_not_exit(monkeypatch):
     cli.cmd_diagnose(["--repair-vec-working", "--dry-run"])
 
     assert run_diagnostics_calls == [{"repair_vec_working": True, "dry_run": True}]
+
+
+def test_run_diagnostics_read_only_creates_no_logs_or_default_db_and_rejects_repair(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+
+    summary = diagnose.run_diagnostics(read_only=True, repair_vec_working=True)
+
+    assert summary["read_only"] is True
+    assert summary["log_path"] is None
+    assert summary["repair_rejected"] is True
+    assert summary["resolved_db"] == str(data_dir / "mnemosyne.db")
+    assert not (tmp_path / "logs").exists()
+    assert not data_dir.exists()
+    assert summary["doctor"]["execution"] == {
+        "dry_run": True,
+        "query_only": True,
+        "read_only": True,
+    }
+    assert summary["doctor"]["ingest_receipts"]["status"] == "unavailable"
+    assert any(
+        entry["check"] == "vec_working_repair_status"
+        and entry["status"] == "rejected_read_only"
+        for entry in summary["entries"]
+    )
+
+
+def test_run_diagnostics_read_only_reports_seeded_db_without_mutation(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+    db_path = data_dir / "mnemosyne.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE working_memory (
+          id TEXT PRIMARY KEY, source TEXT, metadata_json TEXT, consolidated_at TEXT,
+          superseded_by TEXT, recall_count INTEGER, last_recalled TEXT
+        );
+        CREATE TABLE ingest_receipts (
+          event_id TEXT PRIMARY KEY, payload_hash TEXT, memory_ids TEXT,
+          status TEXT, index_status TEXT, attempts INTEGER, created_at TEXT,
+          updated_at TEXT, claim_worker_id TEXT, claim_worker_lease TEXT
+        );
+        INSERT INTO working_memory VALUES
+          ('p1', 'sleep_model_refresh_proposal',
+           '{"status": "pending", "body": "private proposal body"}',
+           NULL, NULL, 1, '2026-01-01T00:00:00');
+        INSERT INTO ingest_receipts VALUES
+          ('ev-1', 'payload-secret-hash', '[]', 'stored', 'pending', 0,
+           '2026-01-01T00:00:00', '2026-01-01T00:00:00', NULL, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    before = db_path.read_bytes()
+
+    summary = diagnose.run_diagnostics(read_only=True, bank="default")
+
+    assert db_path.read_bytes() == before
+    assert summary["log_path"] is None
+    assert not (tmp_path / "logs").exists()
+    assert summary["resolved_bank"] == "default"
+    doctor = summary["doctor"]
+    assert doctor["ingest_receipts"]["pending_or_failed"] == 1
+    assert doctor["proposal_containment"]["leakage_candidates"] == 1
+    assert any(
+        entry["check"] == "sqlite_quick_check" and entry["status"] == "OK"
+        for entry in summary["entries"]
+    )
+    assert "private proposal body" not in json.dumps(doctor)
+    assert "payload-secret-hash" not in json.dumps(doctor)
+
+
+def test_run_diagnostics_read_only_resolves_named_bank_without_creating_directories(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    bank_dir = data_dir / "banks" / "work"
+    bank_dir.mkdir(parents=True)
+    db_path = bank_dir / "mnemosyne.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(diagnose, "LOG_DIR", tmp_path / "logs")
+
+    summary = diagnose.run_diagnostics(read_only=True, bank="work")
+
+    assert summary["resolved_bank"] == "work"
+    assert summary["resolved_db"] == str(db_path)
+    assert summary["doctor"]["sqlite_health"]["quick_check"]["status"] == "ok"
+    assert not (data_dir / "banks" / "other").exists()
+    assert not (tmp_path / "logs").exists()

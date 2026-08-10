@@ -1555,3 +1555,423 @@ class TestImportGuard:
             import asyncio
             with pytest.raises(RuntimeError, match="MCP not installed"):
                 asyncio.get_event_loop().run_until_complete(_run_stdio())
+
+
+class TestTask6BMCPParity:
+    """Task 6B — close the 8 advertised-but-unhandled gaps and add native
+    MCP endpoints for ingest, bounded recall, Dream lifecycle, reclaim.
+
+    These tests are written RED-first: every assertion fails or raises on the
+    current head because the handlers/schemas do not exist.
+    """
+
+    # ─── Schema/handler one-to-one parity (binding behavior #1) ───────────
+
+    def test_every_schema_has_a_real_handler_no_provider_string_exception(self):
+        """Every ALL_TOOL_SCHEMAS entry must have a _TOOL_HANDLERS entry.
+
+        This is the binding contract: the prior exception that accepted a tool
+        merely because a Hermes-provider source file contained its name is
+        gone. The 8 known gaps (persona x4, sync x3, triple_end) must close.
+        """
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+        from mnemosyne.mcp_tools import _TOOL_HANDLERS
+
+        schemas = {s["name"] for s in ALL_TOOL_SCHEMAS}
+        handlers = set(_TOOL_HANDLERS)
+        missing = schemas - handlers
+        assert not missing, (
+            f"schemas without a real _TOOL_HANDLERS entry: {sorted(missing)}"
+        )
+
+    def test_previously_unhandled_tools_now_have_handlers(self):
+        """The 8 historical gaps must each gain a real handler."""
+        from mnemosyne.mcp_tools import _TOOL_HANDLERS
+
+        required = {
+            "mnemosyne_persona_promote",
+            "mnemosyne_persona_demote",
+            "mnemosyne_persona_list",
+            "mnemosyne_persona_reinforce",
+            "mnemosyne_sync_push",
+            "mnemosyne_sync_pull",
+            "mnemosyne_sync_status",
+            "mnemosyne_triple_end",
+        }
+        present = set(_TOOL_HANDLERS) & required
+        assert present == required, f"still missing: {sorted(required - present)}"
+
+    # ─── Native ingest endpoint (#2) ──────────────────────────────────────
+
+    def test_ingest_schema_advertised(self):
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+        names = {s["name"] for s in ALL_TOOL_SCHEMAS}
+        assert "mnemosyne_ingest" in names
+
+    def test_ingest_handler_stores_event_and_returns_content_free_receipt(self, tmp_path, monkeypatch):
+        """mnemosyne_ingest durably ingests one event and returns only
+        content-free receipt fields (no raw content in the payload)."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        result = handle_tool_call("mnemosyne_ingest", {
+            "event_id": "evt-mcp-1",
+            "producer": "cli",
+            "actor_id": "user-1",
+            "project_id": "proj-1",
+            "session_id": "sess-1",
+            "turn_id": "turn-1",
+            "role": "user",
+            "content": "private ingest payload",
+            "occurred_at": "2026-08-10T00:00:00Z",
+        })
+        assert result["status"] in ("stored", "duplicate", "conflict", "rejected")
+        # NEVER echo raw content back.
+        assert "private ingest payload" not in json.dumps(result)
+        assert "content" not in result
+        assert result.get("event_id") == "evt-mcp-1"
+
+    def test_ingest_status_handler_is_content_free(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        handle_tool_call("mnemosyne_ingest", {
+            "event_id": "evt-status-1",
+            "producer": "cli", "actor_id": "a", "project_id": "p",
+            "session_id": "s", "turn_id": "t", "role": "user",
+            "content": "secret-status", "occurred_at": "2026-08-10T00:00:00Z",
+        })
+        rows = handle_tool_call("mnemosyne_ingest_status", {"limit": 5})
+        assert "secret-status" not in json.dumps(rows)
+        for r in rows.get("receipts", []):
+            assert "content" not in r
+            assert "content_hash" not in r
+
+    # ─── Bounded recall extension (#2) ────────────────────────────────────
+
+    def test_recall_accepts_bounded_filter_fields_and_token_cap(self, tmp_path, monkeypatch):
+        """mnemosyne_recall must accept optional producer/actor/project/session
+        and hard token controls, while retaining legacy args when absent."""
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+        schema = next(s for s in ALL_TOOL_SCHEMAS if s["name"] == "mnemosyne_recall")
+        params = schema["parameters"]["properties"]
+        for opt in ("producer", "actor", "project", "session",
+                    "max_tokens", "max_item_tokens"):
+            assert opt in params, f"recall schema missing bounded field {opt!r}"
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # Seed one memory, then bounded-recall with max_tokens=1 → truncated.
+        handle_tool_call("mnemosyne_remember", {
+            "content": "x" * 200, "scope": "session",
+        })
+        env = handle_tool_call("mnemosyne_recall", {
+            "query": "x", "max_tokens": 1,
+        })
+        # Bounded path returns an envelope, not a bare list.
+        assert "token_count" in env or "rendered_context" in env
+
+    def test_recall_legacy_path_unchanged_when_bounded_fields_absent(self, tmp_path, monkeypatch):
+        """When no bounded field is supplied, recall behaves exactly as before."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        handle_tool_call("mnemosyne_remember", {"content": "legacy recall test"})
+        result = handle_tool_call("mnemosyne_recall", {"query": "legacy"})
+        # Legacy shape: status/count/results
+        assert result["status"] == "ok"
+        assert "count" in result
+        assert "results" in result
+
+    # ─── Dream lifecycle (7 handlers) (#2) ────────────────────────────────
+
+    def test_dream_schemas_advertised(self):
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+        names = {s["name"] for s in ALL_TOOL_SCHEMAS}
+        for tool in ("mnemosyne_dream_plan", "mnemosyne_dream_status",
+                     "mnemosyne_dream_review", "mnemosyne_dream_verify",
+                     "mnemosyne_dream_resume", "mnemosyne_dream_apply",
+                     "mnemosyne_dream_undo"):
+            assert tool in names, f"{tool} not advertised"
+
+    def test_dream_plan_content_free_projection(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # Seed a memory so plan has something to consider.
+        handle_tool_call("mnemosyne_remember", {"content": "dream plan seed"})
+        result = handle_tool_call("mnemosyne_dream_plan", {
+            "session_id": "sess-dream",
+        })
+        assert "run_id" in result
+        assert "state" in result
+        # NEVER expose raw scope/manifest/actions content.
+        assert "scope" not in result
+        assert "manifest" not in result
+        assert "actions" not in result
+
+    def test_dream_review_uses_fixed_reviewer_role(self, tmp_path, monkeypatch):
+        """Dream review must call the one native receipt path with the fixed
+        reviewer role; the actor is taken from args, not from the role field."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        handle_tool_call("mnemosyne_remember", {"content": "dream review seed"})
+        plan = handle_tool_call("mnemosyne_dream_plan", {"session_id": "sess-r"})
+        run_id = plan["run_id"]
+        result = handle_tool_call("mnemosyne_dream_review", {
+            "run_id": run_id,
+            "actor_id": "reviewer-a",
+            "verdict": "PASS",
+        })
+        assert result.get("state") in ("awaiting_approval", "ready", "rejected",
+                                       "failed_terminal", "planning")
+        # role must NOT be caller-controllable.
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+        schema = next(s for s in ALL_TOOL_SCHEMAS if s["name"] == "mnemosyne_dream_review")
+        assert "role" not in schema["parameters"]["properties"]
+
+    def test_dream_verify_requires_distinct_actor(self, tmp_path, monkeypatch):
+        """Verifier must be a different actor than reviewer (core contract)."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        handle_tool_call("mnemosyne_remember", {"content": "dream verify seed"})
+        plan = handle_tool_call("mnemosyne_dream_plan", {"session_id": "sess-v"})
+        run_id = plan["run_id"]
+        handle_tool_call("mnemosyne_dream_review", {
+            "run_id": run_id, "actor_id": "same-actor", "verdict": "PASS",
+        })
+        # Same actor verifying must fail-closed.
+        result = handle_tool_call("mnemosyne_dream_verify", {
+            "run_id": run_id, "actor_id": "same-actor", "verdict": "PASS",
+        })
+        assert result.get("state") in ("rejected", "failed_terminal")
+
+    def test_dream_status_content_free(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        handle_tool_call("mnemosyne_remember", {"content": "status seed"})
+        plan = handle_tool_call("mnemosyne_dream_plan", {"session_id": "sess-s"})
+        result = handle_tool_call("mnemosyne_dream_status", {"run_id": plan["run_id"]})
+        assert result["run_id"] == plan["run_id"]
+        assert "actions" not in result
+        assert "manifest" not in result
+
+    # ─── Orphan reclaim — dry-run default (#2) ────────────────────────────
+
+    def test_reclaim_orphans_defaults_to_dry_run_and_is_content_free(self, tmp_path, monkeypatch):
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+        schema = next(s for s in ALL_TOOL_SCHEMAS if s["name"] == "mnemosyne_reclaim_orphans")
+        assert schema["parameters"]["properties"]["apply"]["default"] is False
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        result = handle_tool_call("mnemosyne_reclaim_orphans", {})
+        assert result.get("dry_run") is True
+        # No row content echoed.
+        assert "content" not in result
+
+    def test_reclaim_orphans_apply_requires_explicit_opt_in(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # Default (no apply=True) never mutates.
+        result = handle_tool_call("mnemosyne_reclaim_orphans", {})
+        assert result.get("dry_run") is True
+
+    # ─── triple_end gap closure (#1) ──────────────────────────────────────
+
+    def test_triple_end_handler_closes_open_triples(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        handle_tool_call("mnemosyne_triple_add", {
+            "subject": "alice", "predicate": "knows", "object": "bob",
+        })
+        result = handle_tool_call("mnemosyne_triple_end", {
+            "subject": "alice", "predicate": "knows",
+        })
+        assert result["status"] == "ended"
+        assert result["count"] >= 1
+
+    # ─── Persona handlers (4 gap closures) (#1) ───────────────────────────
+
+    def test_persona_promote_demote_list_reinforce_handlers(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # Seed a working memory row to promote.
+        mem_result = handle_tool_call("mnemosyne_remember", {
+            "content": "persona promote target",
+        })
+        memory_id = mem_result["memory_id"]
+
+        promoted = handle_tool_call("mnemosyne_persona_promote", {
+            "memory_id": memory_id, "tier": "long_term",
+        })
+        assert promoted["status"] == "ok"
+        assert "persona_id" in promoted
+        persona_id = promoted["persona_id"]
+
+        listed = handle_tool_call("mnemosyne_persona_list", {})
+        assert listed["status"] == "ok"
+        assert listed["count"] >= 1
+
+        reinforced = handle_tool_call("mnemosyne_persona_reinforce", {
+            "persona_id": persona_id,
+        })
+        assert reinforced["status"] == "ok"
+
+        demoted = handle_tool_call("mnemosyne_persona_demote", {
+            "persona_id": persona_id,
+        })
+        assert demoted["status"] == "ok"
+
+    def test_persona_promote_unknown_memory_returns_structured_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        result = handle_tool_call("mnemosyne_persona_promote", {
+            "memory_id": "does-not-exist-xyz",
+        })
+        # Structured rejection, not an exception.
+        assert result.get("status") == "error" or "error" in result
+
+    # ─── Sync handlers — safe-default, no remote authority widened (#1, #6) ─
+
+    def test_sync_status_no_remote_returns_unconfigured_structured(self, tmp_path, monkeypatch):
+        """With no remote configured, sync_status must return a structured
+        'unconfigured' status, never raise, never widen network authority."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("MNEMOSYNE_SYNC_REMOTE", raising=False)
+        result = handle_tool_call("mnemosyne_sync_status", {})
+        assert result.get("status") in ("ok", "unconfigured", "error")
+        assert "remote" in result
+
+    def test_sync_push_no_remote_returns_structured_rejection(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("MNEMOSYNE_SYNC_REMOTE", raising=False)
+        result = handle_tool_call("mnemosyne_sync_push", {})
+        # Must NOT raise; must NOT attempt any network call.
+        assert result.get("status") in ("error", "unconfigured")
+        assert "remote" in result or "error" in result
+
+    # ─── Diagnose read-only path (#5) ─────────────────────────────────────
+
+    def test_diagnose_handler_calls_read_only_path_and_writes_no_log(self, tmp_path, monkeypatch):
+        """mnemosyne_diagnose must use run_diagnostics(read_only=True) and must
+        not create a log directory/file or default writable DB."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        # Snapshot the data dir contents before.
+        before = sorted(p.name for p in tmp_path.rglob("*")) if tmp_path.exists() else []
+
+        import inspect
+        from mnemosyne.diagnose import run_diagnostics
+        sig = inspect.signature(run_diagnostics)
+        if "read_only" not in sig.parameters:
+            pytest.skip("run_diagnostics(read_only=True) not yet implemented by Task 6B-diagnose")
+
+        handle_tool_call("mnemosyne_diagnose", {})
+        # After call: no new log file or default DB created in data dir.
+        after = sorted(p.name for p in tmp_path.rglob("*")) if tmp_path.exists() else []
+        # Tolerate only the diagnose-produced structured dict (in-memory).
+        new_files = [n for n in after if n not in before]
+        # No .jsonl log, no mnemosyne.db materialized.
+        assert not any(n.endswith(".jsonl") for n in new_files), (
+            f"diagnose wrote a JSONL log: {new_files}"
+        )
+        assert not any(n == "mnemosyne.db" for n in new_files), (
+            f"diagnose materialized a default DB: {new_files}"
+        )
+
+    def test_diagnose_repair_request_returns_structured_rejection(self, tmp_path, monkeypatch):
+        """A repair request through the read-only MCP surface must return a
+        structured rejection instead of mutating."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        import inspect
+        from mnemosyne.diagnose import run_diagnostics
+        sig = inspect.signature(run_diagnostics)
+        if "read_only" not in sig.parameters:
+            pytest.skip("run_diagnostics(read_only=True) not yet implemented")
+
+        result = handle_tool_call("mnemosyne_diagnose", {
+            "repair_vec_working": True,
+        })
+        # Must NOT have performed a repair; structured rejection.
+        assert result.get("status") == "read_only" or result.get("repair_rejected") is True or                result.get("error") == "repair_not_permitted_over_mcp", (
+            f"read-only MCP surface must reject repair, got: {result}"
+        )
+
+    # ─── Read/write distinguishability in schema metadata (#2) ────────────
+
+    def test_read_write_tools_are_distinguishable_in_schema(self):
+        """readOnly flag must let clients tell writes from reads.
+
+        Applied at TOOLS construction time so canonical schema dicts stay
+        byte-equal to the provider copies (test_hermes_provider_parity)."""
+        from mnemosyne.mcp_tools import TOOLS
+        names = {t["name"] for t in TOOLS}
+        write_tools = ("mnemosyne_ingest", "mnemosyne_remember",
+                       "mnemosyne_dream_apply", "mnemosyne_reclaim_orphans")
+        read_tools = ("mnemosyne_recall", "mnemosyne_stats", "mnemosyne_dream_status")
+        for w in write_tools:
+            assert w in names
+        for r in read_tools:
+            assert r in names
+        by_name = {t["name"]: t for t in TOOLS}
+        for w in write_tools:
+            assert by_name[w].get("readOnly") is False, (
+                f"{w} must declare readOnly: false (it mutates)"
+            )
+        for r in read_tools:
+            assert by_name[r].get("readOnly") is True, (
+                f"{r} must declare readOnly: true (pure read)"
+            )
+
+
+    def test_forget_canonical_is_advertised_and_handled(self, tmp_path, monkeypatch):
+        """FORGET_CANONICAL_SCHEMA must be in ALL_TOOL_SCHEMAS and have a real
+        MCP handler (previously it was defined but only reachable through the
+        Hermes provider; the parity test allowlisted it under PROVIDER_ONLY)."""
+        from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
+        from mnemosyne.mcp_tools import _TOOL_HANDLERS
+        names = {s["name"] for s in ALL_TOOL_SCHEMAS}
+        assert "mnemosyne_forget_canonical" in names, (
+            "FORGET_CANONICAL_SCHEMA must be advertised in ALL_TOOL_SCHEMAS"
+        )
+        assert "mnemosyne_forget_canonical" in _TOOL_HANDLERS, (
+            "mnemosyne_forget_canonical must have a real MCP handler"
+        )
+
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        handle_tool_call("mnemosyne_remember_canonical", {
+            "category": "identity", "name": "name", "body": "Alice",
+        })
+        result = handle_tool_call("mnemosyne_forget_canonical", {
+            "category": "identity", "name": "name",
+        })
+        assert result.get("retired") is True
+        result2 = handle_tool_call("mnemosyne_forget_canonical", {
+            "category": "identity", "name": "name",
+        })
+        assert result2.get("retired") is False
+
+    def test_forget_canonical_validates_required_fields(self):
+        from mnemosyne.mcp_tools import handle_tool_call
+        result = handle_tool_call("mnemosyne_forget_canonical", {})
+        assert "error" in result
+
+    # ─── All results JSON-serializable & content-free (#2, #4) ────────────
+
+    def test_all_handler_results_are_json_serializable(self, tmp_path, monkeypatch):
+        """Every handler result must be JSON-serializable structured data."""
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from mnemosyne.mcp_tools import _TOOL_HANDLERS
+        # Pick a safe read-only subset to exercise serializability.
+        safe_calls = [
+            ("mnemosyne_stats", {}),
+            ("mnemosyne_dream_status", {"run_id": "nonexistent"}),
+            ("mnemosyne_sync_status", {}),
+        ]
+        for name, args in safe_calls:
+            result = _TOOL_HANDLERS[name](args)
+            json.dumps(result)  # raises if not serializable

@@ -8,6 +8,7 @@ SQLite databases with read-only safeguards for inspection.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -36,6 +37,7 @@ _VEC0_VIRTUAL_TABLE = re.compile(
     r"^\s*CREATE\s+VIRTUAL\s+TABLE\b.*\bUSING\s+vec0\b", re.IGNORECASE | re.DOTALL
 )
 _VEC0_UNAVAILABLE_ERROR = re.compile(r"\bno such module:\s*vec0\b", re.IGNORECASE)
+_VEC0_REQUIRED_SHADOW_SUFFIXES = ("_chunks", "_rowids", "_info")
 _SAFE_DETAIL_OPERATIONS = frozenset({"schema_metadata", "table_introspection"})
 _SAFE_DETAIL_ERROR_CLASSES = frozenset(
     {"sqlite_error", "operational_error", "database_error"}
@@ -76,17 +78,68 @@ class _SQLiteVecExtensionDisableError(RuntimeError):
 # arbitrary application table into a doctor query target.
 DEFAULT_SCAN_LIMIT = 200
 _DOCTOR_TABLE_COLUMNS: dict[str, frozenset[str]] = {
-    "working_memory": frozenset({"id", "valid_until", "superseded_by"}),
+    "working_memory": frozenset(
+        {
+            "id",
+            "valid_until",
+            "superseded_by",
+            "source",
+            # metadata_json is allowed ONLY for json_extract(..., '$.status')
+            # enum reads in the proposal adapter; content fields are never
+            # selected or serialized.
+            "metadata_json",
+            "consolidated_at",
+            "consolidation_claimed_at",
+            "recall_count",
+            "last_recalled",
+        }
+    ),
     "memories": frozenset({"id"}),
-    "episodic_memory": frozenset({"id", "binary_vector"}),
+    "episodic_memory": frozenset({"id", "binary_vector", "summary_of"}),
     "memory_embeddings": frozenset({"memory_id"}),
     "vec_working": frozenset(),
     "vec_episodes": frozenset(),
     "graph_edges": frozenset({"source", "target"}),
     "canonical_facts": frozenset({"owner_id", "category", "name", "valid_until"}),
     "triples": frozenset({"valid_from", "valid_until"}),
+    "ingest_receipts": frozenset(
+        {"status", "index_status", "created_at", "updated_at", "claim_worker_id", "claim_worker_lease"}
+    ),
+    "ingest_conflicts": frozenset({"observed_at"}),
+    "dream_runs": frozenset({"state", "created_at", "updated_at"}),
 }
 _DOCTOR_TABLES = tuple(_DOCTOR_TABLE_COLUMNS)
+
+_RECEIPT_INDEX_STATES = (
+    "pending",
+    "ready",
+    "degraded",
+    "failed_retryable",
+    "failed_terminal",
+)
+_RECEIPT_PENDING_INDEX_STATES = frozenset(
+    {"pending", "degraded", "failed_retryable", "failed_terminal"}
+)
+# Mirrors mnemosyne.core.dream.TERMINAL_STATES without importing the heavy
+# Dream module into the doctor's light read-only surface.
+_DREAM_LIFECYCLE_STATES = (
+    "planning",
+    "awaiting_approval",
+    "ready",
+    "applying",
+    "applied",
+    "undoing",
+    "undone",
+    "rejected",
+    "failed_retryable",
+    "failed_terminal",
+)
+_DREAM_TERMINAL_STATES = frozenset({"rejected", "failed_retryable", "failed_terminal"})
+_PROPOSAL_SOURCE = "sleep_model_refresh_proposal"
+# Match reclaim_orphans' default stale cutoff for sleep claims.
+_SLEEP_CLAIM_STALE_SECONDS = 3600
+# Match mnemosyne.core.inhale.CLAIM_LEASE_SECONDS for receipt claims.
+_RECEIPT_CLAIM_STALE_SECONDS = 60
 
 
 @dataclass
@@ -182,6 +235,11 @@ class DoctorReport:
     reference_contracts: dict[str, Any] = field(default_factory=dict)
     vector_coverage: dict[str, Any] = field(default_factory=dict)
     hygiene_summary: dict[str, Any] = field(default_factory=dict)
+    ingest_receipts: dict[str, Any] = field(default_factory=dict)
+    sleep_claims: dict[str, Any] = field(default_factory=dict)
+    dream_health: dict[str, Any] = field(default_factory=dict)
+    proposal_containment: dict[str, Any] = field(default_factory=dict)
+    recovery_integrity: dict[str, Any] = field(default_factory=dict)
     execution: dict[str, bool] = field(
         default_factory=lambda: {"read_only": True, "query_only": True, "dry_run": True}
     )
@@ -648,24 +706,33 @@ def build_doctor_report(
         # A report without a regular-file identity remains useful read-only
         # diagnostics, but repair will deliberately reject it.
         report.database_identity = {}
+    unavailable_sections = (
+        "sqlite_health",
+        "reference_contracts",
+        "vector_coverage",
+        "ingest_receipts",
+        "sleep_claims",
+        "dream_health",
+        "proposal_containment",
+        "recovery_integrity",
+    )
+
+    def _mark_unavailable(report: DoctorReport) -> None:
+        unavailable = {"status": "unavailable", "error_class": "sqlite_error"}
+        for section in unavailable_sections:
+            setattr(report, section, dict(unavailable))
+        report.hygiene_summary = dict(unavailable, candidates=[])
+
     try:
         conn = open_readonly_doctor_db(db_path)
     except sqlite3.Error:
-        unavailable = {"status": "unavailable", "error_class": "sqlite_error"}
-        report.sqlite_health = dict(unavailable)
-        report.reference_contracts = dict(unavailable)
-        report.vector_coverage = dict(unavailable)
-        report.hygiene_summary = dict(unavailable, candidates=[])
+        _mark_unavailable(report)
         return report
     try:
         try:
             _load_optional_sqlite_vec(conn)
         except _SQLiteVecExtensionDisableError:
-            unavailable = {"status": "unavailable", "error_class": "sqlite_error"}
-            report.sqlite_health = dict(unavailable)
-            report.reference_contracts = dict(unavailable)
-            report.vector_coverage = dict(unavailable)
-            report.hygiene_summary = dict(unavailable, candidates=[])
+            _mark_unavailable(report)
             return report
         report.schema_fingerprint = inspect_schema_fingerprint(conn, scan_limit=scan_limit)
         sqlite_health = SQLiteHealthAdapter(conn, scan_limit=scan_limit).inspect()
@@ -686,6 +753,23 @@ def build_doctor_report(
             scan_limit=scan_limit,
             candidate_limit=candidate_limit,
         ).inspect().metrics
+        ingest_health = IngestReceiptHealthAdapter(conn, scan_limit=scan_limit).inspect()
+        sleep_claims = SleepClaimHealthAdapter(conn, scan_limit=scan_limit).inspect()
+        dream_health = DreamHealthAdapter(conn, scan_limit=scan_limit).inspect()
+        proposal_containment = ProposalContainmentAdapter(conn, scan_limit=scan_limit).inspect()
+        report.ingest_receipts = ingest_health.metrics
+        report.sleep_claims = sleep_claims.metrics
+        report.dream_health = dream_health.metrics
+        report.proposal_containment = proposal_containment.metrics
+        report.findings.extend(ingest_health.findings)
+        report.findings.extend(sleep_claims.findings)
+        report.findings.extend(dream_health.findings)
+        report.findings.extend(proposal_containment.findings)
+        report.recovery_integrity = _recovery_integrity_metrics(
+            report.sqlite_health,
+            report.reference_contracts,
+            report.vector_coverage,
+        )
     finally:
         conn.close()
     return report
@@ -1129,6 +1213,11 @@ def _vec_table_status(conn: sqlite3.Connection, table: str, ddl: str | None) -> 
 
     if ddl is None or not _VEC0_VIRTUAL_TABLE.search(ddl):
         return "not_configured", None
+    if not _vec0_shadow_tables_present(conn, table):
+        # A forged vec0 catalog row can make LIMIT 0 succeed after sqlite-vec
+        # loads, then crash native code on a later join. Verify only catalog
+        # metadata before touching the virtual table.
+        return STATUS_PRESENT_BUT_UNLOADABLE, "operational_error"
     try:
         conn.execute(f"SELECT 1 FROM {_quote_identifier(table)} LIMIT 0").fetchone()
         return "available", None
@@ -1136,6 +1225,21 @@ def _vec_table_status(conn: sqlite3.Connection, table: str, ddl: str | None) -> 
         if _is_confirmed_vec0_unloadable(ddl, error):
             return STATUS_PRESENT_BUT_UNLOADABLE, _safe_sqlite_error_class(error)
         return STATUS_UNKNOWN, _safe_sqlite_error_class(error)
+
+
+def _vec0_shadow_tables_present(conn: sqlite3.Connection, table: str) -> bool:
+    """Return whether SQLite catalog metadata has vec0's required backing tables."""
+
+    expected = {f"{table}{suffix}" for suffix in _VEC0_REQUIRED_SHADOW_SUFFIXES}
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN (?, ?, ?)",
+            tuple(sorted(expected)),
+        )
+        return {str(row[0]) for row in rows} == expected
+    except sqlite3.Error:
+        return False
 
 
 def _live_memory_tables(
@@ -1622,3 +1726,507 @@ class VectorCoverageAdapter:
         if vec_error and vec_status != "available":
             result["vec0_error_class"] = vec_error
         return result
+
+
+def _age_seconds(iso_timestamp: str | None) -> int | None:
+    """Return whole seconds since a stored ISO timestamp, or None if unparseable."""
+
+    if not iso_timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(iso_timestamp))
+    except (TypeError, ValueError):
+        return None
+    try:
+        if parsed.tzinfo is not None:
+            age = datetime.now(timezone.utc) - parsed
+        else:
+            age = datetime.now() - parsed
+    except TypeError:
+        return None
+    return max(0, int(age.total_seconds()))
+
+
+def _proposal_status(metadata_json: Any) -> str:
+    """Return the fixed proposal status enum, defaulting to pending like the core."""
+
+    try:
+        metadata = json.loads(metadata_json) if metadata_json else {}
+    except (TypeError, ValueError):
+        return "pending"
+    if not isinstance(metadata, dict):
+        return "pending"
+    return str(metadata.get("status") or "pending")
+
+
+class IngestReceiptHealthAdapter:
+    """Bounded, content-free ingest receipt, conflict, and claim health."""
+
+    def __init__(self, conn: sqlite3.Connection, scan_limit: int = DEFAULT_SCAN_LIMIT):
+        self.conn = conn
+        self.scan_limit = _validate_scan_limit(scan_limit)
+
+    @staticmethod
+    def _empty_metrics() -> dict[str, Any]:
+        return {
+            "status": "not_configured",
+            "pending_or_failed": 0,
+            "by_index_status": {state: 0 for state in _RECEIPT_INDEX_STATES},
+            "non_enum_index_statuses": 0,
+            "conflicts": 0,
+            "stale_receipt_claims": 0,
+            "oldest_pending_created_at": None,
+            "oldest_pending_age_seconds": None,
+        }
+
+    def inspect(self) -> AdapterResult:
+        catalog = _catalog(self.conn)
+        if catalog.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": catalog.error_class})
+        if "ingest_receipts" not in catalog.tables:
+            return AdapterResult(metrics=self._empty_metrics())
+        columns = _table_columns(self.conn, "ingest_receipts", self.scan_limit)
+        required = {"status", "index_status", "created_at", "updated_at", "claim_worker_lease"}
+        if columns.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": columns.error_class})
+        if columns.truncated and not required.issubset(columns.columns):
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "columns_truncated": True})
+        if not required.issubset(columns.columns):
+            return AdapterResult(metrics=self._empty_metrics())
+
+        rows, truncated = _bounded_metadata_rows(
+            self.conn.execute("SELECT index_status FROM ingest_receipts"),
+            self.scan_limit,
+        )
+        by_index_status = {state: 0 for state in _RECEIPT_INDEX_STATES}
+        pending_or_failed = 0
+        for (index_status,) in rows:
+            status = str(index_status)
+            if status in by_index_status:
+                by_index_status[status] += 1
+                if status in _RECEIPT_PENDING_INDEX_STATES:
+                    pending_or_failed += 1
+
+        enum_list = ", ".join(f"'{state}'" for state in _RECEIPT_INDEX_STATES)
+        non_enum = _bounded_count(
+            self.conn,
+            f"SELECT 1 FROM ingest_receipts WHERE index_status NOT IN ({enum_list})",
+            self.scan_limit,
+        )
+        conflicts = (
+            _bounded_count(self.conn, "SELECT 1 FROM ingest_conflicts", self.scan_limit)
+            if "ingest_conflicts" in catalog.tables
+            else _BoundedCount(value=0)
+        )
+        stale_cutoff = (
+            datetime.now() - timedelta(seconds=_RECEIPT_CLAIM_STALE_SECONDS)
+        ).isoformat()
+        stale_claims = _bounded_count(
+            self.conn,
+            "SELECT 1 FROM ingest_receipts "
+            "WHERE claim_worker_lease IS NOT NULL AND claim_worker_lease < '"
+            + stale_cutoff
+            + "'",
+            self.scan_limit,
+        )
+
+        error_class = next(
+            (
+                count.error_class
+                for count in (non_enum, conflicts, stale_claims)
+                if count.error_class
+            ),
+            None,
+        )
+        if error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": error_class})
+
+        oldest_pending: str | None = None
+        try:
+            row = self.conn.execute(
+                "SELECT MIN(created_at) FROM ingest_receipts "
+                "WHERE index_status IN (?, ?, ?, ?)",
+                tuple(sorted(_RECEIPT_PENDING_INDEX_STATES)),
+            ).fetchone()
+            oldest_pending = str(row[0]) if row and row[0] is not None else None
+        except sqlite3.Error as error:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": _safe_sqlite_error_class(error)})
+
+        metrics: dict[str, Any] = {
+            "status": "scan_limited" if truncated else "checked",
+            "pending_or_failed": pending_or_failed,
+            "by_index_status": by_index_status,
+            "non_enum_index_statuses": int(non_enum.value or 0),
+            "conflicts": int(conflicts.value or 0),
+            "stale_receipt_claims": int(stale_claims.value or 0),
+            "oldest_pending_created_at": oldest_pending,
+            "oldest_pending_age_seconds": _age_seconds(oldest_pending),
+        }
+        if truncated:
+            metrics["truncated"] = True
+        for name, count in (
+            ("non_enum_index_statuses", non_enum),
+            ("conflicts", conflicts),
+            ("stale_receipt_claims", stale_claims),
+        ):
+            if count.truncated:
+                metrics[f"{name}_truncated"] = True
+
+        findings: list[Finding] = []
+        if pending_or_failed:
+            findings.append(
+                Finding(
+                    code="ingest.pending_or_failed",
+                    status=STATUS_WARNING,
+                    severity=SEVERITY_WARNING,
+                    message="Ingest receipts are pending, degraded, or failed; indexing may be incomplete.",
+                )
+            )
+        if metrics["conflicts"]:
+            findings.append(
+                Finding(
+                    code="ingest.receipt_conflicts",
+                    status=STATUS_WARNING,
+                    severity=SEVERITY_WARNING,
+                    message="Receipt conflicts indicate a reused event id with a different payload.",
+                )
+            )
+        if metrics["stale_receipt_claims"]:
+            findings.append(
+                Finding(
+                    code="ingest.stale_receipt_claims",
+                    status=STATUS_WARNING,
+                    severity=SEVERITY_WARNING,
+                    message="Stale ingest receipt claims are eligible for deterministic reclaim.",
+                )
+            )
+        return AdapterResult(metrics=metrics, findings=findings)
+
+
+class SleepClaimHealthAdapter:
+    """Bounded count of stale sleep claims that orphan reclaim would clear."""
+
+    def __init__(self, conn: sqlite3.Connection, scan_limit: int = DEFAULT_SCAN_LIMIT):
+        self.conn = conn
+        self.scan_limit = _validate_scan_limit(scan_limit)
+
+    def inspect(self) -> AdapterResult:
+        catalog = _catalog(self.conn)
+        if catalog.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": catalog.error_class})
+        if "working_memory" not in catalog.tables or "episodic_memory" not in catalog.tables:
+            return AdapterResult(
+                metrics={
+                    "status": "not_configured",
+                    "stale_orphan_claim_candidates": 0,
+                    "stale_after_seconds": _SLEEP_CLAIM_STALE_SECONDS,
+                }
+            )
+        wm_columns = _table_columns(self.conn, "working_memory", self.scan_limit)
+        em_columns = _table_columns(self.conn, "episodic_memory", self.scan_limit)
+        if wm_columns.error_class or em_columns.error_class:
+            return AdapterResult(
+                metrics={
+                    "status": STATUS_UNKNOWN,
+                    "error_class": wm_columns.error_class or em_columns.error_class,
+                }
+            )
+        required_wm = {"consolidated_at", "consolidation_claimed_at"}
+        required_em = {"summary_of"}
+        if (wm_columns.truncated and not required_wm.issubset(wm_columns.columns)) or (
+            em_columns.truncated and not required_em.issubset(em_columns.columns)
+        ):
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "columns_truncated": True})
+        if not required_wm.issubset(wm_columns.columns) or not required_em.issubset(em_columns.columns):
+            return AdapterResult(
+                metrics={
+                    "status": "not_configured",
+                    "stale_orphan_claim_candidates": 0,
+                    "stale_after_seconds": _SLEEP_CLAIM_STALE_SECONDS,
+                }
+            )
+
+        cutoff = (datetime.now() - timedelta(seconds=_SLEEP_CLAIM_STALE_SECONDS)).isoformat()
+        candidates = _bounded_count(
+            self.conn,
+            "SELECT 1 FROM working_memory wm "
+            "WHERE wm.consolidated_at IS NOT NULL "
+            "AND wm.consolidation_claimed_at IS NOT NULL "
+            "AND wm.consolidation_claimed_at < '"
+            + cutoff
+            + "' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM episodic_memory em "
+            "WHERE instr(',' || COALESCE(em.summary_of, '') || ',', ',' || wm.id || ',') > 0"
+            ")",
+            self.scan_limit,
+        )
+        if candidates.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": candidates.error_class})
+        metrics: dict[str, Any] = {
+            "status": "scan_limited" if candidates.truncated else "checked",
+            "stale_orphan_claim_candidates": int(candidates.value or 0),
+            "stale_after_seconds": _SLEEP_CLAIM_STALE_SECONDS,
+        }
+        if candidates.truncated:
+            metrics["stale_orphan_claim_candidates_truncated"] = True
+        findings = (
+            [
+                Finding(
+                    code="sleep.stale_orphan_claims",
+                    status=STATUS_WARNING,
+                    severity=SEVERITY_WARNING,
+                    message="Stale sleep claims without an episodic summary are eligible for reclaim.",
+                )
+            ]
+            if metrics["stale_orphan_claim_candidates"]
+            else []
+        )
+        return AdapterResult(metrics=metrics, findings=findings)
+
+
+class DreamHealthAdapter:
+    """Bounded, content-free Dream run lifecycle health."""
+
+    def __init__(self, conn: sqlite3.Connection, scan_limit: int = DEFAULT_SCAN_LIMIT):
+        self.conn = conn
+        self.scan_limit = _validate_scan_limit(scan_limit)
+
+    @staticmethod
+    def _empty_metrics() -> dict[str, Any]:
+        return {
+            "status": "not_configured",
+            "non_terminal_runs": 0,
+            "by_state": {state: 0 for state in _DREAM_LIFECYCLE_STATES},
+            "unknown_state_runs": 0,
+            "oldest_non_terminal_created_at": None,
+            "oldest_non_terminal_age_seconds": None,
+        }
+
+    def inspect(self) -> AdapterResult:
+        catalog = _catalog(self.conn)
+        if catalog.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": catalog.error_class})
+        if "dream_runs" not in catalog.tables:
+            return AdapterResult(metrics=self._empty_metrics())
+        columns = _table_columns(self.conn, "dream_runs", self.scan_limit)
+        required = {"state", "created_at", "updated_at"}
+        if columns.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": columns.error_class})
+        if columns.truncated and not required.issubset(columns.columns):
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "columns_truncated": True})
+        if not required.issubset(columns.columns):
+            return AdapterResult(metrics=self._empty_metrics())
+
+        rows, truncated = _bounded_metadata_rows(
+            self.conn.execute("SELECT state, created_at FROM dream_runs"),
+            self.scan_limit,
+        )
+        by_state = {state: 0 for state in _DREAM_LIFECYCLE_STATES}
+        non_terminal = 0
+        unknown_states = 0
+        for state, _created in rows:
+            state = str(state)
+            if state in by_state:
+                by_state[state] += 1
+                if state not in _DREAM_TERMINAL_STATES:
+                    non_terminal += 1
+            else:
+                unknown_states += 1
+
+        oldest_non_terminal: str | None = None
+        try:
+            row = self.conn.execute(
+                "SELECT MIN(created_at) FROM dream_runs WHERE state NOT IN (?, ?, ?)",
+                tuple(sorted(_DREAM_TERMINAL_STATES)),
+            ).fetchone()
+            oldest_non_terminal = str(row[0]) if row and row[0] is not None else None
+        except sqlite3.Error as error:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": _safe_sqlite_error_class(error)})
+
+        metrics: dict[str, Any] = {
+            "status": "scan_limited" if truncated else "checked",
+            "non_terminal_runs": non_terminal,
+            "by_state": by_state,
+            "unknown_state_runs": unknown_states,
+            "oldest_non_terminal_created_at": oldest_non_terminal,
+            "oldest_non_terminal_age_seconds": _age_seconds(oldest_non_terminal),
+        }
+        if truncated:
+            metrics["truncated"] = True
+        findings = (
+            [
+                Finding(
+                    code="dream.non_terminal_runs",
+                    status=STATUS_OK,
+                    severity=SEVERITY_INFO,
+                    message="Dream runs exist outside terminal states; inspect the lifecycle if any appear stuck.",
+                )
+            ]
+            if non_terminal or unknown_states
+            else []
+        )
+        return AdapterResult(metrics=metrics, findings=findings)
+
+
+class ProposalContainmentAdapter:
+    """Bounded, content-free proposal containment and leakage health."""
+
+    def __init__(self, conn: sqlite3.Connection, scan_limit: int = DEFAULT_SCAN_LIMIT):
+        self.conn = conn
+        self.scan_limit = _validate_scan_limit(scan_limit)
+
+    def inspect(self) -> AdapterResult:
+        catalog = _catalog(self.conn)
+        if catalog.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": catalog.error_class})
+        if "working_memory" not in catalog.tables:
+            return AdapterResult(
+                metrics={
+                    "status": "not_configured",
+                    "proposal_rows": 0,
+                    "pending_proposals": 0,
+                    "contained_proposals": 0,
+                    "leakage_candidates": 0,
+                }
+            )
+        columns = _table_columns(self.conn, "working_memory", self.scan_limit)
+        required = {"source", "metadata_json", "recall_count", "last_recalled"}
+        if columns.error_class:
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": columns.error_class})
+        if columns.truncated and not required.issubset(columns.columns):
+            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "columns_truncated": True})
+        if not required.issubset(columns.columns):
+            return AdapterResult(
+                metrics={
+                    "status": "not_configured",
+                    "proposal_rows": 0,
+                    "pending_proposals": 0,
+                    "contained_proposals": 0,
+                    "leakage_candidates": 0,
+                }
+            )
+
+        rows, truncated = _bounded_metadata_rows(
+            self.conn.execute(
+                "SELECT metadata_json, recall_count, last_recalled "
+                "FROM working_memory WHERE source = ?",
+                (_PROPOSAL_SOURCE,),
+            ),
+            self.scan_limit,
+        )
+        pending = 0
+        contained = 0
+        leakage = 0
+        for metadata_json, recall_count, last_recalled in rows:
+            if _proposal_status(metadata_json) != "pending":
+                continue
+            pending += 1
+            try:
+                recalled = bool(int(recall_count or 0) > 0)
+            except (TypeError, ValueError):
+                recalled = True  # non-numeric recall bookkeeping is anomalous; flag it.
+            if recalled or last_recalled is not None:
+                leakage += 1
+            else:
+                contained += 1
+
+        # ponytail: static containment proxy via recall bookkeeping; add a
+        # recall-path audit adapter if false negatives ever appear.
+        metrics: dict[str, Any] = {
+            "status": "scan_limited" if truncated else "checked",
+            "proposal_rows": len(rows),
+            "pending_proposals": pending,
+            "contained_proposals": contained,
+            "leakage_candidates": leakage,
+        }
+        if truncated:
+            metrics["truncated"] = True
+        findings = (
+            [
+                Finding(
+                    code="proposal.leakage",
+                    status=STATUS_WARNING,
+                    severity=SEVERITY_WARNING,
+                    message="Pending model-refresh proposals show recall activity; containment review is required.",
+                )
+            ]
+            if leakage
+            else []
+        )
+        return AdapterResult(metrics=metrics, findings=findings)
+
+
+def _recovery_integrity_metrics(
+    sqlite_health: Any,
+    reference_contracts: Any,
+    vector_coverage: Any,
+) -> dict[str, Any]:
+    """Summarize recovery integrity exclusively from the safe adapters' output."""
+
+    def _simplify(metric: Any, *, ok_values: frozenset[str] = frozenset({"ok", "checked"})) -> str:
+        status = metric.get("status") if isinstance(metric, dict) else None
+        if status is None:
+            return "unavailable"
+        if status in ok_values:
+            return "ok"
+        if status in {
+            "not_configured",
+            "not_applicable",
+            "unverifiable_contract",
+            "compatibility_store",
+            "no_vectors",
+        }:
+            return "not_applicable"
+        return str(status)
+
+    quick = sqlite_health.get("quick_check", {}) if isinstance(sqlite_health, dict) else {}
+    fk = sqlite_health.get("foreign_key_check", {}) if isinstance(sqlite_health, dict) else {}
+    working = vector_coverage.get("working", {}) if isinstance(vector_coverage, dict) else {}
+    embeddings = (
+        reference_contracts.get("memory_embeddings", {})
+        if isinstance(reference_contracts, dict)
+        else {}
+    )
+
+    quick_status = _simplify(quick)
+    fk_status = "violations" if fk.get("status") == "violations" else _simplify(fk)
+    # ponytail: recovery summary tracks the working tier only; extend to
+    # episodic/canonical tiers if recovery planning ever needs them.
+    vector_status = _simplify(working)
+    ref_status = (
+        "orphans"
+        if isinstance(embeddings, dict)
+        and embeddings.get("status") == "checked"
+        and int(embeddings.get("orphan_rows") or 0) > 0
+        else _simplify(embeddings)
+    )
+
+    problems: list[str] = []
+    if quick_status in {"failed", "truncated"}:
+        problems.append("sqlite_quick_check")
+    if fk_status == "violations":
+        problems.append("foreign_keys")
+    if vector_status in {
+        "unavailable",
+        "unknown",
+        "scan_limited",
+        STATUS_PRESENT_BUT_UNLOADABLE,
+    }:
+        problems.append("vector_index")
+    if ref_status in {"orphans", "unknown", "scan_limited"}:
+        problems.append("reference_integrity")
+
+    if "sqlite_quick_check" in problems or "foreign_keys" in problems:
+        overall = "error"
+    elif problems:
+        overall = "warning"
+    else:
+        overall = "ok"
+    return {
+        "status": overall,
+        "sqlite_quick_check": quick_status,
+        "foreign_keys": fk_status,
+        "vector_index": vector_status,
+        "reference_integrity": ref_status,
+    }

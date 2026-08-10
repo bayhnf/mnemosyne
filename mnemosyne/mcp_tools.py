@@ -31,6 +31,7 @@ except ImportError:
 
 from mnemosyne.core.beam import BeamMemory, _guarded_transaction
 
+from mnemosyne import tool_schemas
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 from mnemosyne.batch_tool import (
     BatchValidationError,
@@ -78,6 +79,11 @@ for _s in ALL_TOOL_SCHEMAS:
         _t["input_schema"] = _t.pop("inputSchema")
     elif "parameters" in _t:
         _t["input_schema"] = _t.pop("parameters")
+    # Apply readOnly metadata (Task 6B) at consumption time so the canonical
+    # schema dicts in tool_schemas.py stay byte-equal to the provider copies
+    # (test_hermes_provider_parity). Hand-set values on the schema dict win.
+    if "readOnly" not in _t:
+        _t["readOnly"] = _t["name"] in tool_schemas.READ_ONLY_TOOLS
     TOOLS.append(_t)
 
 # ---------------------------------------------------------------------------
@@ -334,8 +340,16 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle mnemosyne_recall tool call."""
+    """Handle mnemosyne_recall tool call.
+
+    Without bounded options: legacy plain-list path (unchanged). With any
+    bounded option (producer/actor/project/session/max_tokens/max_item_tokens/
+    top_k_bounded/include_shared): returns a RecallEnvelope via recall_bounded.
+    Mirrors mnemosyne.cli.cmd_recall's two-path dispatch.
+    """
     query = arguments["query"]
+    if any(arguments.get(k) is not None for k in _BOUNDED_RECALL_KEYS):
+        return _recall_bounded_envelope(arguments, query, _resolve_bank(arguments))
     top_k = int(arguments.get("limit", arguments.get("top_k", 5)))
     bank = _resolve_bank(arguments)
     temporal_weight = arguments.get("temporal_weight", 0.0)
@@ -389,6 +403,72 @@ def _handle_recall(arguments: Dict[str, Any]) -> Dict[str, Any]:
     if explain_payload is not None:
         response.update({"query": query, "top_k": top_k, "explain": explain_payload})
     return response
+
+
+# Bounded-field keys that force the RecallEnvelope path (Task 6B).
+_BOUNDED_RECALL_KEYS = (
+    "producer", "actor", "project", "session",
+    "max_tokens", "max_item_tokens", "top_k_bounded", "include_shared",
+)
+
+
+def _recall_bounded_envelope(arguments: Dict[str, Any], query: str, bank: str) -> Dict[str, Any]:
+    """Take the bounded recall path when any bounded control is supplied.
+
+    Mirrors mnemosyne.cli.cmd_recall's bounded branch: builds a RecallPolicy
+    from the optional fields, calls mem.recall_bounded, and projects the
+    RecallEnvelope as JSON-serializable structured data. Legacy args (limit,
+    temporal_*, weights) are ignored on this path, exactly as the CLI does.
+    """
+    from mnemosyne.core.recall_bounded import RecallPolicy
+
+    policy_kwargs: Dict[str, Any] = {}
+    top_k_bounded = arguments.get("top_k_bounded")
+    if top_k_bounded is not None:
+        policy_kwargs["top_k"] = int(top_k_bounded)
+    max_tokens = arguments.get("max_tokens")
+    if max_tokens is not None:
+        policy_kwargs["max_tokens"] = int(max_tokens)
+    max_item_tokens = arguments.get("max_item_tokens")
+    if max_item_tokens is not None:
+        policy_kwargs["max_item_tokens"] = int(max_item_tokens)
+    producer = arguments.get("producer")
+    if producer:
+        policy_kwargs["producer_ids"] = [producer]
+    actor = arguments.get("actor")
+    if actor:
+        policy_kwargs["actor_ids"] = [actor]
+    project = arguments.get("project")
+    if project:
+        policy_kwargs["project_ids"] = [project]
+    session = arguments.get("session")
+    if session:
+        policy_kwargs["session_ids"] = [session]
+    policy_kwargs["include_shared"] = bool(arguments.get("include_shared", False))
+
+    try:
+        policy = RecallPolicy(**policy_kwargs)
+    except (ValueError, TypeError) as exc:
+        return {"error": f"invalid recall policy: {exc}"}
+
+    mem = _create_instance(
+        author_id=arguments.get("author_id"),
+        author_type=arguments.get("author_type"),
+        channel_id=arguments.get("channel_id"),
+        bank=bank,
+    )
+    env = mem.recall_bounded(query, policy)
+    return {
+        "status": "ok",
+        "results": _serialize(env.results),
+        "rendered_context": env.rendered_context,
+        "token_count": env.token_count,
+        "retrieval_mode": env.retrieval_mode,
+        "applied_filters": _serialize(env.applied_filters),
+        "degradation_reasons": list(env.degradation_reasons),
+        "trace_id": env.trace_id,
+        "bank": bank,
+    }
 
 
 def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -825,6 +905,33 @@ def _handle_recall_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
             "results_count": len(results), "results": results, "store": "canonical"}
 
 
+def _handle_forget_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_forget_canonical tool call.
+
+    Retires the current canonical fact for (category, name) by stamping
+    valid_until; nothing is deleted. Mirrors the Hermes provider path and
+    reuses CanonicalStore.forget directly.
+    """
+    from mnemosyne.core.canonical import CanonicalStore
+
+    category = (arguments.get("category") or "").strip()
+    name = (arguments.get("name") or "").strip()
+    if not category or not name:
+        return {"error": "category and name are required"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    store = getattr(mem.beam, "canonical", None)
+    if store is None:
+        db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+        store = CanonicalStore(db_path=db_path, conn=mem.beam.conn)
+
+    owner_id = _canonical_owner(arguments)
+    retired = store.forget(owner_id, category, name)
+    return {"retired": retired, "owner_id": owner_id,
+            "category": category, "name": name, "store": "canonical"}
+
+
 def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_scratchpad_write tool call."""
     content = arguments.get("content", "").strip()
@@ -926,21 +1033,46 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle mnemosyne_diagnose tool call."""
+    """Handle mnemosyne_diagnose tool call.
+
+    MCP diagnose is read-only by default: it MUST NOT write a JSONL log,
+    create a default database, run repair, or mutate SQLite. It calls
+    run_diagnostics(read_only=True), which is the safe path implemented
+    independently. A requested repair (repair_vec_working=True) through this
+    surface returns a structured rejection instead of mutating.
+
+    Falls back to the legacy signature if read_only is not yet accepted by
+    run_diagnostics, but only when no repair was requested (so we never
+    silently mutate over MCP). Once the parallel Task 6B-diagnose work lands
+    read_only support, the fallback path is dead code.
+    """
     from mnemosyne.diagnose import run_diagnostics
-    result = run_diagnostics(
-        repair_vec_working=bool(arguments.get("repair_vec_working", False)),
-        dry_run=bool(arguments.get("dry_run", False)),
-    )
-    db_path = None
-    try:
-        mem = _create_instance()
-        if hasattr(mem, "beam") and hasattr(mem.beam, "db_path"):
-            db_path = str(mem.beam.db_path)
-    except Exception:
-        pass
-    if db_path:
-        result["active_provider_db_path"] = db_path
+    import inspect
+
+    wants_repair = bool(arguments.get("repair_vec_working", False))
+    sig = inspect.signature(run_diagnostics)
+    supports_read_only = "read_only" in sig.parameters
+
+    if wants_repair:
+        # Repair over MCP is never permitted, regardless of read_only support.
+        # Fail-closed: return a structured rejection the client can act on.
+        return {
+            "status": "read_only",
+            "repair_rejected": True,
+            "error": "repair_not_permitted_over_mcp",
+            "detail": (
+                "The MCP diagnose surface is read-only and never performs "
+                "repair. Use the CLI (mnemosyne repair) to mutate."
+            ),
+        }
+
+    kwargs = {"dry_run": True}
+    if supports_read_only:
+        kwargs["read_only"] = True
+    result = run_diagnostics(**kwargs)
+    # Do NOT call _create_instance() here: constructing a Mnemosyne
+    # materializes a default DB, which violates the read-only contract.
+    # run_diagnostics already includes any db_path it resolved internally.
     return _serialize(result)
 
 
@@ -1099,6 +1231,485 @@ def _handle_hygiene_clean(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Task 6B — Native Inhale / Dream / Reclaim / Persona / Sync handlers
+# ---------------------------------------------------------------------------
+
+def _dream_projection(run) -> Dict[str, Any]:
+    """Content-free curated JSON projection of a DreamRun.
+
+    Mirrors mnemosyne.cli._dream_run_projection exactly: NEVER includes scope,
+    raw manifest, actions, before/after images, content, config audit, or
+    unbounded failure text. Only durable identifiers, state, manifest hash,
+    checkpoint, error code, safe timestamps, and receipt role/status counts.
+    """
+    receipt_counts: Dict[str, int] = {}
+    raw_receipts = getattr(run, "receipts", None) or []
+    if isinstance(raw_receipts, list):
+        for r in raw_receipts:
+            if not isinstance(r, dict):
+                continue
+            role = r.get("role", "unknown")
+            verdict = r.get("verdict", "unknown")
+            key = f"{role}:{verdict}"
+            receipt_counts[key] = receipt_counts.get(key, 0) + 1
+    action_count = 0
+    raw_actions = getattr(run, "actions", None)
+    if isinstance(raw_actions, list):
+        action_count = len(raw_actions)
+    return {
+        "run_id": run.run_id,
+        "state": run.state,
+        "manifest_hash": getattr(run, "manifest_hash", "") or "",
+        "checkpoint": getattr(run, "checkpoint", "") or "",
+        "error_code": getattr(run, "error_code", None),
+        "created_at": getattr(run, "created_at", "") or "",
+        "updated_at": getattr(run, "updated_at", "") or "",
+        "request_id": getattr(run, "request_id", None),
+        "action_count": action_count,
+        "receipt_counts": receipt_counts,
+    }
+
+
+def _receipt_projection(receipt) -> Dict[str, Any]:
+    """Content-free projection of an IngestReceipt.
+
+    Strips content, content_hash, and payload; keeps only durable identifiers,
+    status enums, attempts, and structured error fields.
+    """
+    return {
+        "event_id": getattr(receipt, "event_id", ""),
+        "status": getattr(receipt, "status", ""),
+        "index_status": getattr(receipt, "index_status", ""),
+        "attempts": getattr(receipt, "attempts", 0),
+        "last_error_code": getattr(receipt, "last_error_code", None),
+        "last_error_at": getattr(receipt, "last_error_at", None),
+        "created_at": getattr(receipt, "created_at", ""),
+        "updated_at": getattr(receipt, "updated_at", ""),
+    }
+
+
+def _handle_ingest(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_ingest tool call — durable receipt-backed ingest."""
+    import hashlib as _hashlib
+    from mnemosyne.core.inhale import IngestEvent
+
+    required = ("event_id", "producer", "actor_id", "project_id",
+                "session_id", "turn_id", "role", "content", "occurred_at")
+    missing = [f for f in required if not arguments.get(f)]
+    if missing:
+        return {"error": f"missing required fields: {', '.join(missing)}"}
+
+    content = arguments["content"]
+    metadata = arguments.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return {"error": "metadata must be an object"}
+
+    event = IngestEvent(
+        event_id=arguments["event_id"],
+        producer=arguments["producer"],
+        actor_id=arguments["actor_id"],
+        project_id=arguments["project_id"],
+        session_id=arguments["session_id"],
+        turn_id=arguments["turn_id"],
+        role=arguments["role"],
+        content=content,
+        content_hash=_hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        occurred_at=arguments["occurred_at"],
+        metadata=metadata,
+    )
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(
+        author_id=arguments.get("author_id"),
+        author_type=arguments.get("author_type"),
+        channel_id=arguments.get("channel_id"),
+        bank=bank,
+    )
+    receipt = mem.remember_event(event)
+    # NEVER echo content / content_hash in the result.
+    result = _receipt_projection(receipt)
+    result["bank"] = bank
+    return result
+
+
+def _handle_ingest_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_ingest_status tool call — content-free receipts."""
+    event_id = arguments.get("event_id") or None
+    try:
+        limit = int(arguments.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    if limit < 1:
+        return {"error": "limit must be a positive integer"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    try:
+        rows = mem.ingest_status(event_id=event_id, limit=limit)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return {
+        "status": "ok",
+        "count": len(rows),
+        "receipts": [_receipt_projection(r) for r in rows],
+        "bank": bank,
+    }
+
+
+def _handle_ingest_retry(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_ingest_retry tool call — re-index non-ready receipts."""
+    try:
+        limit = int(arguments.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    if limit < 1:
+        return {"error": "limit must be a positive integer"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    report = mem.retry_pending_ingest(limit=limit)
+    return {
+        "status": "ok",
+        "attempted": report.attempted,
+        "succeeded": report.succeeded,
+        "degraded": report.degraded,
+        "failed_retryable": report.failed_retryable,
+        "failed_terminal": report.failed_terminal,
+        "bank": bank,
+    }
+
+
+def _handle_dream_plan(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_dream_plan tool call."""
+    session_id = arguments.get("session_id")
+    if not session_id:
+        return {"error": "session_id is required for dream plan"}
+
+    scope: Dict[str, Any] = {"session_id": session_id}
+    for opt in ("actor_id", "producer", "project_id"):
+        v = arguments.get(opt)
+        if v:
+            scope[opt] = v
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    run = mem.dream_plan(
+        scope=scope,
+        limits=None,
+        request_id=arguments.get("request_id"),
+    )
+    return _dream_projection(run)
+
+
+def _handle_dream_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_dream_status tool call."""
+    run_id = arguments.get("run_id")
+    if not run_id:
+        return {"error": "run_id is required"}
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    run = mem.dream_status(run_id)
+    return _dream_projection(run)
+
+
+def _dream_submit_receipt_handler(arguments: Dict[str, Any], role: str) -> Dict[str, Any]:
+    """Shared handler for dream_review (role='reviewer') and dream_verify
+    (role='verifier'). Role is fixed by the caller, never taken from args."""
+    run_id = arguments.get("run_id")
+    if not run_id:
+        return {"error": "run_id is required"}
+    actor_id = arguments.get("actor_id")
+    if not actor_id:
+        return {"error": "actor_id is required"}
+    verdict = arguments.get("verdict")
+    if verdict not in ("PASS", "FAIL"):
+        return {"error": "verdict must be PASS or FAIL"}
+
+    from datetime import datetime, timezone
+    manifest_hash = arguments.get("manifest_hash") or ""
+    receipt = {
+        "role": role,
+        "actor_id": actor_id,
+        "run_id": run_id,
+        "manifest_hash": manifest_hash,
+        "verdict": verdict,
+        "reason_code": arguments.get("reason_code") or "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    # Bind manifest_hash from the durable run if not supplied.
+    if not receipt["manifest_hash"]:
+        existing = mem.dream_status(run_id)
+        receipt["manifest_hash"] = existing.manifest_hash or ""
+    run = mem.dream_submit_receipt(run_id, receipt)
+    return _dream_projection(run)
+
+
+def _handle_dream_review(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_dream_review — fixed reviewer role."""
+    return _dream_submit_receipt_handler(arguments, "reviewer")
+
+
+def _handle_dream_verify(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_dream_verify — fixed verifier role."""
+    return _dream_submit_receipt_handler(arguments, "verifier")
+
+
+def _handle_dream_resume(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_dream_resume tool call."""
+    run_id = arguments.get("run_id")
+    if not run_id:
+        return {"error": "run_id is required"}
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    run = mem.dream_resume(run_id)
+    return _dream_projection(run)
+
+
+def _handle_dream_apply(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_dream_apply tool call."""
+    run_id = arguments.get("run_id")
+    if not run_id:
+        return {"error": "run_id is required"}
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    run = mem.dream_apply(run_id)
+    return _dream_projection(run)
+
+
+def _handle_dream_undo(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_dream_undo tool call."""
+    run_id = arguments.get("run_id")
+    if not run_id:
+        return {"error": "run_id is required"}
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    run = mem.dream_undo(run_id)
+    return _dream_projection(run)
+
+
+def _handle_reclaim_orphans(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_reclaim_orphans — dry-run by default."""
+    dry_run = not bool(arguments.get("apply", False))
+    try:
+        stale_after_seconds = int(arguments.get("stale_after_seconds", 3600))
+    except (TypeError, ValueError):
+        stale_after_seconds = 3600
+    if stale_after_seconds < 0:
+        return {"error": "stale_after_seconds must be non-negative"}
+    try:
+        limit = int(arguments.get("limit", 1000))
+    except (TypeError, ValueError):
+        limit = 1000
+    if limit < 0:
+        return {"error": "limit must be non-negative"}
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    result = mem.reclaim_orphans(
+        dry_run=dry_run,
+        stale_after_seconds=stale_after_seconds,
+        limit=limit,
+    )
+    # Strip any row-level content; expose counts only.
+    return {
+        "status": "ok",
+        "dry_run": dry_run,
+        "reclaimed": result.get("reclaimed", 0),
+        "candidates": result.get("candidates", 0),
+        "bank": bank,
+    }
+
+
+# ---------------------------------------------------------------------------
+# triple_end gap closure (binding behavior #1)
+# ---------------------------------------------------------------------------
+
+def _handle_triple_end(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_triple_end tool call.
+
+    Mirrors hermes_memory_provider._handle_triple_end: expires open triples
+    for subject+predicate (or only the matching object when given).
+    """
+    subject = arguments.get("subject")
+    predicate = arguments.get("predicate")
+    if not subject or not predicate:
+        return {"error": "subject and predicate are required"}
+    obj = arguments.get("object") or None
+    valid_until = arguments.get("valid_until") or None
+
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+    from mnemosyne.core.triples import end_triple
+    n = end_triple(subject, predicate, object=obj, valid_until=valid_until,
+                   db_path=db_path)
+    return {"status": "ended", "count": n}
+
+
+# ---------------------------------------------------------------------------
+# Persona handlers (binding behavior #1) — thin adapter over PersonaAdapter
+# ---------------------------------------------------------------------------
+
+def _persona_adapter(mem):
+    """Lazily build a PersonaAdapter bound to the given Mnemosyne's beam."""
+    from hermes_memory_provider.persona_adapter import PersonaAdapter
+    return PersonaAdapter(beam_instance=mem.beam)
+
+
+def _persona_result(raw: str) -> Dict[str, Any]:
+    """PersonaAdapter returns JSON strings; parse into a dict for MCP."""
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "internal: malformed persona response"}
+
+
+def _handle_persona_promote(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_promote tool call."""
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    adapter = _persona_adapter(mem)
+    raw = adapter.handle_tool_call("mnemosyne_persona_promote", {
+        "memory_id": arguments.get("memory_id", ""),
+        "tier": arguments.get("tier", "long_term"),
+        "reason": arguments.get("reason", ""),
+    })
+    result = _persona_result(raw)
+    result["bank"] = bank
+    return result
+
+
+def _handle_persona_demote(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_demote tool call."""
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    adapter = _persona_adapter(mem)
+    raw = adapter.handle_tool_call("mnemosyne_persona_demote", {
+        "persona_id": arguments.get("persona_id", 0),
+        "reason": arguments.get("reason", ""),
+    })
+    result = _persona_result(raw)
+    result["bank"] = bank
+    return result
+
+
+def _handle_persona_list(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_list tool call."""
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    adapter = _persona_adapter(mem)
+    raw = adapter.handle_tool_call("mnemosyne_persona_list", {
+        "tier": arguments.get("tier"),
+        "topic": arguments.get("topic"),
+    })
+    result = _persona_result(raw)
+    result["bank"] = bank
+    return result
+
+
+def _handle_persona_reinforce(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_persona_reinforce tool call."""
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    adapter = _persona_adapter(mem)
+    raw = adapter.handle_tool_call("mnemosyne_persona_reinforce", {
+        "persona_id": arguments.get("persona_id", 0),
+    })
+    result = _persona_result(raw)
+    result["bank"] = bank
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Sync handlers (binding behavior #1, #6) — safe-default, no network widening
+# ---------------------------------------------------------------------------
+
+def _sync_remote_configured() -> str:
+    """Return the configured remote URL, or empty string if unconfigured.
+
+    Honors the same env precedence as the CLI. An MCP handler must NEVER
+    widen remote/network authority: when no remote is configured we return a
+    structured 'unconfigured' status and perform no network call.
+    """
+    return (os.environ.get("MNEMOSYNE_SYNC_REMOTE") or "").strip()
+
+
+def _sync_unconfigured_result() -> Dict[str, Any]:
+    return {
+        "status": "unconfigured",
+        "remote": "(unconfigured)",
+        "error": "No remote configured. Set MNEMOSYNE_SYNC_REMOTE or use the CLI (mnemosyne sync --remote URL --db-path PATH).",
+    }
+
+
+def _handle_sync_push(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_sync_push tool call.
+
+    Over MCP, sync push is gated on an explicitly configured remote. Without
+    one we return a structured 'unconfigured' rejection rather than
+    attempting any network call. This intentionally does NOT accept an inline
+    remote URL: the CLI is the trust boundary for binding a remote.
+    """
+    if not _sync_remote_configured():
+        return _sync_unconfigured_result()
+    # Remote is configured: defer to the Hermes SyncAdapter, which owns the
+    # transport, encryption, and auth semantics. We do not inline those here.
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    try:
+        from hermes_memory_provider.sync_adapter import SyncAdapter
+        adapter = SyncAdapter(mem.beam, config={})
+        raw = adapter.handle_tool_call("mnemosyne_sync_push", {})
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        result = {"status": "error", "error": str(exc)}
+    result["bank"] = bank
+    return result
+
+
+def _handle_sync_pull(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_sync_pull tool call."""
+    if not _sync_remote_configured():
+        return _sync_unconfigured_result()
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    try:
+        from hermes_memory_provider.sync_adapter import SyncAdapter
+        adapter = SyncAdapter(mem.beam, config={})
+        raw = adapter.handle_tool_call("mnemosyne_sync_pull", {})
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        result = {"status": "error", "error": str(exc)}
+    result["bank"] = bank
+    return result
+
+
+def _handle_sync_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle mnemosyne_sync_status tool call.
+
+    With no remote configured we return a safe 'unconfigured' status with no
+    network attempt. With a remote configured we defer to the SyncAdapter
+    status path (which may itself decide whether to contact the remote).
+    """
+    if not _sync_remote_configured():
+        return _sync_unconfigured_result()
+    bank = _resolve_bank(arguments)
+    mem = _create_instance(bank=bank)
+    try:
+        from hermes_memory_provider.sync_adapter import SyncAdapter
+        adapter = SyncAdapter(mem.beam, config={})
+        raw = adapter.handle_tool_call("mnemosyne_sync_status", {})
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        result = {"status": "error", "error": str(exc)}
+    result["bank"] = bank
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -1117,8 +1728,10 @@ _TOOL_HANDLERS = {
     "mnemosyne_get": _handle_get,
     "mnemosyne_triple_add": _handle_triple_add,
     "mnemosyne_triple_query": _handle_triple_query,
+    "mnemosyne_triple_end": _handle_triple_end,
     "mnemosyne_remember_canonical": _handle_remember_canonical,
     "mnemosyne_recall_canonical": _handle_recall_canonical,
+    "mnemosyne_forget_canonical": _handle_forget_canonical,
     "mnemosyne_scratchpad_write": _handle_scratchpad_write,
     "mnemosyne_scratchpad_read": _handle_scratchpad_read,
     "mnemosyne_scratchpad_clear": _handle_scratchpad_clear,
@@ -1131,6 +1744,27 @@ _TOOL_HANDLERS = {
     "mnemosyne_graph_link": _handle_graph_link,
     "mnemosyne_hygiene_audit": _handle_hygiene_audit,
     "mnemosyne_hygiene_clean": _handle_hygiene_clean,
+    # Task 6B — native Inhale / Dream / Reclaim endpoints
+    "mnemosyne_ingest": _handle_ingest,
+    "mnemosyne_ingest_status": _handle_ingest_status,
+    "mnemosyne_ingest_retry": _handle_ingest_retry,
+    "mnemosyne_dream_plan": _handle_dream_plan,
+    "mnemosyne_dream_status": _handle_dream_status,
+    "mnemosyne_dream_review": _handle_dream_review,
+    "mnemosyne_dream_verify": _handle_dream_verify,
+    "mnemosyne_dream_resume": _handle_dream_resume,
+    "mnemosyne_dream_apply": _handle_dream_apply,
+    "mnemosyne_dream_undo": _handle_dream_undo,
+    "mnemosyne_reclaim_orphans": _handle_reclaim_orphans,
+    # Task 6B — persona gap closures (thin adapter over PersonaAdapter)
+    "mnemosyne_persona_promote": _handle_persona_promote,
+    "mnemosyne_persona_demote": _handle_persona_demote,
+    "mnemosyne_persona_list": _handle_persona_list,
+    "mnemosyne_persona_reinforce": _handle_persona_reinforce,
+    # Task 6B — sync gap closures (safe-default, no network widening)
+    "mnemosyne_sync_push": _handle_sync_push,
+    "mnemosyne_sync_pull": _handle_sync_pull,
+    "mnemosyne_sync_status": _handle_sync_status,
 }
 
 

@@ -1,8 +1,7 @@
 """Tests for memoria_persona L3 schema (v3.10.0)."""
 
-import os
+import json
 import sqlite3
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -144,3 +143,60 @@ class TestPersonaPromotion:
             "SELECT reinforcement_count FROM memoria_persona WHERE id = ?", (pid,)
         ).fetchone()[0]
         assert count == 1
+
+
+
+class TestPersonaMCPHandlers:
+    """Task 6B — MCP handlers for persona promote/demote/list/reinforce.
+
+    The MCP layer is a thin adapter over PersonaAdapter; these verify the
+    handler contracts: structured errors, content-free rejection on unknown
+    ids, tier validation, and reinforcement counter semantics.
+    """
+
+    def test_mcp_persona_promote_validates_tier(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from mnemosyne.mcp_tools import handle_tool_call
+        # Need a real memory to promote.
+        mem = handle_tool_call("mnemosyne_remember", {"content": "tier check"})
+        result = handle_tool_call("mnemosyne_persona_promote", {
+            "memory_id": mem["memory_id"], "tier": "bogus_tier",
+        })
+        assert result.get("status") == "error"
+        assert "tier" in json.dumps(result).lower()
+
+    def test_mcp_persona_demote_unknown_id_returns_structured_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from mnemosyne.mcp_tools import handle_tool_call
+        result = handle_tool_call("mnemosyne_persona_demote", {
+            "persona_id": 999999,
+        })
+        assert result.get("status") == "error"
+
+    def test_mcp_persona_reinforce_unknown_id_returns_structured_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from mnemosyne.mcp_tools import handle_tool_call
+        result = handle_tool_call("mnemosyne_persona_reinforce", {
+            "persona_id": 999999,
+        })
+        assert result.get("status") == "error"
+
+    def test_mcp_persona_list_filters_by_tier(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        from mnemosyne.mcp_tools import handle_tool_call
+        m1 = handle_tool_call("mnemosyne_remember", {"content": "permanent fact"})
+        m2 = handle_tool_call("mnemosyne_remember", {"content": "working note"})
+        handle_tool_call("mnemosyne_persona_promote", {
+            "memory_id": m1["memory_id"], "tier": "permanent",
+        })
+        handle_tool_call("mnemosyne_persona_promote", {
+            "memory_id": m2["memory_id"], "tier": "working",
+        })
+        only_permanent = handle_tool_call("mnemosyne_persona_list", {"tier": "permanent"})
+        assert only_permanent["status"] == "ok"
+        assert only_permanent["count"] == 1
+        assert only_permanent["personas"][0]["tier"] == "permanent"

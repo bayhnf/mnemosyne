@@ -495,3 +495,39 @@ def test_doctor_cli_single_output_failure_preserves_target_and_cleans_temps(
     assert error in capsys.readouterr().err
     assert target.read_text() == previous
     assert not list(tmp_path.glob(".doctor-*"))
+
+
+def test_doctor_cli_payload_includes_read_only_health_sections_without_mutation(tmp_path):
+    db_path = tmp_path / "fixture.db"
+    _create_fixture_db(db_path)
+    before_hash = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    json_path = tmp_path / "doctor.json"
+
+    result = _run_cli(
+        [
+            "doctor",
+            "--db", str(db_path),
+            "--format", "json",
+            "--json-out", str(json_path),
+            "--scan-limit", "10",
+        ],
+        tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(json_path.read_text())
+    for section in (
+        "ingest_receipts",
+        "sleep_claims",
+        "dream_health",
+        "proposal_containment",
+        "recovery_integrity",
+    ):
+        assert section in payload
+        assert isinstance(payload[section], dict)
+    assert payload["ingest_receipts"]["status"] == "not_configured"
+    assert payload["sleep_claims"]["status"] == "not_configured"
+    assert payload["dream_health"]["status"] == "not_configured"
+    assert payload["proposal_containment"]["status"] == "not_configured"
+    assert payload["recovery_integrity"]["status"] in {"ok", "warning"}
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before_hash

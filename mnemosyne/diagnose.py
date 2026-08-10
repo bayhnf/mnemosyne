@@ -13,6 +13,7 @@ Supports --fix mode: auto-installs missing dependencies.
 import importlib.metadata  # noqa: F401  (monkeypatched by tests; runtime_diagnostics calls .version)
 import json
 import os
+import sqlite3
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -151,7 +152,13 @@ def _sqlite_integrity_diagnostics(conn) -> dict[str, str]:
     return {"quick_check": result, "detail": ""}
 
 
-def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, bank: str | None = None) -> dict:
+def run_diagnostics(
+    *,
+    repair_vec_working: bool = False,
+    dry_run: bool = False,
+    bank: str | None = None,
+    read_only: bool = False,
+) -> dict:
     """
     Run full diagnostic scan and write PII-safe log.
     Returns summary dict for display.
@@ -164,7 +171,15 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
         bank: Optional named bank to diagnose. When provided, diagnostics run
             against the bank's own SQLite DB (data/banks/<bank>/mnemosyne.db).
             When None, the default/profile-root DB is used.
+        read_only: If true, never writes a log file, never constructs a default
+            writable database, never runs repair, and never modifies SQLite.
+            Repairs requested through the read-only path are rejected with a
+            structured status instead of being executed.
     """
+    if read_only:
+        return _run_read_only_diagnostics(
+            repair_vec_working=repair_vec_working, bank=bank
+        )
     log_path = _log_path()
     entries: list[dict] = []
     resolved_bank: str | None = None
@@ -390,6 +405,161 @@ def run_diagnostics(*, repair_vec_working: bool = False, dry_run: bool = False, 
                 "Working-memory vector recall is using memory_embeddings fallback; sqlite-vec vec_working is unavailable"
             )
 
+    return summary
+
+
+def _read_only_doctor_status(payload: dict) -> str:
+    """Collapse the safe doctor payload into one fixed health status enum."""
+
+    if not isinstance(payload, dict) or not payload:
+        return "unavailable"
+    sqlite_health = payload.get("sqlite_health")
+    if isinstance(sqlite_health, dict) and sqlite_health.get("status") == "unavailable":
+        return "unavailable"
+    recovery = payload.get("recovery_integrity")
+    recovery_status = recovery.get("status") if isinstance(recovery, dict) else None
+    severities = {
+        finding.get("severity")
+        for finding in payload.get("findings", [])
+        if isinstance(finding, dict)
+    }
+    if severities & {"critical", "error"} or recovery_status == "error":
+        return "error"
+    if severities & {"warning"} or recovery_status == "warning":
+        return "warning"
+    return "ok"
+
+
+def _read_only_key_findings(payload: dict) -> list[str]:
+    """Surface only the fixed, content-free doctor finding messages."""
+
+    if not isinstance(payload, dict):
+        return []
+    return [
+        str(finding.get("message"))
+        for finding in payload.get("findings", [])
+        if isinstance(finding, dict)
+        and finding.get("severity") in {"warning", "error", "critical"}
+    ]
+
+
+def _log_doctor_metrics(payload: dict, log) -> None:
+    """Flatten bounded doctor metrics into the existing entries contract."""
+
+    sqlite = payload.get("sqlite_health") or {}
+    quick = sqlite.get("quick_check") or {}
+    fk = sqlite.get("foreign_key_check") or {}
+    log("db", "sqlite_quick_check", "OK" if quick.get("status") == "ok" else quick.get("status", "UNKNOWN"))
+    log("db", "foreign_key_check", "OK" if fk.get("status") == "ok" else str(fk.get("status", "UNKNOWN")))
+
+    ingest = payload.get("ingest_receipts") or {}
+    if ingest.get("status") in {"checked", "scan_limited"}:
+        log("db", "ingest_pending_or_failed", str(ingest.get("pending_or_failed", 0)))
+        log("db", "ingest_conflicts", str(ingest.get("conflicts", 0)))
+        log("db", "ingest_stale_receipt_claims", str(ingest.get("stale_receipt_claims", 0)))
+    else:
+        log("db", "ingest_receipts", str(ingest.get("status", "unavailable")))
+
+    sleep_claims = payload.get("sleep_claims") or {}
+    if sleep_claims.get("status") in {"checked", "scan_limited"}:
+        log("db", "sleep_stale_claims", str(sleep_claims.get("stale_orphan_claim_candidates", 0)))
+    else:
+        log("db", "sleep_claims", str(sleep_claims.get("status", "unavailable")))
+
+    dream = payload.get("dream_health") or {}
+    if dream.get("status") in {"checked", "scan_limited"}:
+        log("db", "dream_non_terminal_runs", str(dream.get("non_terminal_runs", 0)))
+    else:
+        log("db", "dream_health", str(dream.get("status", "unavailable")))
+
+    proposals = payload.get("proposal_containment") or {}
+    if proposals.get("status") in {"checked", "scan_limited"}:
+        log("db", "proposal_pending", str(proposals.get("pending_proposals", 0)))
+        log("db", "proposal_leakage_candidates", str(proposals.get("leakage_candidates", 0)))
+    else:
+        log("db", "proposal_containment", str(proposals.get("status", "unavailable")))
+
+    vector_coverage = payload.get("vector_coverage") or {}
+    working = vector_coverage.get("working") or {}
+    episodic = vector_coverage.get("episodic") or {}
+    log("db", "working_total", str(working.get("active_source_rows", 0)))
+    log("db", "vec_working_status", str(working.get("status", "unavailable")))
+    log("db", "episodic_total", str(episodic.get("source_rows", 0)))
+    log("db", "episodic_vectors", str(episodic.get("binary_vector_rows", 0)))
+    log("db", "doctor_status", _read_only_doctor_status(payload))
+
+
+def _run_read_only_diagnostics(
+    *, repair_vec_working: bool = False, bank: str | None = None
+) -> dict:
+    """Non-writing diagnostics: no log file, no default DB, no repair, no writes.
+
+    The returned summary keeps the existing ``run_diagnostics`` shape
+    (entries/checks/key_findings) plus ``read_only``, ``repair_rejected``,
+    ``log_path=None``, and a structured ``doctor`` payload for the MCP surface.
+    """
+
+    entries: list[dict] = []
+    resolved_bank = (bank or "default").strip() or "default"
+    resolved_db: str | None = None
+    payload: dict = {}
+
+    def log(category: str, check: str, status: str, detail: str = ""):
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "category": category,
+            "check": check,
+            "status": status,
+            "detail": detail,
+        }
+        entries.append(entry)
+        return entry
+
+    # Pure runtime/dependency/capability checks (no provider construction).
+    for check in collect_runtime_diagnostics()["checks"]:
+        log(check["category"], check["check"], check["status"], check["detail"])
+
+    try:
+        from mnemosyne.core.banks import get_bank_db_path_read_only
+        from mnemosyne.doctor import build_doctor_report, doctor_report_payload
+
+        db_path = get_bank_db_path_read_only(resolved_bank)
+        resolved_db = str(db_path)
+        report = build_doctor_report(resolved_bank, db_path)
+        payload = doctor_report_payload(report)
+        _log_doctor_metrics(payload, log)
+    except (FileNotFoundError, ValueError, OSError):
+        log("db", "doctor_status", "unavailable", "database unavailable")
+    except sqlite3.Error:
+        log("db", "sqlite_quick_check", "ERROR", "sqlite error")
+
+    if repair_vec_working:
+        log(
+            "db",
+            "vec_working_repair_status",
+            "rejected_read_only",
+            "repair is not available in read-only diagnostics",
+        )
+
+    non_failure_statuses = ("OK", "YES", "set", "OPTIONAL")
+    summary = {
+        "log_path": None,
+        "read_only": True,
+        "repair_rejected": bool(repair_vec_working),
+        "checks_total": len(entries),
+        "checks_passed": sum(1 for e in entries if e["status"] in non_failure_statuses),
+        "checks_failed": sum(
+            1
+            for e in entries
+            if str(e["status"]).upper() in ("MISSING", "NO", "ERROR")
+        ),
+        "key_findings": _read_only_key_findings(payload),
+        "fixable": [],
+        "entries": entries,
+        "resolved_bank": resolved_bank,
+        "resolved_db": resolved_db,
+        "doctor": payload,
+    }
     return summary
 
 

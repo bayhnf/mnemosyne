@@ -348,6 +348,8 @@ CONFIG_DESCRIPTIONS = {
     "sleep_model_refresh_min_evidence": "Minimum supporting memories before proposing a change.",
     "sleep_model_refresh_conflict_min_confidence": "Minimum confidence to auto-apply a proposal that contradicts a current fact.",
     "sleep_model_refresh_conflict_min_evidence": "Minimum supporting memories for a contradicting change.",
+    # Dream lifecycle
+    "dream_active": "Dream lifecycle gate. Set before verified apply/undo, cleared on completion; while active, sleep-time model-refresh auto-apply is forced off.",
 
     # SHMR
     "shmr_batch_size": "Memories per SHMR harmonization batch.",
