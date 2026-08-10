@@ -512,6 +512,51 @@ class TestSessionEndInaccessibleSpoolContract(_Base):
 
 
 # ---------------------------------------------------------------------------
+# Task 3: flush drops legacy spool rows that now fail admission
+# ---------------------------------------------------------------------------
+
+
+class TestFlushAdmissionDrop(_Base):
+    """A pre-existing spool row that now fails the shared admission
+    classifier must be deleted and counted as ``terminal_dropped``, without
+    incrementing the retry counter or retaining it."""
+
+    def test_flush_drops_legacy_spool_row_that_now_fails_admission(self) -> None:
+        import importlib
+
+        sys.path.insert(0, HOOKS_DIR)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_t3_flush_common", os.path.join(HOOKS_DIR, "common.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            sys.path.remove(HOOKS_DIR)
+
+        event = {
+            "event_id": "cx-legacy-secret",
+            "producer": "codex",
+            "actor_id": "alice",
+            "project_id": "projX",
+            "scope": "mem-legacy",
+            "turn_id": "t1",
+            "role": "user",
+            "content": "api_key=sk-abcdefghij0123456789",
+            "occurred_at": "2026-08-10T00:00:00+00:00",
+        }
+        self.assertEqual(mod.spool_put(self.spool_path, event), "stored")
+
+        env = self._env(
+            MNEMOSYNE_CODEX_ACTOR_ID="alice",
+            MNEMOSYNE_CODEX_PROJECT_ID="projX",
+        )
+        result = mod.flush_spool(self.spool_path, env=env)
+
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+        self.assertEqual(result.terminal_dropped, 1)
+
+
 # Contract 3: README states real SessionEnd behavior + desktop manual sequence
 #             (restart desktop, marketplace, install/enable, /hooks trust,
 #              new session, test the four lifecycle hooks)

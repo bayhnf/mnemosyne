@@ -286,6 +286,11 @@ class Outcome:
         self.error_code = error_code
         self.error_message = error_message
 
+    @property
+    def reason(self) -> str:
+        """Static, content-free rejection reason (alias of error_code)."""
+        return self.error_code
+
     def __bool__(self) -> bool:
         return self.ok
 
@@ -334,9 +339,54 @@ def native_ingest(event_dict: Dict[str, Any]) -> Outcome:
         status = getattr(receipt, "status", "")
         if status in ("stored", "duplicate"):
             return Outcome(True)
+        if (
+            status == "rejected"
+            and getattr(receipt, "last_error_code", "") == "admission_rejected"
+        ):
+            # Terminal: never enqueue an event the native admission policy
+            # rejected. The receipt carries labels only, never the content.
+            return Outcome(False, "admission_rejected", "")
         return Outcome(False, f"ingest_{status}", "")
     except Exception:
         return Outcome(False, "ingest_exception", "")
+
+
+def _admission_reject_reason(event_dict: Dict[str, Any]) -> str:
+    """Shared-classifier admission gate for spool persistence.
+
+    Mirrors native Inhale admission using Task 1's public
+    ``classify_memory_write``: secrets (content or canonical metadata) are
+    always terminal; reasoning/approval artifacts are terminal in strict
+    mode. Returns the static reason ``admission_rejected`` or "". Never
+    echoes content, matched values, or metadata.
+    """
+    try:
+        from mnemosyne.core.filters import (
+            classify_memory_write,
+            get_write_classifier_mode,
+        )
+    except Exception:
+        return ""
+    try:
+        mode = get_write_classifier_mode()
+        candidates = [str(event_dict.get("content", ""))]
+        metadata = event_dict.get("metadata")
+        if metadata is not None:
+            candidates.append(
+                json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)
+            )
+        for candidate in candidates:
+            decision = classify_memory_write(candidate)
+            if decision.reason == "secret_detected":
+                return "admission_rejected"
+            if (
+                decision.reason in ("reasoning_artifact", "approval_artifact")
+                and mode == "strict"
+            ):
+                return "admission_rejected"
+    except Exception:
+        return ""
+    return ""
 
 
 def native_recall(
@@ -582,19 +632,54 @@ def spool_inspect_state(path: str) -> Tuple[int, bool]:
         return 0, False
 
 
+class FlushResult:
+    """Flush outcome: legacy 3-tuple ``(flushed, retained_pending,
+    retained_terminal)`` plus ``terminal_dropped``.
+
+    Iterates as the legacy 3 fields so SessionEnd's existing unpacking
+    (and the child-process result round-trip) is unchanged; the extra
+    count is observable via the attribute.
+    """
+
+    __slots__ = (
+        "flushed",
+        "retained_pending",
+        "retained_terminal",
+        "terminal_dropped",
+    )
+
+    def __init__(
+        self,
+        flushed: int = 0,
+        retained_pending: int = 0,
+        retained_terminal: int = 0,
+        terminal_dropped: int = 0,
+    ):
+        self.flushed = flushed
+        self.retained_pending = retained_pending
+        self.retained_terminal = retained_terminal
+        self.terminal_dropped = terminal_dropped
+
+    def __iter__(self):
+        yield self.flushed
+        yield self.retained_pending
+        yield self.retained_terminal
+
+
 def _deadline_remaining(start: float, budget_s: float) -> float:
     return max(0.0, budget_s - (datetime.datetime.now().timestamp() - start))
 
 
-def _flush_spool_inner(path: str, budget_s: float) -> Tuple[int, int, int]:
-    """Inner flush logic (no env management). Returns (flushed, pending, terminal)."""
+def _flush_spool_inner(path: str, budget_s: float) -> FlushResult:
+    """Inner flush logic (no env management). Returns FlushResult."""
     if not os.path.exists(path):
-        return 0, 0, 0
+        return FlushResult()
     _ensure_spool(path)
     start = datetime.datetime.now().timestamp()
     flushed = 0
     retained_pending = 0
     retained_terminal = 0
+    terminal_dropped = 0
     conn = sqlite3.connect(path)
     try:
         rows = conn.execute(
@@ -610,11 +695,24 @@ def _flush_spool_inner(path: str, budget_s: float) -> Tuple[int, int, int]:
             except (json.JSONDecodeError, TypeError, ValueError):
                 retained_pending += 1
                 continue
+            if _admission_reject_reason(event_dict):
+                # Legacy row that now fails admission: terminal drop, no
+                # retry counter increment, no delivery attempt.
+                conn.execute("DELETE FROM spooled_events WHERE rowid = ?", (rowid,))
+                conn.commit()
+                terminal_dropped += 1
+                continue
             outcome = native_ingest(event_dict)
             if outcome.ok:
                 conn.execute("DELETE FROM spooled_events WHERE rowid = ?", (rowid,))
                 conn.commit()
                 flushed += 1
+            elif outcome.error_code == "admission_rejected":
+                # Native admission receipt is terminal even if the classifier
+                # gate above passed (e.g. version skew): drop, never retry.
+                conn.execute("DELETE FROM spooled_events WHERE rowid = ?", (rowid,))
+                conn.commit()
+                terminal_dropped += 1
             else:
                 new_attempts = attempts + 1
                 is_terminal = 1 if new_attempts >= _SPOOL_MAX_ATTEMPTS else 0
@@ -635,21 +733,21 @@ def _flush_spool_inner(path: str, budget_s: float) -> Tuple[int, int, int]:
         pass
     finally:
         conn.close()
-    return flushed, retained_pending, retained_terminal
+    return FlushResult(flushed, retained_pending, retained_terminal, terminal_dropped)
 
 
 def flush_spool(
     path: str,
     env: Optional[Dict[str, Any]] = None,
     budget_s: float = 2.5,
-) -> Tuple[int, int, int]:
+) -> FlushResult:
     """Attempt to deliver spooled events via native ingest within a deadline.
 
     If ``env`` is provided, it is applied temporarily via ``_scoped_env`` and
     restored on exit — it never permanently mutates ``os.environ``.
 
-    Deletes a row only after a successful ack. Terminal rows are retained.
-    Corrupt rows are retained. Never raises.
+    Deletes a row only after a successful ack or a terminal admission drop.
+    Terminal rows are retained. Corrupt rows are retained. Never raises.
     """
     if env:
         with _scoped_env({k: str(v) for k, v in env.items()}):
@@ -657,30 +755,38 @@ def flush_spool(
     return _flush_spool_inner(path, budget_s)
 
 
-def _write_flush_result(path: str, result: Tuple[int, int, int]) -> None:
+def _write_flush_result(path: str, result: FlushResult) -> None:
     """Write flush results to a temp file for the parent to read."""
     result_path = path + ".flush_result"
     try:
         with open(result_path, "w") as f:
-            json.dump(result, f)
+            json.dump(
+                [
+                    result.flushed,
+                    result.retained_pending,
+                    result.retained_terminal,
+                    result.terminal_dropped,
+                ],
+                f,
+            )
     except Exception:
         pass
 
 
-def _read_flush_result(path: str) -> Tuple[int, int, int]:
+def _read_flush_result(path: str) -> FlushResult:
     result_path = path + ".flush_result"
     try:
         with open(result_path) as f:
             data = json.load(f)
         os.unlink(result_path)
-        return tuple(data)
+        return FlushResult(*data)
     except Exception:
-        return 0, 0, 0
+        return FlushResult()
 
 
 def flush_spool_bounded(
     path: str, budget_s: float = _SESSION_END_BUDGET_S
-) -> Tuple[int, int, int]:
+) -> FlushResult:
     """Run flush_spool in a child process with a hard subprocess timeout.
 
     This provides a real hard process boundary: if the child is killed on
@@ -734,13 +840,22 @@ def flush_spool_bounded(
 def ingest_or_spool(event_dict: Dict[str, Any]) -> Tuple[Outcome, str]:
     """Try native ingest; on failure, spool for later delivery.
 
+    Terminal drops: events rejected by the shared admission classifier are
+    never spooled, and native ``admission_rejected`` receipts are terminal.
+    Both return ``Outcome(False, "admission_rejected")`` with spool_status "".
+
     Returns (Outcome, spool_status). spool_status is one of:
-    "stored", "duplicate", "full", "error", "" (ingest succeeded).
+    "stored", "duplicate", "full", "error", "" (ingest succeeded or
+    terminal-dropped).
     """
     force = os.environ.get("MNEMOSYNE_CODEX_FORCE_SPOOL", "") == "1"
     if not force:
         outcome = native_ingest(event_dict)
         if outcome.ok:
             return outcome, ""
+        if outcome.error_code == "admission_rejected":
+            return outcome, ""
+    if _admission_reject_reason(event_dict):
+        return Outcome(False, "admission_rejected", ""), ""
     status = spool_put(spool_path(), event_dict)
     return Outcome(False, "spooled", ""), status

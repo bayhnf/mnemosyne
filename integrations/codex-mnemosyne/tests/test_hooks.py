@@ -369,6 +369,123 @@ class TestSpoolFailurePath(_HookTestBase):
         self.assertEqual(remaining, 0, "spool must be empty after successful flush/ack")
 
 
+# ---------------------------------------------------------------------------
+# Task 3: shared-classifier admission gate before spool persistence
+# ---------------------------------------------------------------------------
+
+
+class TestAdmissionTerminalDrop(unittest.TestCase):
+    """Task 3: events rejected by the shared admission classifier are
+    terminal-dropped and never written to the spool; native
+    ``admission_rejected`` receipts are terminal; safe transient failures
+    still spool for retry."""
+
+    SECRET = "api_key=sk-abcdefghij0123456789"
+
+    def setUp(self) -> None:
+        self.data_dir = tempfile.mkdtemp(prefix="mnem-admission-")
+        self.spool_path = os.path.join(self.data_dir, "codex-spool.db")
+        self.base_env = {
+            "MNEMOSYNE_DATA_DIR": self.data_dir,
+            "MNEMOSYNE_CODEX_SPOOL_PATH": self.spool_path,
+            "MNEMOSYNE_CODEX_ACTOR_ID": "alice",
+            "MNEMOSYNE_CODEX_PROJECT_ID": "projX",
+        }
+
+    def tearDown(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.data_dir, ignore_errors=True)
+
+    def _load_common(self):
+        import importlib
+
+        sys.path.insert(0, HOOKS_DIR)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_t3_common", os.path.join(HOOKS_DIR, "common.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        finally:
+            sys.path.remove(HOOKS_DIR)
+
+    def _event(self, content: str, metadata: dict | None = None) -> dict:
+        return {
+            "event_id": "cx-t3-secret",
+            "producer": "codex",
+            "actor_id": "alice",
+            "project_id": "projX",
+            "scope": "mem-t3",
+            "turn_id": "turn-1",
+            "role": "user",
+            "content": content,
+            "metadata": metadata,
+            "occurred_at": "2026-08-10T00:00:00+00:00",
+        }
+
+    def _spool_bytes(self) -> bytes:
+        if not os.path.exists(self.spool_path):
+            return b""
+        with open(self.spool_path, "rb") as fh:
+            return fh.read()
+
+    def test_secret_event_is_terminal_drop_and_never_written_to_spool(self) -> None:
+        """A secret event must be terminal-dropped before any spool write."""
+        mod = self._load_common()
+        env = dict(self.base_env)
+        env["MNEMOSYNE_CODEX_FORCE_SPOOL"] = "1"  # force the spool fallback path
+        with mod._scoped_env(env):
+            outcome, spool_status = mod.ingest_or_spool(self._event(self.SECRET))
+        self.assertEqual(outcome.error_code, "admission_rejected")
+        self.assertEqual(outcome.reason, "admission_rejected")
+        self.assertEqual(spool_status, "")
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+        self.assertNotIn(self.SECRET.encode(), self._spool_bytes())
+
+    def test_secret_in_metadata_is_terminal_drop_not_spooled(self) -> None:
+        """Secrets in canonical metadata must also be terminal-dropped."""
+        mod = self._load_common()
+        env = dict(self.base_env)
+        env["MNEMOSYNE_CODEX_FORCE_SPOOL"] = "1"
+        event = self._event("clean content", metadata={"token": self.SECRET})
+        with mod._scoped_env(env):
+            outcome, spool_status = mod.ingest_or_spool(event)
+        self.assertEqual(outcome.error_code, "admission_rejected")
+        self.assertEqual(spool_status, "")
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+        self.assertNotIn(self.SECRET.encode(), self._spool_bytes())
+
+    def test_native_admission_rejected_receipt_is_terminal_not_spooled(self) -> None:
+        """A native receipt coded ``admission_rejected`` must not enqueue."""
+        mod = self._load_common()
+        with mod._scoped_env(self.base_env):
+            original = mod.native_ingest
+            mod.native_ingest = lambda _ev: mod.Outcome(False, "admission_rejected", "")
+            try:
+                outcome, spool_status = mod.ingest_or_spool(self._event("safe content"))
+            finally:
+                mod.native_ingest = original
+        self.assertEqual(outcome.error_code, "admission_rejected")
+        self.assertEqual(spool_status, "")
+        self.assertEqual(mod.spool_count(self.spool_path), 0)
+
+    def test_safe_transient_failure_still_spools_under_admission_gate(self) -> None:
+        """Admission must not turn safe transient failures into data loss."""
+        mod = self._load_common()
+        env = dict(self.base_env)
+        env["MNEMOSYNE_CODEX_FORCE_SPOOL"] = "1"
+        with mod._scoped_env(env):
+            outcome, spool_status = mod.ingest_or_spool(
+                self._event("User prefers dark mode for all editors")
+            )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_code, "spooled")
+        self.assertEqual(spool_status, "stored")
+        self.assertEqual(mod.spool_count(self.spool_path), 1)
+
+
 class TestVisibleFailures(_HookTestBase):
     def test_memory_failure_produces_visible_non_sensitive_warning(self) -> None:
         """When the DB is unreachable, the hook emits a systemMessage warning
