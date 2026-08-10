@@ -2694,52 +2694,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         return []
 
-    def _sync_turn_ingest_one(self, beam, role: str, content: str,
-                              scope_snapshot: Dict[str, str], turn_id: str):
-        """Ingest one role of a turn with a stable event id and provenance.
-
-        Uses the native receipt-backed ``remember_turn`` API when the Beam
-        exposes it; otherwise falls back to the legacy ``remember()`` path so
-        older Mnemosyne deployments keep working. Returns the receipt object
-        (or ``None`` for the legacy path, which has no receipt).
-        """
-        event_id = _sync_turn_event_id(
-            scope_snapshot["producer"] or "hermes",
-            scope_snapshot["session_id"],
-            turn_id,
-            role,
-        )
-        remember_turn = _native_remember_turn(beam)
-        if remember_turn is not None:
-            try:
-                from mnemosyne.core.inhale import TurnEvent
-            except Exception:
-                TurnEvent = None
-            if TurnEvent is not None:
-                turn = TurnEvent(
-                    event_id=event_id,
-                    producer=scope_snapshot["producer"] or "hermes",
-                    actor_id=scope_snapshot["actor_id"],
-                    project_id=scope_snapshot["project_id"],
-                    session_id=scope_snapshot["session_id"],
-                    turn_id=turn_id,
-                    role=role,
-                    content=content,
-                    content_hash=_sync_turn_content_hash(content),
-                    occurred_at=_sync_turn_occurred_at(),
-                )
-                return remember_turn(turn)
-        # Legacy fallback: no receipt, preserve the original remember() shape.
-        importance = 0.5 if role == "user" else 0.15
-        beam.remember(
-            content=content,
-            source="conversation",
-            importance=importance,
-            scope=self._default_scope,
-            extract_entities=True,
-        )
-        return None
-
     @staticmethod
     def _receipt_summary(receipt) -> Dict[str, Any]:
         """Content-free summary of one ingest receipt for diagnostics."""

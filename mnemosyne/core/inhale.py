@@ -299,17 +299,19 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
             raise TypeError("each turn must be a TurnEvent")
 
     # Phase 1: validate all events. Rejected events return a rejected
-    # receipt and are skipped -- they never enter the transaction (a
-    # corrected resubmission with the same event id must be able to
-    # succeed, so a rejected key is never burned).
+    # receipt at their original input position and are skipped -- they
+    # never enter the transaction (a corrected resubmission with the same
+    # event id must be able to succeed, so a rejected key is never burned).
+    # receipts is sized to len(turns) so every position maps 1:1 to an
+    # input turn; a rejected receipt can never be overwritten or suppressed.
     valid_turns: List[TurnEvent] = []
-    receipts: List[IngestReceipt] = []
-    for turn in turns:
+    receipts: List[Optional[IngestReceipt]] = [None] * len(turns)
+    for i, turn in enumerate(turns):
         errors = _validate_event(turn)
         if errors:
-            receipts.append(_reject(turn, errors))
+            receipts[i] = _reject(turn, errors)
         else:
-            valid_turns.append(turn)
+            valid_turns.append((i, turn))
 
     if not valid_turns:
         return receipts
@@ -323,7 +325,7 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
 
     _begin_write(conn)
     try:
-        for idx, turn in enumerate(valid_turns):
+        for idx, turn in valid_turns:
             payload_hash = _payload_hash(turn)
             row = conn.execute(
                 "SELECT * FROM ingest_receipts WHERE event_id = ?",
@@ -333,7 +335,7 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
                 if row["payload_hash"] == payload_hash:
                     # Idempotent replay: record the duplicate receipt at this
                     # position; nothing to insert.
-                    receipts.append(_receipt_from_row(row, status="duplicate"))
+                    receipts[idx] = _receipt_from_row(row, status="duplicate")
                     continue
                 # Conflict: record it in the audit trail but do NOT mutate
                 # the original lifecycle row.
@@ -349,7 +351,7 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
                     "conflicting payload_hash=%s (original receipt untouched)",
                     turn.event_id, row["payload_hash"], payload_hash,
                 )
-                receipts.append(_conflict_receipt(row, payload_hash, now))
+                receipts[idx] = _conflict_receipt(row, payload_hash, now)
                 continue
 
             memory_id = _memory_id_for_event(turn.event_id)
@@ -387,7 +389,7 @@ def remember_turns_atomic(beam, turns: List["TurnEvent"]) -> List[IngestReceipt]
                 payload=_sync_payload(turn, metadata_json), commit=False,
             )
             pending_index.append((idx, turn, memory_id))
-            receipts.append(None)  # placeholder; filled after commit
+            receipts[idx] = None  # placeholder; filled after commit
         conn.commit()
     except Exception:
         try:

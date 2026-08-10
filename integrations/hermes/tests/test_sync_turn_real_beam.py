@@ -210,6 +210,11 @@ class _RejectingBeam:
         self.remember_turn_calls.append(turn)
         return _RejectingReceipt(turn.event_id)
 
+    def remember_turns_atomic(self, turns):
+        # Return a rejected receipt for every turn, mirroring how a real
+        # BeamMemory would surface a validation/security rejection.
+        return [self.remember_turn(turn) for turn in turns]
+
     def remember(self, **kwargs):
         pass
 
@@ -345,3 +350,95 @@ def test_dream_active_false_allows_sleep_via_real_config(monkeypatch):
     monkeypatch.setattr(cfg, "get_bool", lambda key, default=False: False)
     p = _provider_with_beam(_RejectingBeam())
     assert p._dream_active_blocks_sleep() is False
+
+
+# ---------------------------------------------------------------------------
+# Round 2 C2: remember_turns_atomic must return one receipt per input turn
+# in original order, even for mixed rejected + valid inputs.
+# ---------------------------------------------------------------------------
+
+def test_remember_turns_atomic_mixed_bad_first(monkeypatch):
+    """A rejected event at position 0 must not be overwritten by the stored
+    event at position 1. Receipts must be [rejected, stored], never
+    [stored, None]."""
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.inhale import TurnEvent, remember_turns_atomic
+
+    beam_module._embeddings.available = lambda: False
+    db_path = Path(tempfile.mkdtemp()) / "c2_bad_first.db"
+    beam = BeamMemory(
+        session_id="sess", db_path=db_path,
+        author_id="actor-1", author_type="hermes",
+    )
+
+    def _turn(eid, role, content, actor="actor-1"):
+        return TurnEvent(
+            event_id=eid, producer="hermes", actor_id=actor,
+            project_id="proj", session_id="sess", turn_id="turn-1",
+            role=role, content=content,
+            content_hash=hashlib.sha256(content.encode()).hexdigest(),
+            occurred_at="2026-08-10T01:02:03Z",
+        )
+
+    turns = [
+        _turn("evt-bad", "user", "bad content", actor=""),
+        _turn("evt-good", "assistant", "good content"),
+    ]
+    out = remember_turns_atomic(beam, turns)
+
+    # Must return exactly 2 receipts, one per input, in original order.
+    assert len(out) == 2
+    assert None not in out, f"None leaked into returned receipts: {out}"
+    # Position 0: the rejected event.
+    assert out[0].event_id == "evt-bad"
+    assert out[0].status == "rejected"
+    # Position 1: the stored event.
+    assert out[1].event_id == "evt-good"
+    assert out[1].status in ("stored", "duplicate")
+    # DB: only the valid event should be persisted.
+    bad_rows = beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE content = 'bad content'"
+    ).fetchone()[0]
+    good_rows = beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE content = 'good content'"
+    ).fetchone()[0]
+    assert bad_rows == 0
+    assert good_rows == 1
+
+
+def test_remember_turns_atomic_mixed_bad_second(monkeypatch):
+    """Reverse ordering: valid first, rejected second. Receipts must be
+    [stored, rejected], never [None, rejected] or [stored, None]."""
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.inhale import TurnEvent, remember_turns_atomic
+
+    beam_module._embeddings.available = lambda: False
+    db_path = Path(tempfile.mkdtemp()) / "c2_bad_second.db"
+    beam = BeamMemory(
+        session_id="sess", db_path=db_path,
+        author_id="actor-1", author_type="hermes",
+    )
+
+    def _turn(eid, role, content, actor="actor-1"):
+        return TurnEvent(
+            event_id=eid, producer="hermes", actor_id=actor,
+            project_id="proj", session_id="sess", turn_id="turn-2",
+            role=role, content=content,
+            content_hash=hashlib.sha256(content.encode()).hexdigest(),
+            occurred_at="2026-08-10T01:02:03Z",
+        )
+
+    turns = [
+        _turn("evt-good2", "user", "good content 2"),
+        _turn("evt-bad2", "assistant", "bad content 2", actor=""),
+    ]
+    out = remember_turns_atomic(beam, turns)
+
+    assert len(out) == 2
+    assert None not in out
+    assert out[0].event_id == "evt-good2"
+    assert out[0].status in ("stored", "duplicate")
+    assert out[1].event_id == "evt-bad2"
+    assert out[1].status == "rejected"

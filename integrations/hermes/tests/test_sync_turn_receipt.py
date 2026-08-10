@@ -236,8 +236,8 @@ def test_sync_turn_atomic_when_both_sides_available():
     assert diag["failed"] == 1
     assert diag["last_error"]
     # With the atomic path, a second-side failure rolls back the first side,
-    # so no receipt landed -- the outcome is "failed" (not "partial").
-    assert diag.get("last_outcome") in ("failed", "partial")
+    # so no receipt landed -- the outcome is deterministically "failed".
+    assert diag.get("last_outcome") == "failed"
 
 
 # ---------------------------------------------------------------------------
