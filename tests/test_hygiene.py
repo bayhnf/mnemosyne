@@ -1317,3 +1317,150 @@ class TestHygieneTransactionalCounters:
             f"deleted count {result.deleted} does not match committed state (1)"
         )
         assert any("bad" in e for e in result.errors)
+
+
+# ---------------------------------------------------------------------------
+# Task 29: per-candidate error path must not leak raw exception/traceback
+# ---------------------------------------------------------------------------
+
+
+class TestHygieneCleanNoLeak:
+    """The clean_noise() per-candidate failure path must produce structural,
+    content-free errors — no raw exception text, no traceback, no content-derived
+    identifier that is not essential to the cleanup status contract."""
+
+    @staticmethod
+    def _failing_candidate():
+        """A candidate whose audit-log write raises with a unique marker.
+
+        ``noise_reasons`` holds a non-JSON-serializable instance of a uniquely
+        named class; ``json.dumps`` during the audit-log INSERT raises a
+        ``TypeError`` whose ``str()`` contains the marker class name.
+        """
+
+        class MarkerHygieneLeakProbeXyz9:  # unique marker baked into the type name
+            pass
+
+        return NoiseCandidate(
+            memory_id="leaky",
+            table_name="working_memory",
+            content_preview="",
+            noise_score=0.8,
+            noise_reasons=[MarkerHygieneLeakProbeXyz9()],
+            suggested_action="delete",
+        )
+
+    def test_per_candidate_error_excludes_marker_traceback_and_remains_an_error(
+        self, tmp_path, caplog
+    ):
+        db_path = tmp_path / "leak.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE working_memory ("
+            "id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT, "
+            "session_id TEXT, importance REAL, metadata_json TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO working_memory VALUES ('leaky','c','s','t','s',0.7,'{}')"
+        )
+        conn.commit()
+        conn.close()
+
+        candidate = self._failing_candidate()
+        marker = type(candidate.noise_reasons[0]).__name__
+
+        with caplog.at_level("WARNING", logger="mnemosyne.core.hygiene"):
+            result = clean_noise(
+                db_path, [candidate], action="delete", confirm=True, dry_run=False
+            )
+
+        # The result must still be an error (not silently successful).
+        assert result.errors, "failed candidate must still surface an error"
+
+        # A static, structural error code must be visible to the CLI surface.
+        assert any(
+            "hygiene_candidate_failed" in err or "candidate_failed" in err
+            for err in result.errors
+        ), f"static error code missing from result.errors: {result.errors}"
+
+        # The unique marker (raw exception text) must not reach result.errors.
+        assert not any(marker in err for err in result.errors), (
+            f"raw exception marker leaked into result.errors: {result.errors}"
+        )
+
+        # No traceback must reach the captured log output.
+        log_text = caplog.text
+        assert "Traceback" not in log_text, (
+            f"traceback leaked into log output:\n{log_text}"
+        )
+        assert marker not in log_text, (
+            f"raw exception marker leaked into log output:\n{log_text}"
+        )
+
+        # Good-candidate behavior remains intact: the row survives because the
+        # per-candidate savepoint rolled back the partial DELETE.
+        verify = sqlite3.connect(str(db_path))
+        try:
+            surviving = verify.execute(
+                "SELECT COUNT(*) FROM working_memory WHERE id = 'leaky'"
+            ).fetchone()[0]
+        finally:
+            verify.close()
+        assert surviving == 1, "failed candidate row must survive savepoint rollback"
+
+    def test_transaction_failure_excludes_raw_exception_text(
+        self, tmp_path, monkeypatch
+    ):
+        """The outer transaction-failure path must also be content-free."""
+        db_path = tmp_path / "txleak.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE working_memory ("
+            "id TEXT PRIMARY KEY, content TEXT, source TEXT, timestamp TEXT, "
+            "session_id TEXT, importance REAL, metadata_json TEXT)"
+        )
+        conn.execute("INSERT INTO working_memory VALUES ('k','c','s','t','s',0.7,'{}')")
+        conn.commit()
+        conn.close()
+
+        marker = "MarkerTxnLeakProbeZzz1"
+        candidate = NoiseCandidate(
+            memory_id="k",
+            table_name="working_memory",
+            content_preview="",
+            noise_score=0.8,
+            noise_reasons=["x"],
+            suggested_action="delete",
+        )
+
+        # Wrap sqlite3.connect so the connection's commit() raises with a
+        # marker-bearing message, forcing the outer transaction-failure path.
+        original_connect = sqlite3.connect
+
+        class _FailingCommitConnection:
+            def __init__(self, real):
+                self._real = real
+
+            def commit(self):
+                raise sqlite3.OperationalError(marker + ": synthetic commit failure")
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        def connect_failing_commit(*a, **kw):
+            return _FailingCommitConnection(original_connect(*a, **kw))
+
+        monkeypatch.setattr(hygiene_module.sqlite3, "connect", connect_failing_commit)
+
+        result = clean_noise(
+            db_path, [candidate], action="delete", confirm=True, dry_run=False
+        )
+
+        assert result.errors, "transaction failure must surface an error"
+        assert any(
+            "hygiene_transaction_failed" in err or "transaction_failed" in err
+            for err in result.errors
+        ), f"static error code missing: {result.errors}"
+        assert not any(marker in err for err in result.errors), (
+            f"raw exception marker leaked into transaction error: {result.errors}"
+        )

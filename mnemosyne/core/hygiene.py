@@ -778,21 +778,26 @@ def clean_noise(
                     result.kept += 1
                 result.log_entries += 1
 
-            except Exception as e:
+            except Exception:
                 try:
                     cursor.execute("ROLLBACK TO hygiene_candidate")
                     cursor.execute("RELEASE hygiene_candidate")
                 except sqlite3.Error:
-                    logger.warning("Failed to roll back hygiene savepoint for %s:%s",
-                                   c.table_name, c.memory_id, exc_info=True)
-                result.errors.append(f"Error processing {c.table_name}:{c.memory_id}: {e}")
-                logger.warning("Hygiene cleanup error for %s:%s: %s",
-                               c.table_name, c.memory_id, e)
+                    logger.warning("hygiene_savepoint_rollback_failed: %s:%s",
+                                   c.table_name, c.memory_id)
+                # Structural, content-free error: identify which candidate
+                # failed without leaking raw exception text or a traceback.
+                # table_name:memory_id are candidate references (not content),
+                # required by the cleanup status contract so operators can
+                # see which candidate to retry.
+                result.errors.append(f"hygiene_candidate_failed: {c.table_name}:{c.memory_id}")
+                logger.warning("hygiene_candidate_failed: %s:%s",
+                               c.table_name, c.memory_id)
 
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        result.errors.append(f"Transaction failed: {e}")
+        result.errors.append("hygiene_transaction_failed")
     finally:
         conn.close()
 
