@@ -1360,6 +1360,8 @@ def _read_only_beam(bank: str):
         if "unable to open" in str(exc).lower():
             raise FileNotFoundError(f"database for bank '{bank}' does not exist")
         raise
+    # sqlite3.DatabaseError (corrupt/non-SQLite file) propagates to the caller,
+    # which returns a structured 'unavailable' result without leaking raw text.
     return types.SimpleNamespace(conn=conn, db_path=db_path)
 
 
@@ -1381,14 +1383,23 @@ def _handle_ingest_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
     from mnemosyne.core.inhale import ingest_status as _ingest_status
     try:
         beam = _read_only_beam(bank)
-    except (FileNotFoundError, ValueError):
+    except ValueError:
+        # Invalid bank name (failed validation): truthful structured error.
+        return {"status": "error", "error": "invalid_bank", "bank": bank}
+    except FileNotFoundError:
         # No database exists yet for this bank: no receipts to report. Do NOT
         # materialize one; return an empty structured result.
         return {"status": "ok", "count": 0, "receipts": [], "bank": bank}
+    except sqlite3.Error:
+        return {"status": "unavailable", "error": "database_unavailable", "bank": bank}
     try:
         rows = _ingest_status(beam, event_id=event_id, limit=limit)
-    except (FileNotFoundError, ValueError) as exc:
+    except ValueError as exc:
         return {"error": str(exc)}
+    except sqlite3.Error:
+        # Corrupt/malformed/missing-table DB: structured, content-free,
+        # no raw exception text. Matches the doctor adapter error pattern.
+        return {"status": "unavailable", "error": "database_unavailable", "bank": bank}
     finally:
         beam.conn.close()
     return {
@@ -1649,8 +1660,12 @@ def _handle_persona_list(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     try:
         beam = _read_only_beam(bank)
-    except (FileNotFoundError, ValueError):
+    except ValueError:
+        return {"status": "error", "error": "invalid_bank", "bank": bank}
+    except FileNotFoundError:
         return {"status": "ok", "count": 0, "personas": [], "bank": bank}
+    except sqlite3.Error:
+        return {"status": "unavailable", "error": "database_unavailable", "bank": bank}
     try:
         from hermes_memory_provider.persona_adapter import PersonaAdapter
         adapter = PersonaAdapter(beam_instance=beam)
@@ -1658,11 +1673,18 @@ def _handle_persona_list(arguments: Dict[str, Any]) -> Dict[str, Any]:
             "tier": arguments.get("tier"),
             "topic": arguments.get("topic"),
         })
-    except (FileNotFoundError, ValueError) as exc:
-        return {"error": str(exc)}
+    except sqlite3.Error:
+        # Corrupt/malformed/missing-table DB: structured, content-free.
+        return {"status": "unavailable", "error": "database_unavailable", "bank": bank}
     finally:
         beam.conn.close()
     result = _persona_result(raw)
+    # persona_list is a read-only surface: sanitize any adapter-returned error
+    # to a content-free structured result (the adapter echoes raw exception
+    # text like "no such table" / "file is not a database", which must not
+    # leak to MCP clients).
+    if isinstance(result, dict) and result.get("status") == "error":
+        result = {"status": "unavailable", "error": "database_unavailable", "bank": bank}
     result["bank"] = bank
     return result
 
@@ -1717,6 +1739,51 @@ def _sync_unconfigured_result() -> Dict[str, Any]:
     }
 
 
+def _sync_adapter_config_from_yaml() -> Dict[str, Any]:
+    """Build a SyncAdapter config dict from config.yaml sync_* keys.
+
+    ``SyncAdapter._string``/``_resolve_remote``/``_resolve_bool``/``_resolve_key``
+    read ONLY env vars + the passed config dict — they never read config.yaml.
+    Without this mapping, a config.yaml-only deployment passes the MCP gate
+    (``_sync_resolve_remote`` reads config.yaml) but fails inside the adapter
+    with "No remote configured".
+
+    Mapping config.yaml → adapter config keys lets the adapter's OWN
+    authoritative resolution apply its env-over-config precedence uniformly
+    to remote, host, port, key, encrypt, token, and mode. We deliberately do
+    NOT duplicate the resolution logic; we feed the inputs and let the adapter
+    resolve. Env still wins over config.yaml because the adapter checks env
+    first in ``_string``.
+    """
+    from mnemosyne.core.config import get_config
+    cfg = get_config()
+    adapter_cfg: Dict[str, Any] = {}
+    # Credentials / mode: direct key mappings (config.yaml → adapter config).
+    for yaml_key, adapter_key in (
+        ("sync_key", "key"),
+        ("sync_encrypt", "encrypt"),
+        ("sync_token", "token"),
+        ("sync_mode", "mode"),
+    ):
+        val = cfg.get(yaml_key, "")
+        if val not in ("", None):
+            adapter_cfg[adapter_key] = val
+    # Remote: config.yaml sync_remote wins; otherwise synthesize from
+    # sync_host + sync_port. The adapter's _resolve_remote only checks
+    # env for host/port (not its config dict), so we must build the URL
+    # here and pass it as the "remote" config key. Env still wins over
+    # config.yaml because _string checks MNEMOSYNE_SYNC_REMOTE first.
+    remote = str(cfg.get("sync_remote", "") or "").strip()
+    if not remote:
+        host = str(cfg.get("sync_host", "") or "").strip()
+        port = str(cfg.get("sync_port", "") or "").strip()
+        if host and port:
+            remote = f"https://{host}:{port}"
+    if remote:
+        adapter_cfg["remote"] = remote
+    return adapter_cfg
+
+
 def _handle_sync_push(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_sync_push tool call.
 
@@ -1731,7 +1798,7 @@ def _handle_sync_push(arguments: Dict[str, Any]) -> Dict[str, Any]:
     mem = _create_instance(bank=bank)
     try:
         from hermes_memory_provider.sync_adapter import SyncAdapter
-        adapter = SyncAdapter(mem.beam, config={})
+        adapter = SyncAdapter(mem.beam, config=_sync_adapter_config_from_yaml())
         raw = adapter.handle_tool_call("mnemosyne_sync_push", {})
         result = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
@@ -1748,7 +1815,7 @@ def _handle_sync_pull(arguments: Dict[str, Any]) -> Dict[str, Any]:
     mem = _create_instance(bank=bank)
     try:
         from hermes_memory_provider.sync_adapter import SyncAdapter
-        adapter = SyncAdapter(mem.beam, config={})
+        adapter = SyncAdapter(mem.beam, config=_sync_adapter_config_from_yaml())
         raw = adapter.handle_tool_call("mnemosyne_sync_pull", {})
         result = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
@@ -1768,7 +1835,7 @@ def _handle_sync_status(arguments: Dict[str, Any]) -> Dict[str, Any]:
     mem = _create_instance(bank=bank)
     try:
         from hermes_memory_provider.sync_adapter import SyncAdapter
-        adapter = SyncAdapter(mem.beam, config={})
+        adapter = SyncAdapter(mem.beam, config=_sync_adapter_config_from_yaml())
         raw = adapter.handle_tool_call("mnemosyne_sync_status", {})
         result = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
