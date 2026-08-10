@@ -1511,6 +1511,41 @@ class TestBoundedDegradationObservabilityI3:
             "raw exception text leaked into fact degradation log"
         )
 
+    def test_associative_hydration_failure_emits_degradation_reason(
+        self, beam, monkeypatch, caplog,
+    ):
+        """Associative graph traversal failure must not silently drop the
+        layer: recall continues and the envelope reports
+        ``associative_hydration_failed`` with no exception detail."""
+        import logging
+        from mnemosyne.core.episodic_graph import EpisodicGraph
+
+        mid = _remember(beam, "associative hydration observability alpha")
+        if beam.episodic_graph is None:
+            beam.episodic_graph = EpisodicGraph(conn=beam.conn, db_path=beam.db_path)
+
+        def _boom(memory_id, depth=1):
+            raise RuntimeError("synthetic associative backend failure")
+
+        monkeypatch.setattr(beam.episodic_graph, "find_related_memories", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            env = beam.recall_bounded(
+                "associative hydration observability", RecallPolicy(top_k=10),
+            )
+        assert "associative_hydration_failed" in env.degradation_reasons, (
+            f"missing associative_hydration_failed; got {env.degradation_reasons}"
+        )
+        assert mid in {r["id"] for r in env.results}, (
+            "envelope lost working FTS results after associative hydration failure"
+        )
+        full = caplog.text
+        assert "synthetic associative backend failure" not in full, (
+            "raw exception text leaked into associative degradation log"
+        )
+        assert "Traceback" not in full, (
+            "traceback leaked into associative degradation log"
+        )
+
     def test_degradation_logs_are_content_free(self, beam, monkeypatch, caplog):
         """The safe log signal for FTS/MEMORIA failures must not echo
         the raw query or memory content."""

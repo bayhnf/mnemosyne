@@ -722,6 +722,7 @@ def _hydrate_candidates(
                     assoc_added[mid] = real_row
             scored.extend(assoc_added.values())
         except Exception:
+            degradation.append("associative_hydration_failed")
             logger.info("bounded: associative hydration failed")
 
     return scored, mode, degradation
