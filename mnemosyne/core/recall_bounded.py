@@ -429,6 +429,7 @@ def _hydrate_candidates(
         try:
             query_embedding = _beam_mod._embeddings.embed_query(query)
         except Exception:
+            degradation.append("query_embedding_failed")
             logger.info("bounded: query embedding failed")
             query_embedding = None
 
@@ -452,6 +453,7 @@ def _hydrate_candidates(
                 had_vector = True
                 candidates.setdefault(vr["id"], {"id": vr["id"], "_vec_sim": vr["sim"]})
         except Exception:
+            degradation.append("vec_working_failed")
             logger.info("bounded: wm vec search failed")
         try:
             if _beam_mod._vec_available(conn):
@@ -472,6 +474,7 @@ def _hydrate_candidates(
                         {"id": None, "_rowid": vr["rowid"], "_vec_sim": sim},
                     )
         except Exception:
+            degradation.append("vec_episodic_failed")
             logger.info("bounded: episodic vec search failed")
 
     # --- FTS path (working + episodic) ---
@@ -506,6 +509,7 @@ def _hydrate_candidates(
         for eid in entity_ids:
             candidates.setdefault(eid, {"id": eid, "_entity_match": True})
     except Exception:
+        degradation.append("entity_lookup_failed")
         logger.info("bounded: entity lookup failed")
 
     # --- Fact supplement ---
@@ -514,6 +518,7 @@ def _hydrate_candidates(
         for fid in fact_ids:
             candidates.setdefault(fid, {"id": fid, "_fact_match": True})
     except Exception:
+        degradation.append("fact_lookup_failed")
         logger.info("bounded: fact lookup failed")
 
     # --- MEMORIA supplement ---

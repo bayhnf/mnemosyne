@@ -1310,6 +1310,177 @@ class TestBoundedDegradationObservabilityI3:
             f"missing memoria_failed; got {env.degradation_reasons}"
         )
 
+    def test_query_embedding_failure_emits_degradation_reason(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+        import mnemosyne.core.beam as beam_mod
+
+        mid = _remember(beam, "bounded observability alpha topic")
+        monkeypatch.setattr(
+            beam_mod._embeddings, "available", lambda: True,
+        )
+
+        def _boom(query):
+            raise RuntimeError("synthetic backend failure")
+
+        monkeypatch.setattr(beam_mod._embeddings, "embed_query", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            env = beam.recall_bounded(
+                "bounded observability", RecallPolicy(top_k=10),
+            )
+        assert "query_embedding_failed" in env.degradation_reasons, (
+            f"missing query_embedding_failed; got {env.degradation_reasons}"
+        )
+        assert mid in {r["id"] for r in env.results}, (
+            "envelope lost working FTS results after embedding failure"
+        )
+        full = caplog.text
+        assert "bounded observability" not in full, (
+            "raw query leaked into query-embedding degradation log"
+        )
+        assert "synthetic backend failure" not in full, (
+            "raw exception text leaked into query-embedding degradation log"
+        )
+
+    def test_vec_working_failure_emits_degradation_reason(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+        import numpy as np
+        import mnemosyne.core.beam as beam_mod
+        from mnemosyne.core import embeddings as emb_mod
+
+        mid = _remember(beam, "bounded observability alpha topic")
+        fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
+        monkeypatch.setattr(
+            beam_mod._embeddings, "available", lambda: True,
+        )
+        monkeypatch.setattr(
+            beam_mod._embeddings, "embed_query", lambda q: fake_vec.copy(),
+        )
+
+        def _boom(conn, query_embedding, k=50, where_sql=None, where_params=()):
+            raise RuntimeError("synthetic backend failure")
+
+        monkeypatch.setattr(beam_mod, "_wm_vec_search", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            env = beam.recall_bounded(
+                "bounded observability", RecallPolicy(top_k=10),
+            )
+        assert "vec_working_failed" in env.degradation_reasons, (
+            f"missing vec_working_failed; got {env.degradation_reasons}"
+        )
+        assert mid in {r["id"] for r in env.results}, (
+            "envelope lost working FTS results after vec_working failure"
+        )
+        full = caplog.text
+        assert "bounded observability" not in full, (
+            "raw query leaked into vec_working degradation log"
+        )
+        assert "synthetic backend failure" not in full, (
+            "raw exception text leaked into vec_working degradation log"
+        )
+
+    def test_vec_episodic_failure_emits_degradation_reason(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+        import numpy as np
+        import mnemosyne.core.beam as beam_mod
+        from mnemosyne.core import embeddings as emb_mod
+
+        mid = _remember(beam, "bounded observability alpha topic")
+        fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
+        monkeypatch.setattr(
+            beam_mod._embeddings, "available", lambda: True,
+        )
+        monkeypatch.setattr(
+            beam_mod._embeddings, "embed_query", lambda q: fake_vec.copy(),
+        )
+
+        def _boom(conn, query_embedding, k=20):
+            raise RuntimeError("synthetic backend failure")
+
+        monkeypatch.setattr(beam_mod, "_in_memory_vec_search", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            env = beam.recall_bounded(
+                "bounded observability", RecallPolicy(top_k=10),
+            )
+        assert "vec_episodic_failed" in env.degradation_reasons, (
+            f"missing vec_episodic_failed; got {env.degradation_reasons}"
+        )
+        assert mid in {r["id"] for r in env.results}, (
+            "envelope lost working FTS results after episodic vec failure"
+        )
+        full = caplog.text
+        assert "bounded observability" not in full, (
+            "raw query leaked into episodic vec degradation log"
+        )
+        assert "synthetic backend failure" not in full, (
+            "raw exception text leaked into episodic vec degradation log"
+        )
+
+    def test_entity_failure_emits_degradation_reason(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+        import mnemosyne.core.beam as beam_mod
+
+        mid = _remember(beam, "bounded observability alpha topic")
+
+        def _boom(beam, query):
+            raise RuntimeError("synthetic backend failure")
+
+        monkeypatch.setattr(beam_mod, "_find_memories_by_entity", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            env = beam.recall_bounded(
+                "bounded observability", RecallPolicy(top_k=10),
+            )
+        assert "entity_lookup_failed" in env.degradation_reasons, (
+            f"missing entity_lookup_failed; got {env.degradation_reasons}"
+        )
+        assert mid in {r["id"] for r in env.results}, (
+            "envelope lost working FTS results after entity lookup failure"
+        )
+        full = caplog.text
+        assert "bounded observability" not in full, (
+            "raw query leaked into entity degradation log"
+        )
+        assert "synthetic backend failure" not in full, (
+            "raw exception text leaked into entity degradation log"
+        )
+
+    def test_fact_failure_emits_degradation_reason(
+        self, beam, monkeypatch, caplog,
+    ):
+        import logging
+        import mnemosyne.core.beam as beam_mod
+
+        mid = _remember(beam, "bounded observability alpha topic")
+
+        def _boom(beam, query):
+            raise RuntimeError("synthetic backend failure")
+
+        monkeypatch.setattr(beam_mod, "_find_memories_by_fact", _boom)
+        with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
+            env = beam.recall_bounded(
+                "bounded observability", RecallPolicy(top_k=10),
+            )
+        assert "fact_lookup_failed" in env.degradation_reasons, (
+            f"missing fact_lookup_failed; got {env.degradation_reasons}"
+        )
+        assert mid in {r["id"] for r in env.results}, (
+            "envelope lost working FTS results after fact lookup failure"
+        )
+        full = caplog.text
+        assert "bounded observability" not in full, (
+            "raw query leaked into fact degradation log"
+        )
+        assert "synthetic backend failure" not in full, (
+            "raw exception text leaked into fact degradation log"
+        )
+
     def test_degradation_logs_are_content_free(self, beam, monkeypatch, caplog):
         """The safe log signal for FTS/MEMORIA failures must not echo
         the raw query or memory content."""
