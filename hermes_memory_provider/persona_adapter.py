@@ -60,7 +60,7 @@ class PersonaAdapter:
             elif tool_name == "mnemosyne_persona_reinforce":
                 return self._reinforce(**args)
         except Exception:
-            logger.exception("Persona tool %s failed", tool_name)
+            logger.error("Persona tool %s failed", tool_name)
             return json.dumps({
                 "status": "error",
                 "error": "persona_tool_failed",
