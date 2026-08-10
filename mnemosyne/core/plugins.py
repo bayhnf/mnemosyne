@@ -14,6 +14,7 @@ and built-in plugins are always available.
 """
 
 import abc
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -583,14 +584,20 @@ class PluginManager:
         for file_path in self._plugin_dir.glob("*.py"):
             if file_path.name.startswith("_"):
                 continue
+            module_key = ""
+            module = None
             try:
+                digest = hashlib.sha256(
+                    f"{file_path.resolve()}:{file_path.stem}".encode("utf-8")
+                ).hexdigest()
+                module_key = f"_mnemosyne_user_plugin_{file_path.stem}_{digest}"
                 spec = importlib.util.spec_from_file_location(
-                    file_path.stem, str(file_path)
+                    module_key, str(file_path)
                 )
                 if spec is None or spec.loader is None:
                     continue
                 module = importlib.util.module_from_spec(spec)
-                sys.modules[file_path.stem] = module
+                sys.modules[module_key] = module
                 spec.loader.exec_module(module)
 
                 for attr_name in dir(module):
@@ -606,6 +613,8 @@ class PluginManager:
                             self.register_plugin(plugin_name, obj)
                             discovered.append(plugin_name)
             except Exception as exc:
+                if module is not None and sys.modules.get(module_key) is module:
+                    del sys.modules[module_key]
                 logger.warning("Failed to load plugin from %s: %s", file_path, exc)
 
         return discovered

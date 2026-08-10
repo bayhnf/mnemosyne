@@ -10,6 +10,7 @@ Validates:
 6. Global manager convenience functions
 """
 
+import importlib
 import os
 import sys
 import pytest
@@ -30,6 +31,8 @@ from mnemosyne.core.plugins import (
     reset_manager,
     DEFAULT_PLUGIN_DIR,
 )
+
+_STDLIB_LOGGING = importlib.import_module("logging")
 
 
 # ============================================================================
@@ -648,6 +651,18 @@ class TestPluginNotifications:
 class TestPluginDiscovery:
     """Tests for discover_plugins."""
 
+    @pytest.fixture(autouse=True)
+    def plugin_module_cleanup(self):
+        """Remove discovery-created module keys and restore stdlib logging."""
+        yield
+        for key in [
+            key for key in sys.modules if key.startswith("_mnemosyne_user_plugin_")
+        ]:
+            del sys.modules[key]
+        for key in ("broken", "my_plugin"):
+            sys.modules.pop(key, None)
+        sys.modules["logging"] = _STDLIB_LOGGING
+
     def test_discover_empty_dir(self, manager):
         """Discover on non-existent directory returns empty list."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -715,6 +730,60 @@ class TestPluginDiscovery:
             mgr = PluginManager(plugin_dir=Path(tmpdir))
             discovered = mgr.discover_plugins()
             assert discovered == []
+
+    def test_discovery_does_not_shadow_stdlib_logging(self):
+        stdlib_logging = importlib.import_module("logging")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_file = Path(tmpdir) / "logging.py"
+            plugin_file.write_text(
+                "from mnemosyne.core.plugins import MnemosynePlugin\n"
+                "class UserLog(MnemosynePlugin):\n"
+                "    name = 'userlog'\n"
+                "    def on_remember(self, memory): pass\n"
+                "    def on_recall(self, memory): pass\n"
+                "    def on_consolidate(self, summary): pass\n"
+                "    def on_invalidate(self, memory_id): pass\n"
+            )
+            discovered = PluginManager(plugin_dir=Path(tmpdir)).discover_plugins()
+            assert discovered == ["userlog"]
+            assert sys.modules["logging"] is stdlib_logging
+
+    def test_discovery_cleans_module_after_exec_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_file = Path(tmpdir) / "broken.py"
+            plugin_file.write_text('raise RuntimeError("plugin-test-canary")\n')
+            PluginManager(plugin_dir=Path(tmpdir)).discover_plugins()
+            assert "broken" not in sys.modules
+            assert not any(
+                key.startswith("_mnemosyne_user_plugin_broken_") for key in sys.modules
+            )
+
+    def test_discovery_reuses_deterministic_internal_key_without_bare_stem(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_file = Path(tmpdir) / "my_plugin.py"
+            plugin_file.write_text(
+                "from mnemosyne.core.plugins import MnemosynePlugin\n"
+                "class MyPlugin(MnemosynePlugin):\n"
+                "    name = 'myplugin'\n"
+                "    def on_remember(self, memory): pass\n"
+                "    def on_recall(self, memory): pass\n"
+                "    def on_consolidate(self, summary): pass\n"
+                "    def on_invalidate(self, memory_id): pass\n"
+            )
+            manager = PluginManager(plugin_dir=Path(tmpdir))
+            assert manager.discover_plugins() == ["myplugin"]
+            assert manager.discover_plugins() == []
+            assert "my_plugin" not in sys.modules
+            assert (
+                len(
+                    [
+                        key
+                        for key in sys.modules
+                        if key.startswith("_mnemosyne_user_plugin_my_plugin_")
+                    ]
+                )
+                == 1
+            )
 
 
 # ============================================================================
