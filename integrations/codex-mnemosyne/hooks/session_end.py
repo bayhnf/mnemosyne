@@ -2,11 +2,14 @@
 """SessionEnd hook for Mnemosyne Codex integration.
 
 Flushes the transport-only spool: attempts to deliver any spooled events via
-native ingest and ack-deletes successful ones.  Must complete under 3 seconds
-(the hook timeout in hooks.json enforces this).
+native ingest and ack-deletes successful ones, under a hard wall-clock deadline.
 
-Fail-open: if flush fails, spooled events remain for the next session's
-SessionStart/SessionEnd to retry.  Never blocks session teardown.
+Must return before the 3-second Codex ceiling even if native ingest is slow or
+hung. Uses a SIGALRM-based bounded flush (falling back to a between-row
+deadline) so the hook does NOT rely solely on Codex forcibly killing it.
+Unacknowledged rows are always retained.
+
+Fail-open: if flush leaves pending events, they remain for the next session.
 """
 
 from __future__ import annotations
@@ -17,21 +20,29 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common  # noqa: E402
 
+# Bounded budget: comfortably under the 3s Codex SessionEnd ceiling.
+_SESSION_END_BUDGET_S = 2.0
+
 
 def main() -> int:
-    # SessionEnd payload may include session_id; we only need to flush.
     _payload = common.read_stdin()
 
     path = common.spool_path()
-    # Best-effort flush; never raises.  Completes in well under 3s because
-    # native ingest is a local SQLite write.
     try:
-        common.flush_spool(path)
+        flushed, retained_pending, retained_terminal = common.flush_spool_bounded(
+            path, budget_s=_SESSION_END_BUDGET_S
+        )
     except Exception:
         # Fail-open: spooled events remain for next session.
-        pass
+        common.emit_noop()
+        return 0
 
-    common.emit_noop()
+    # Honest, content-free status. SessionEnd output is advisory (does not
+    # steer Codex), but we surface the condition visibly.
+    if retained_pending > 0 or retained_terminal > 0:
+        common.emit_system_message(common.message_session_end_pending())
+    else:
+        common.emit_noop()
     return 0
 
 

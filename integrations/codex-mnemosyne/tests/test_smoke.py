@@ -17,11 +17,15 @@ import unittest
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOOKS_DIR = os.path.join(PLUGIN_ROOT, "hooks")
+WORKTREE_ROOT = os.path.dirname(os.path.dirname(PLUGIN_ROOT))
 
 
 def _run_hook(script: str, payload: dict, env: dict) -> tuple[int, dict | None, str]:
     full = dict(os.environ)
     full.update(env)
+    # Simulate installed mnemosyne package for subprocess hooks.
+    prior = full.get("PYTHONPATH", "")
+    full["PYTHONPATH"] = WORKTREE_ROOT + (os.pathsep + prior if prior else "")
     proc = subprocess.run(
         [sys.executable, os.path.join(HOOKS_DIR, script)],
         input=json.dumps(payload),
