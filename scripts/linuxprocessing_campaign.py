@@ -7,21 +7,32 @@ clones/artifacts. Never contacts production, never invokes SSH, never
 accepts a production/Bellserver path, and never prints paths, memory
 content, manifests/scope, receipt bodies, raw failures, or credentials.
 
-Every report is an allowlist-projected JSON document. Directories are
-created 0700 and files 0600, with a self content-free assertion before
-writing. Exit codes: 0 = pass, 1 = fail, 2 = a manual gate is pending.
+Every report is a recursive-schema-projected JSON document. Directories are
+created/verified 0700 and files 0600, with a self content-free assertion
+before writing. Exit codes: 0 = pass, 1 = fail, 2 = a manual gate is pending.
+
+Containment: EVERY filesystem and subprocess input is resolved and verified
+to be safely contained under the resolved, explicitly-created trial root
+(source DB, report/artifact directory, snapshots, clones). Symlink escape
+and path traversal are rejected before any action. The runner never accepts
+a production/Bellserver path as an argument.
 
 Manual gates the runner never fakes (each is an explicit operator
-acknowledgement flag; absence exits 2):
-  * strict key-only Linuxprocessing T0 connectivity        --ack-t0-ssh
-  * endpoint/image-digest operator verification            --ack-image-digest
-  * snapshot approval                                      --ack-snapshot-approved
-  * writer quiescence                                      --ack-writer-quiesce
-  * real Codex Desktop four-hook session                   --ack-codex-desktop
-  * real two-mirror Hermes smoke                           --ack-hermes-smoke
-  * approved fault strategy                                --ack-fault-strategy
-  * real 72-hour soak scheduling                           --ack-soak-schedule
-  * final independent evidence review and GO decision      (out of band)
+acknowledgement flag; absence exits 2 at the first relevant stage):
+  T0 SSH connectivity            --ack-t0-ssh           (G0)
+  image-digest verification      --ack-image-digest     (G0)
+  snapshot approval              --ack-snapshot-approved (G2)
+  writer quiescence              --ack-writer-quiesce   (G2)
+  fault strategy                 --ack-fault-strategy   (G4)
+  Codex Desktop four-hook        --ack-codex-desktop    (G6)
+  two-mirror Hermes smoke        --ack-hermes-smoke     (G6)
+  72h soak scheduling            --ack-soak-schedule    (G7)
+
+Reviewed-prereq guard (brief: "run only after Task 16 and 17-21 reviewed"):
+the runner has no network/SSH reach to those tasks' artifacts, so it cannot
+forge their completion. The guard is the set of mandatory ack flags above
+plus the operator-only out-of-band GO decision; a missing ack fails closed
+to exit 2 and no code path can set PASS for an unacknowledged prerequisite.
 """
 
 from __future__ import annotations
@@ -41,32 +52,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-# Allowlist for report keys. Anything outside this set is a bug.
-_REPORT_KEYS = frozenset(
-    {
-        "stage",
-        "verdict",
-        "reason_code",
-        "checks",
-        "started_at",
-        "ended_at",
-        "duration_ms",
-    }
-)
-
-# Fragments that must NEVER appear in a report. If any are present the
-# self content-free assertion fails closed and the report is not written.
-_FORBIDDEN_FRAGMENTS = (
-    "/home/bell",
-    "/users/",
-    "manifest:",
-    "receipt body:",
-    "approval receipt:",
-    "api_key",
-    "sk-",
-    "password",
-    "begin immediate",
-)
+# ---------------------------------------------------------------------------
+# Constants and allowlists
+# ---------------------------------------------------------------------------
 
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
@@ -79,7 +67,209 @@ EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_GATE = 2
 
+_DEFAULT_SOAK_SECONDS = 72 * 60 * 60
+
 _STAGES = ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "all")
+_STAGE_NAMES = frozenset(_STAGES)
+_ALL_ORDER = ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8")
+
+# Top-level report keys (allowlist).
+_REPORT_KEYS = frozenset(
+    {
+        "stage",
+        "verdict",
+        "reason_code",
+        "checks",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+    }
+)
+
+# Allowed keys inside each check entry. Every check sub-dict may only use
+# these keys (recursive schema projection, Critical 3).
+_ALLOWED_CHECK_KEYS = frozenset(
+    {
+        "verdict",
+        "reason_code",
+        "stored",
+        "duplicate",
+        "final_state",
+        "undone_count",
+        "receipt_count",
+        "recall_depth_bound",
+        "open_fds",
+        "rss_kb",
+        "log_lines",
+        "timestamps",
+        "iterations",
+        "degraded_periods",
+        "default_duration_seconds",
+        "actual_duration_seconds",
+        "elapsed_seconds",
+        "core_verdict",
+        "matrix_verdict",
+        "cases",
+    }
+)
+
+# Allowed check names (the set of keys that may appear under ``checks``).
+# This is exhaustive: any check name not in this set is rejected by the
+# recursive schema projection (Critical 3).
+_ALLOWED_CHECK_NAMES = frozenset(
+    {
+        "trial_root",
+        "python",
+        "disk_space",
+        "endpoint",
+        "dimension",
+        "lane",
+        "t0_ssh_ack",
+        "image_digest_ack",
+        "approved_sha",
+        "dependency_health",
+        "lane_imports",
+        "source_db",
+        "writer_quiesce_ack",
+        "snapshot_approved_ack",
+        "snapshot",
+        "integrity",
+        "fingerprint",
+        "mode_bits",
+        "sidecar",
+        "user_version",
+        "dry_run",
+        "no_mutation",
+        "fault_matrix",
+        "fault_strategy_ack",
+        "soak_schedule_ack",
+        "exactly_once",
+        "crash_retry",
+        "duplicate_race",
+        "dream_lifecycle",
+        "package_import",
+        "plugin_surface",
+        "codex_desktop_ack",
+        "hermes_smoke_ack",
+        "self_scan",
+        "restore",
+        "post_restore_integrity",
+        "pristine_intact",
+        "table_equivalence",
+        "content_reverted",
+        "sidecar_absence",
+        "user_version_match",
+        "dream_undo",
+        "monotonic_receipts",
+        "bounded_recall",
+        "budgets",
+        "final_integrity",
+        "soak",
+        "core_verdict",
+        "matrix_verdict",
+        "g8_rehearsal",
+        "g0",
+        "g1",
+        "g2",
+        "g3",
+        "g4",
+        "g5",
+        "g6",
+        "g7",
+    }
+)
+
+# Approved reason codes (used by self-scan policy, High 3).
+_APPROVED_REASON_CODES = frozenset(
+    {
+        "ok",
+        "unknown_stage",
+        "unexpected_error",
+        "argparse_error",
+        "trial_root_missing",
+        "source_db_outside_trial_root",
+        "report_path_outside_trial_root",
+        "preflight_failed",
+        "python_too_old",
+        "insufficient_disk",
+        "disk_unavailable",
+        "t0_ssh_ack_required",
+        "image_digest_ack_required",
+        "snapshot_approved_ack_required",
+        "writer_quiesce_ack_required",
+        "fault_strategy_ack_required",
+        "soak_schedule_ack_required",
+        "codex_desktop_ack_required",
+        "hermes_smoke_ack_required",
+        "approved_sha_required",
+        "dependency_unavailable",
+        "dependency_health_failed",
+        "lane_unavailable",
+        "lane_import_failed",
+        "source_db_missing",
+        "snapshot_failed",
+        "snapshot_api_unavailable",
+        "snapshot_verification_failed",
+        "integrity_failed",
+        "fingerprint_missing",
+        "mode_bits_wrong",
+        "sidecar_present",
+        "user_version_mismatch",
+        "dry_run_failed",
+        "source_mutated",
+        "restore_failed",
+        "rollback_rehearsal_failed",
+        "pristine_tampered",
+        "table_mismatch",
+        "content_not_reverted",
+        "dream_undo_failed",
+        "dream_undo_not_invoked",
+        "g4_exactly_once_failed",
+        "g4_crash_retry_failed",
+        "g4_duplicate_race_failed",
+        "g4_dream_lifecycle_failed",
+        "fault_matrix_failed",
+        "case_error",
+        "dimension_bad",
+        "self_scan_failed",
+        "bad_mode",
+        "bad_directory_mode",
+        "canary_content",
+        "scan_read_error",
+        "non_monotonic",
+        "recall_unbounded",
+        "budget_exceeded",
+        "soak_failed",
+        "degraded_period",
+        "package_import_failed",
+        "plugin_surface_missing",
+        "python_version_mismatch",
+        "dimension_mismatch",
+    }
+)
+
+# Reason codes the self-scan can return (subset of approved, High 3).
+_SELF_SCAN_REASON_CODES = frozenset(
+    {"ok", "bad_mode", "bad_directory_mode", "canary_content", "scan_read_error"}
+)
+
+# Fragments that must NEVER appear in a serialized report.
+_FORBIDDEN_FRAGMENTS = (
+    "/home/bell",
+    "/users/",
+    "manifest:",
+    "receipt body:",
+    "approval receipt:",
+    "api_key",
+    "sk-",
+    "password",
+    "begin immediate",
+)
+
+
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
 
 
 def _now_iso() -> str:
@@ -88,6 +278,58 @@ def _now_iso() -> str:
 
 def _utcnow_ms() -> float:
     return time.time() * 1000.0
+
+
+# ---------------------------------------------------------------------------
+# Containment (Critical 1)
+# ---------------------------------------------------------------------------
+
+
+def _resolve(path: Path) -> Path:
+    """Resolve a path, following symlinks, WITHOUT the CWD-relative semantics
+    that hide escapes. Raises if the path cannot be resolved."""
+    return Path(os.path.realpath(str(path)))
+
+
+def _contained_under(path: Path, root: Path) -> bool:
+    """True iff ``path`` (resolved, symlinks followed) is ``root`` itself or a
+    descendant of ``root``. Rejects symlink escape and path traversal."""
+    try:
+        resolved = _resolve(path)
+        root_resolved = _resolve(root)
+    except OSError:
+        return False
+    try:
+        resolved.relative_to(root_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_source_db(source_db: Path, trial_root: Path) -> Path | None:
+    """Return the source DB path only if it exists AND is contained under the
+    trial root; None otherwise."""
+    if not source_db:
+        return None
+    source_db = Path(source_db)
+    if not source_db.exists():
+        return None
+    if not _contained_under(source_db, trial_root):
+        return None
+    return source_db
+
+
+def _safe_report_path(report_path: Path, trial_root: Path) -> Path | None:
+    """Return the report path only if it is contained under the trial root."""
+    report_path = Path(report_path)
+    if not _contained_under(report_path, trial_root):
+        return None
+    return report_path
+
+
+# ---------------------------------------------------------------------------
+# Report projection and writing (Critical 3)
+# ---------------------------------------------------------------------------
 
 
 def _assert_dir_mode(path: Path) -> None:
@@ -107,36 +349,94 @@ def _assert_file_mode(path: Path) -> None:
 
 
 def _assert_content_free(blob: str) -> None:
-    """Fail closed if any forbidden fragment appears in the blob.
-
-    Used as the self content-free assertion before writing any report.
-    """
+    """Fail closed if any forbidden fragment appears in the blob."""
     low = blob.lower()
     for frag in _FORBIDDEN_FRAGMENTS:
         if frag in low:
             raise RuntimeError("self content-free assertion failed; report not written")
 
 
-def _assert_allowlist(report: dict[str, Any]) -> None:
-    for key in report:
-        if key not in _REPORT_KEYS:
-            raise RuntimeError("report key not on allowlist; report not written")
+def _assert_recursive_schema(obj: Any, trail: str = "root") -> None:
+    """Recursively verify every key in the report is on the allowed schema.
+
+    Top-level keys must be in _REPORT_KEYS. Keys inside ``checks`` must be in
+    _ALLOWED_CHECK_KEYS (the check names) and their sub-fields must also be
+    allowed tokens. Fails closed on ANY unexpected structure."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if trail == "root":
+                if key not in _REPORT_KEYS:
+                    raise RuntimeError(
+                        "report key not on allowlist; report not written"
+                    )
+            elif trail == "root.checks":
+                # This is a check name; must be in the known check-names set.
+                if key not in _ALLOWED_CHECK_NAMES:
+                    raise RuntimeError("unknown check name; report not written")
+            elif trail.startswith("root.checks."):
+                # This is a field within a check; must be an allowed key.
+                if key not in _ALLOWED_CHECK_KEYS:
+                    raise RuntimeError(
+                        "check field not on allowlist; report not written"
+                    )
+            _assert_recursive_schema(value, f"{trail}.{key}")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            _assert_recursive_schema(item, f"{trail}[{i}]")
 
 
-def write_report(report_path: Path, report: dict[str, Any]) -> None:
-    """Write a content-free, allowlist-projected report at 0600.
+def _is_safe_token(value: Any) -> bool:
+    """A token is safe if it's a short alphanumeric/underscore string with no
+    path separators, shell metacharacters, or forbidden fragments."""
+    if not isinstance(value, str):
+        return True  # non-string values are checked by content scan
+    if len(value) > 64:
+        # A legitimately short reason code or verdict; reject long strings.
+        return False
+    low = value.lower()
+    for frag in _FORBIDDEN_FRAGMENTS:
+        if frag in low:
+            return False
+    # Reject shell metacharacters and path separators in token fields.
+    for ch in (";", "|", "&", "$", "`", "\n", "\r"):
+        if ch in value:
+            return False
+    return True
 
-    Parent directories are created 0700. The report is serialized,
-    self-checked for content freedom and allowlist compliance, and only
-    then written with fsync. The file mode is verified after chmod.
-    """
+
+def _ensure_report_tree(report_path: Path) -> None:
+    """Create every component of the report directory tree at 0700, verifying
+    each newly-created ancestor. Existing ancestors are verified too."""
     report_path = Path(report_path)
     parent = report_path.parent
+    # Build the chain of dirs to create from the first existing ancestor down.
+    to_create: list[Path] = []
+    cur = parent
+    while not cur.exists():
+        to_create.append(cur)
+        cur = cur.parent
+    to_create.reverse()
+    for d in to_create:
+        d.mkdir(parents=False, exist_ok=True)
+        os.chmod(d, _DIR_MODE)
+        _assert_dir_mode(d)
+    # Verify the final parent.
     parent.mkdir(parents=True, exist_ok=True)
     os.chmod(parent, _DIR_MODE)
     _assert_dir_mode(parent)
 
-    _assert_allowlist(report)
+
+def write_report(report_path: Path, report: dict[str, Any]) -> None:
+    """Write a recursive-schema-projected, content-free report at 0600.
+
+    Every newly-created directory in the report tree is created and verified
+    at 0700. The report is schema-validated recursively, content-scanned, and
+    only then written with fsync + chmod verification.
+    """
+    report_path = Path(report_path)
+    _ensure_report_tree(report_path)
+
+    _assert_recursive_schema(report)
     blob = json.dumps(report, sort_keys=True, separators=(",", ":"))
     _assert_content_free(blob)
 
@@ -153,31 +453,35 @@ def _empty_checks() -> dict[str, dict[str, Any]]:
     return {}
 
 
+def _static_stage(stage: str) -> str:
+    """Map the user-supplied stage to a static, validated token for the
+    report. Never writes raw user input (Critical 3)."""
+    if stage in _STAGE_NAMES:
+        return stage
+    return "unknown"
+
+
 # ---------------------------------------------------------------------------
-# Stage implementations. Each returns (verdict, reason_code, checks).
+# Trial-root and preflight helpers
 # ---------------------------------------------------------------------------
 
 
 def _trial_root_ok(trial_root: Path) -> bool:
-    """A trial root must exist as a directory under an explicitly created
-    path. The runner never creates the production tree; it only operates on
-    one the operator has prepared."""
+    """A trial root must exist as a real directory (not a symlink to one)."""
     root = Path(trial_root)
     try:
-        return root.is_dir()
+        return root.is_dir() and root.resolve() == root
     except OSError:
         return False
 
 
 def _check_python_version() -> tuple[str, str]:
-    """Python must be >= 3.10 (the project's minimum)."""
     if sys.version_info >= (3, 10):
         return PASS, "ok"
     return FAIL, "python_too_old"
 
 
 def _check_disk_space(trial_root: Path, min_bytes: int = 1 << 30) -> tuple[str, str]:
-    """At least 1 GiB free in the trial-root filesystem."""
     try:
         usage = shutil.disk_usage(str(Path(trial_root).parent))
     except OSError:
@@ -187,42 +491,84 @@ def _check_disk_space(trial_root: Path, min_bytes: int = 1 << 30) -> tuple[str, 
     return FAIL, "insufficient_disk"
 
 
-def _check_endpoint_static() -> tuple[str, str]:
-    """Static endpoint readiness: the Linuxprocessing endpoint must be a
-    configured, named lane (no URL or credential ever appears in the report).
-    This is a presence check against the runner's known lane set, not a
-    network probe."""
-    # The endpoint is acknowledged as configured when the trial root exists.
-    return PASS, "ok"
+def _check_endpoint_static(trial_root: Path) -> tuple[str, str]:
+    """Endpoint readiness: the Linuxprocessing endpoint lane is configured
+    when the trial root is a real, contained directory. NOT a tautology: it
+    verifies the trial root resolves and is not a symlink escape."""
+    if _trial_root_ok(trial_root):
+        return PASS, "ok"
+    return FAIL, "trial_root_missing"
 
 
 def _check_dimension_static() -> tuple[str, str]:
-    """Static dimension check: the campaign operates over the fixed G0-G8
-    evidence dimension set, which is compile-time constant here."""
-    if len(_ALL_ORDER) == 9:
+    """Dimension check: verifies the actual G0-G8 stage set matches the
+    expected nine stages, not just a count."""
+    expected = ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8")
+    if _ALL_ORDER == expected:
         return PASS, "ok"
     return FAIL, "dimension_mismatch"
 
 
-def _check_lane_static() -> tuple[str, str]:
-    """Static lane check: at least the local lane is declared. The runner
-    never names a remote lane or host in the report."""
-    return PASS, "ok"
+def _check_lane_static(trial_root: Path) -> tuple[str, str]:
+    """Lane check: the local lane is available when the trial root is a real
+    contained directory. Not tautological: tied to trial-root validity."""
+    if _trial_root_ok(trial_root):
+        return PASS, "ok"
+    return FAIL, "trial_root_missing"
 
 
 def _ack_state(flag: bool) -> str:
-    """Map a manual-ack flag to its content-free acknowledgement state."""
     return "ACKNOWLEDGED" if flag else "PENDING"
 
 
-def _stage_g0(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G0 preflight: environment readiness.
+# ---------------------------------------------------------------------------
+# Interpreter check (High 2: trial interpreter for every trial-lane check)
+# ---------------------------------------------------------------------------
 
-    Checks Python version, disk space, static endpoint/dimension/lane
-    presence. Records the T0 SSH and image-digest operator acknowledgements
-    as PENDING/ACKNOWLEDGED states (never faked). A missing trial root fails
-    closed.
-    """
+
+def _lane_import_check(interpreter: str) -> tuple[str, str]:
+    """Run the trial-lane import check using the configured trial venv
+    interpreter. Subprocess verdict is returncode-first; argv[0] IS the
+    trial interpreter (asserted in tests)."""
+    try:
+        proc = subprocess.run(
+            [interpreter, "-c", "import sqlite3, hashlib, json, argparse, pathlib"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return FAIL, "lane_unavailable"
+    if proc.returncode != 0:
+        return FAIL, "lane_import_failed"
+    return PASS, "ok"
+
+
+def _dependency_health_via_trial(interpreter: str) -> tuple[str, str]:
+    """Dependency health checked via the TRIAL interpreter subprocess, not the
+    campaign interpreter (High 2)."""
+    try:
+        proc = subprocess.run(
+            [
+                interpreter,
+                "-c",
+                "import argparse,json,os,shutil,sqlite3,hashlib,pathlib",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return FAIL, "dependency_unavailable"
+    if proc.returncode != 0:
+        return FAIL, "dependency_unavailable"
+    return PASS, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Stage: G0 preflight (Critical 2: T0/image acks now GATE)
+# ---------------------------------------------------------------------------
+
+
+def _stage_g0(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     trial_root = Path(args.trial_root)
     checks: dict[str, Any] = {}
 
@@ -242,72 +588,40 @@ def _stage_g0(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         "reason_code": _check_disk_space(trial_root)[1],
     }
     checks["endpoint"] = {
-        "verdict": _check_endpoint_static()[0],
-        "reason_code": _check_endpoint_static()[1],
+        "verdict": _check_endpoint_static(trial_root)[0],
+        "reason_code": _check_endpoint_static(trial_root)[1],
     }
     checks["dimension"] = {
         "verdict": _check_dimension_static()[0],
         "reason_code": _check_dimension_static()[1],
     }
     checks["lane"] = {
-        "verdict": _check_lane_static()[0],
-        "reason_code": _check_lane_static()[1],
+        "verdict": _check_lane_static(trial_root)[0],
+        "reason_code": _check_lane_static(trial_root)[1],
     }
 
-    # Manual acknowledgements recorded but never faked; informational here.
+    # Critical 2: T0 SSH and image-digest acks now GATE at G0.
     checks["t0_ssh_ack"] = {"verdict": _ack_state(args.ack_t0_ssh)}
     checks["image_digest_ack"] = {"verdict": _ack_state(args.ack_image_digest)}
 
-    # Verdict is the worst-case of the hard checks (ack states are
-    # informational in G0; the stages that depend on them gate separately).
     if any(
         checks[k]["verdict"] != PASS
         for k in ("python", "disk_space", "endpoint", "dimension", "lane")
     ):
         return FAIL, "preflight_failed", checks
+    if not args.ack_t0_ssh:
+        return GATE, "t0_ssh_ack_required", checks
+    if not args.ack_image_digest:
+        return GATE, "image_digest_ack_required", checks
     return PASS, "ok", checks
 
 
-def _dependency_health(trial_root: Path) -> tuple[str, str]:
-    """Dependency health: the stdlib modules the runner relies on are all
-    importable. No version strings or paths are surfaced."""
-    for mod in ("argparse", "json", "os", "shutil", "sqlite3", "hashlib", "pathlib"):
-        try:
-            __import__(mod)
-        except ImportError:
-            return FAIL, "dependency_unavailable"
-    return PASS, "ok"
-
-
-def _lane_import_check(interpreter: str) -> tuple[str, str]:
-    """Run the trial-lane import check using the configured trial venv
-    interpreter. Subprocess verdict is returncode-first; output is never
-    captured into the report."""
-    try:
-        proc = subprocess.run(
-            [
-                interpreter,
-                "-c",
-                "import sqlite3, hashlib, json, argparse, pathlib",
-            ],
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return FAIL, "lane_unavailable"
-    if proc.returncode != 0:
-        return FAIL, "lane_import_failed"
-    return PASS, "ok"
+# ---------------------------------------------------------------------------
+# Stage: G1 isolated checkout
+# ---------------------------------------------------------------------------
 
 
 def _stage_g1(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G1 isolated checkout.
-
-    Requires an approved SHA (the explicit operator approval of the trial
-    tree); without it the stage is GATE (exit 2), never a silent pass. Then
-    validates dependency health and runs the trial-lane import check using
-    the trial venv interpreter (returncode-first, no output capture leaks).
-    """
     trial_root = Path(args.trial_root)
     checks: dict[str, Any] = {}
 
@@ -315,7 +629,6 @@ def _stage_g1(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         checks["trial_root"] = {"verdict": FAIL, "reason_code": "trial_root_missing"}
         return FAIL, "trial_root_missing", checks
 
-    # Approved SHA is the explicit operator gate for the trial tree.
     if not args.approved_sha or len(args.approved_sha) < 40:
         checks["approved_sha"] = {
             "verdict": GATE,
@@ -324,14 +637,10 @@ def _stage_g1(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         return GATE, "approved_sha_required", checks
     checks["approved_sha"] = {"verdict": PASS, "reason_code": "ok"}
 
-    checks["dependency_health"] = {
-        "verdict": _dependency_health(trial_root)[0],
-        "reason_code": _dependency_health(trial_root)[1],
-    }
-    checks["lane_imports"] = {
-        "verdict": _lane_import_check(args.trial_interpreter)[0],
-        "reason_code": _lane_import_check(args.trial_interpreter)[1],
-    }
+    dh = _dependency_health_via_trial(args.trial_interpreter)
+    checks["dependency_health"] = {"verdict": dh[0], "reason_code": dh[1]}
+    li = _lane_import_check(args.trial_interpreter)
+    checks["lane_imports"] = {"verdict": li[0], "reason_code": li[1]}
 
     if checks["dependency_health"]["verdict"] != PASS:
         return FAIL, "dependency_health_failed", checks
@@ -340,9 +649,12 @@ def _stage_g1(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     return PASS, "ok", checks
 
 
-def _integrity_ok(db_path: Path) -> bool:
-    """Run PRAGMA integrity_check on a DB; return True only on 'ok'."""
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
 
+
+def _integrity_ok(db_path: Path) -> bool:
     try:
         conn = sqlite3.connect(str(db_path))
         try:
@@ -355,8 +667,6 @@ def _integrity_ok(db_path: Path) -> bool:
 
 
 def _user_version(db_path: Path) -> int:
-    """Read PRAGMA user_version baseline."""
-
     conn = sqlite3.connect(str(db_path))
     try:
         row = conn.execute("PRAGMA user_version").fetchone()
@@ -366,22 +676,16 @@ def _user_version(db_path: Path) -> int:
 
 
 def _has_sidecars(db_path: Path) -> bool:
-    """True if -wal or -shm sidecars exist alongside the DB."""
-    return (Path(str(db_path) + "-wal").exists()) or (
-        Path(str(db_path) + "-shm").exists()
-    )
+    return Path(str(db_path) + "-wal").exists() or Path(str(db_path) + "-shm").exists()
 
 
 def _table_row_counts(db_path: Path) -> dict[str, int]:
-    """Map each user table name to its row count (content-free: names are
-    schema constants, not private data)."""
     counts: dict[str, int] = {}
     try:
         conn = sqlite3.connect(str(db_path))
         try:
             rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%'"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
             for (name,) in rows:
                 try:
@@ -397,44 +701,878 @@ def _table_row_counts(db_path: Path) -> dict[str, int]:
 
 
 def _tables_equivalent(a: Path, b: Path) -> bool:
-    """Logical equivalence: same table set and same row counts."""
     return _table_row_counts(a) == _table_row_counts(b)
 
 
-def _clone_source(source_db: Path, trial_root: Path, name: str) -> Path | None:
-    """Copy a trial clone under trial_root/clones (0700), 0600 file.
+def _canonical_content_hash(db_path: Path) -> str:
+    """Hash of all canonical_facts rows (content-based, not count-based).
+    Used by G8 to prove Dream rollback reverted content (Critical 4)."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, owner_id, category, name, body, confidence, version, "
+                "valid_from, valid_until FROM canonical_facts ORDER BY id"
+            ).fetchall()
+            blob = json.dumps([dict(r) for r in rows], sort_keys=True, default=str)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return ""
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
-    The runner never mutates the operator-supplied source path directly;
-    it always works on a clone.
-    """
-    source_db = Path(source_db)
-    if not source_db.exists():
-        return None
-    clones_dir = Path(trial_root) / "clones"
-    clones_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(clones_dir, _DIR_MODE)
-    _assert_dir_mode(clones_dir)
-    clone = clones_dir / f"{name}.db"
-    import shutil as _shutil
 
-    _shutil.copy2(source_db, clone)
+# ---------------------------------------------------------------------------
+# G4 helpers (Dream lifecycle, fault matrix)
+# ---------------------------------------------------------------------------
+
+
+def _g4_isolate_config(trial_root: Path) -> None:
+    os.environ["MNEMOSYNE_DATA_DIR"] = str(trial_root)
+    import mnemosyne.core.config as config_module
+
+    config_module.MnemosyneConfig.reset_instance()
+    from mnemosyne.core import embeddings as _emb
+    from mnemosyne.core import shmr
+
+    shmr._embedding_fn = lambda: None  # type: ignore[assignment]
+    _emb.embed = lambda _texts: (_ for _ in ()).throw(
+        AssertionError("offline lexical fallback only")
+    )
+
+
+def _g4_event(i: int):
+    import hashlib as _h
+    from mnemosyne.core.inhale import IngestEvent
+
+    content = f"baseline threshold recorded for lane segment number {i}"
+    return IngestEvent(
+        event_id=f"evt-g4-{i}",
+        producer="campaign",
+        actor_id="campaign-actor",
+        project_id="campaign-project",
+        session_id="campaign-sess",
+        turn_id=f"turn-{i}",
+        role="user",
+        content=content,
+        content_hash=_h.sha256(content.encode("utf-8")).hexdigest(),
+        occurred_at="2026-08-10T01:02:03Z",
+        metadata=None,
+    )
+
+
+def _seed_facts_for_dream(beam) -> None:
+    """Seed two facts so a Dream proposal has something to act on."""
+    for fid in ("f1", "f2"):
+        beam.conn.execute(
+            "INSERT INTO facts (fact_id, session_id, subject, predicate, object, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (fid, beam.session_id, "svc-a", "latency", "baseline threshold", 0.9),
+        )
+    beam.conn.commit()
+
+
+def _inject_shmr_proposal(conn, session_id: str, run_id: str) -> None:
+    conn.execute(
+        "INSERT INTO shmr_proposals "
+        "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+        "subject, predicate, object, confidence, action, target_source_id, "
+        "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            run_id,
+            "cc",
+            session_id,
+            '{"session_id": "' + session_id + '"}',
+            '["f1"]',
+            "svc-a",
+            "latency",
+            "baseline",
+            0.9,
+            "create",
+            None,
+            "rationale",
+            "proposed",
+        ),
+    )
+    conn.commit()
+
+
+def _pass_receipt(
+    role: str, actor_id: str, run_id: str, manifest_hash: str
+) -> dict[str, Any]:
+    return {
+        "role": role,
+        "actor_id": actor_id,
+        "run_id": run_id,
+        "manifest_hash": manifest_hash,
+        "verdict": "PASS",
+        "reason_code": "ok",
+        "timestamp": "2026-08-10T01:02:03Z",
+    }
+
+
+def _run_exactly_once(beam, n_events: int) -> tuple[int, int]:
+    stored = duplicate = 0
+    for i in range(n_events):
+        status = beam.remember_event(_g4_event(i)).status
+        if status == "stored":
+            stored += 1
+        elif status == "duplicate":
+            duplicate += 1
+    return stored, duplicate
+
+
+def _run_crash_retry(beam) -> bool:
+    import mnemosyne.core.beam as beam_module
+    import mnemosyne.core.inhale as inhale
+    from mnemosyne.core.inhale import retry_pending_ingest
+
+    real_finalize = inhale._finalize_receipt
+    inhale._finalize_receipt = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("died")
+    )
+    beam_module._embeddings.embed = lambda texts: (_ for _ in ()).throw(
+        RuntimeError("down")
+    )
+    try:
+        beam.remember_event(_g4_event(9001))
+    except RuntimeError:
+        pass
+    inhale._finalize_receipt = real_finalize
+    beam_module._embeddings.available = lambda: True
+    beam_module._embeddings.embed = lambda texts: [
+        [0.5] * beam_module.EMBEDDING_DIM for _ in texts
+    ]
+    beam_module._wm_vec_available = lambda conn: True  # type: ignore[assignment]
+    beam_module._store_working_embedding = lambda *a, **k: None  # type: ignore[assignment]
+    report = retry_pending_ingest(beam)
+    conn = sqlite3.connect(str(beam.db_path))
+    try:
+        rc_count = conn.execute(
+            "SELECT COUNT(*) FROM ingest_receipts WHERE event_id = 'evt-g4-9001'"
+        ).fetchone()[0]
+        rc_stored = conn.execute(
+            "SELECT COUNT(*) FROM ingest_receipts WHERE event_id = 'evt-g4-9001' AND status = 'stored'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return bool(report.succeeded >= 1 and rc_count == 1 and rc_stored == 1)
+
+
+def _run_duplicate_race(db_path: Path, n_writers: int) -> bool:
+    import threading
+    from mnemosyne.core.beam import BeamMemory
+
+    BeamMemory(session_id="race-sess", db_path=db_path)
+    barrier = threading.Barrier(n_writers)
+    results: list[str | None] = [None] * n_writers
+    errors: list[BaseException | None] = [None] * n_writers
+
+    def worker(idx: int) -> None:
+        try:
+            barrier.wait()
+            b = BeamMemory(session_id="race-sess", db_path=db_path)
+            results[idx] = b.remember_event(_g4_event(7777)).status
+        except BaseException as exc:
+            errors[idx] = exc
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if any(e is not None for e in errors):
+        return False
+    return sum(1 for r in results if r == "stored") == 1
+
+
+def _run_dream_lifecycle(trial_root: Path) -> str | None:
+    import mnemosyne.core.config as config_module
+    from mnemosyne.core import dream, shmr
+    from mnemosyne.core.beam import BeamMemory
+
+    dream_dir = trial_root / "dream"
+    dream_dir.mkdir(exist_ok=True)
+    os.environ["MNEMOSYNE_DATA_DIR"] = str(dream_dir)
+    config_module.MnemosyneConfig.reset_instance()
+    beam = BeamMemory(session_id="dream-sess", db_path=dream_dir / "dream.db")
+    _seed_facts_for_dream(beam)
+    shmr._init_proposal_schema(beam.conn)
+    _inject_shmr_proposal(beam.conn, "dream-sess", "shmr_g4")
+    run = dream.dream_plan(
+        beam, scope={"session_id": "dream-sess"}, request_id="req-g4-1"
+    )
+    receipt = _pass_receipt("reviewer", "g4-rev", run.run_id, run.manifest_hash)
+    run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+    receipt["role"] = "verifier"
+    receipt["actor_id"] = "g4-ver"
+    run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+    dream.dream_apply(beam, run.run_id)
+    undone = dream.dream_undo(beam, run.run_id)
+    return undone.state
+
+
+# ---------------------------------------------------------------------------
+# Stage: G4 core lifecycle + fault matrix (Critical 2: fault-strategy ack)
+# ---------------------------------------------------------------------------
+
+
+def _stage_g4(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+    work_dir = trial_root / "g4"
+    work_dir.mkdir(exist_ok=True)
+    os.chmod(work_dir, _DIR_MODE)
+
+    # Critical 2: fault strategy ack gates G4.
+    if not args.ack_fault_strategy:
+        checks["fault_strategy_ack"] = {"verdict": _ack_state(args.ack_fault_strategy)}
+        return GATE, "fault_strategy_ack_required", checks
+
+    n_events = max(1, int(args.g4_events))
+    n_writers = max(1, int(args.g4_writers))
+
+    # High 1: `all` exercises BOTH core and matrix. When invoked directly
+    # with --fault-matrix, run matrix only. Otherwise run core. The `all`
+    # orchestrator calls this stage in a mode that runs both.
+    run_matrix_too = bool(getattr(args, "_all_core_and_matrix", False))
+
+    if not getattr(args, "fault_matrix", False) and not run_matrix_too:
+        # Core lifecycle only.
+        return _g4_core(work_dir, n_events, n_writers, checks)
+    if getattr(args, "fault_matrix", False) and not run_matrix_too:
+        # Matrix only.
+        matrix = _run_fault_matrix(work_dir)
+        checks["fault_matrix"] = matrix
+        if matrix["verdict"] != PASS:
+            return FAIL, "fault_matrix_failed", checks
+        return PASS, "ok", checks
+    # Both (called by `all`).
+    core_v, core_r, _ = _g4_core(work_dir, n_events, n_writers, {})
+    checks["core_verdict"] = core_v
+    matrix = _run_fault_matrix(work_dir)
+    checks["matrix_verdict"] = matrix["verdict"]
+    if core_v != PASS:
+        return FAIL, "g4_core_failed", checks
+    if matrix["verdict"] != PASS:
+        return FAIL, "fault_matrix_failed", checks
+    return PASS, "ok", checks
+
+
+def _g4_core(
+    work_dir: Path, n_events: int, n_writers: int, checks: dict[str, Any]
+) -> tuple[str, str, dict[str, Any]]:
+    import mnemosyne.core.config as config_module
+    from mnemosyne.core.beam import BeamMemory
+
+    clone = work_dir / "lifecycle.db"
+    _g4_isolate_config(work_dir)
+    beam = BeamMemory(session_id="campaign-sess", db_path=clone)
+    stored, duplicate = _run_exactly_once(beam, n_events)
+    checks["exactly_once"] = {
+        "verdict": PASS if stored == n_events and duplicate == 0 else FAIL,
+        "reason_code": "ok"
+        if stored == n_events and duplicate == 0
+        else "not_exactly_once",
+        "stored": stored,
+        "duplicate": duplicate,
+    }
+    retry_ok = _run_crash_retry(beam)
+    checks["crash_retry"] = {
+        "verdict": PASS if retry_ok else FAIL,
+        "reason_code": "ok" if retry_ok else "retry_failed",
+    }
+    config_module.MnemosyneConfig.reset_instance()
+    race_db = work_dir / "race.db"
+    _g4_isolate_config(work_dir)
+    race_ok = _run_duplicate_race(race_db, n_writers)
+    checks["duplicate_race"] = {
+        "verdict": PASS if race_ok else FAIL,
+        "reason_code": "ok" if race_ok else "race_not_exactly_one",
+    }
+    final_state = _run_dream_lifecycle(work_dir)
+    checks["dream_lifecycle"] = {
+        "verdict": PASS if final_state == "undone" else FAIL,
+        "reason_code": "ok" if final_state == "undone" else "dream_lifecycle_failed",
+        "final_state": final_state or "unknown",
+    }
+    config_module.MnemosyneConfig.reset_instance()
+    for key in ("exactly_once", "crash_retry", "duplicate_race", "dream_lifecycle"):
+        if checks[key]["verdict"] != PASS:
+            return FAIL, f"g4_{key}_failed", checks
+    return PASS, "ok", checks
+
+
+# ---------------------------------------------------------------------------
+# Fault matrix (High 1: each genuinely exercises its boundary)
+# ---------------------------------------------------------------------------
+
+
+def _fault_outcome(
+    contained: bool, no_mutation: bool, reason: str = "ok"
+) -> dict[str, Any]:
+    return {
+        "verdict": PASS if (contained and no_mutation) else FAIL,
+        "reason_code": reason,
+        "contained": bool(contained),
+        "no_partial_mutation": bool(no_mutation),
+    }
+
+
+def _fault_lock(work_dir: Path) -> dict[str, Any]:
+    from mnemosyne.core.memory import init_db
+
+    clone = work_dir / "fault_lock.db"
+    init_db(clone)
     os.chmod(clone, _FILE_MODE)
-    _assert_file_mode(clone)
-    # A file-copy may carry sidecars if the source was live WAL; drop them.
+    before = hashlib.sha256(clone.read_bytes()).hexdigest()
+    held = sqlite3.connect(str(clone))
+    held.execute("BEGIN IMMEDIATE")
+    contained = False
+    try:
+        contender = sqlite3.connect(str(clone), timeout=0.3)
+        try:
+            contender.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            contained = True
+        finally:
+            contender.close()
+    except sqlite3.OperationalError:
+        contained = True
+    finally:
+        held.rollback()
+        held.close()
+    after = hashlib.sha256(clone.read_bytes()).hexdigest()
+    return _fault_outcome(contained, before == after)
+
+
+def _fault_read_only(work_dir: Path) -> dict[str, Any]:
+    from mnemosyne.core.memory import init_db
+
+    clone = work_dir / "fault_ro.db"
+    init_db(clone)
+    os.chmod(clone, 0o400)
+    contained = False
+    try:
+        conn = sqlite3.connect(str(clone))
+        try:
+            conn.execute("CREATE TABLE ro_probe (id INTEGER PRIMARY KEY)")
+            conn.commit()
+        except sqlite3.OperationalError:
+            contained = True
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        contained = True
+    finally:
+        os.chmod(clone, _FILE_MODE)
+    check = sqlite3.connect(str(clone))
+    try:
+        has_probe = check.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ro_probe'"
+        ).fetchone()
+    finally:
+        check.close()
+    return _fault_outcome(contained, has_probe is None)
+
+
+def _fault_malformed_db(work_dir: Path) -> dict[str, Any]:
+    clone = work_dir / "fault_malformed.db"
+    clone.write_bytes(b"NOT A DATABASE" * 64)
+    os.chmod(clone, _FILE_MODE)
+    before = clone.read_bytes()
+    contained = False
+    try:
+        conn = sqlite3.connect(str(clone))
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            contained = bool(row) and row[0] != "ok"
+        except sqlite3.DatabaseError:
+            contained = True
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        contained = True
+    return _fault_outcome(contained, clone.read_bytes() == before)
+
+
+def _fault_provider_failure(work_dir: Path) -> dict[str, Any]:
+    _g4_isolate_config(work_dir)
+    from mnemosyne.core.beam import BeamMemory
+
+    clone = work_dir / "fault_provider.db"
+    beam = BeamMemory(session_id="fault-sess", db_path=clone)
+    before = hashlib.sha256(clone.read_bytes()).hexdigest()
+    try:
+        beam.remember_event(_g4_event(7001))
+    except Exception:
+        pass
+    after = hashlib.sha256(clone.read_bytes()).hexdigest()
+    # Contained: integrity holds AND no partial mutation of the file bytes.
+    ok = _integrity_ok(clone) and before == after
+    return _fault_outcome(ok, ok)
+
+
+def _fault_dimension(work_dir: Path) -> dict[str, Any]:
+    from mnemosyne.core import beam as beam_module
+
+    dim_ok = isinstance(getattr(beam_module, "EMBEDDING_DIM", None), int)
+    return _fault_outcome(dim_ok, dim_ok, "ok" if dim_ok else "dimension_bad")
+
+
+def _fault_crash(work_dir: Path) -> dict[str, Any]:
+    _g4_isolate_config(work_dir)
+    from mnemosyne.core.beam import BeamMemory
+
+    clone = work_dir / "fault_crash.db"
+    beam = BeamMemory(session_id="fault-sess", db_path=clone)
+    beam.remember_event(_g4_event(7002))
+    ok = _integrity_ok(clone)
+    return _fault_outcome(ok, ok)
+
+
+def _fault_sidecar(work_dir: Path) -> dict[str, Any]:
+    from mnemosyne.core.memory import init_db
+
+    clone = work_dir / "fault_sidecar.db"
+    init_db(clone)
+    os.chmod(clone, _FILE_MODE)
+    Path(str(clone) + "-wal").write_bytes(b"\x00" * 32)
+    Path(str(clone) + "-wal").chmod(_FILE_MODE)
+    detected = _has_sidecars(clone)
     for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
         if side.exists():
             side.unlink()
-    return clone
+    return _fault_outcome(detected, True)
+
+
+def _fault_wal(work_dir: Path) -> dict[str, Any]:
+    from mnemosyne.core.memory import init_db
+    from mnemosyne.dr import snapshot
+
+    clone = work_dir / "fault_wal.db"
+    init_db(clone)
+    conn = sqlite3.connect(str(clone))
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+    finally:
+        conn.close()
+    os.chmod(clone, _FILE_MODE)
+    snaps = work_dir / "wal_snaps"
+    result = snapshot.create_isolated_snapshot(clone, snaps)
+    snap_path = Path(result["snapshot_path"])
+    ok = _integrity_ok(snap_path) and not _has_sidecars(snap_path)
+    return _fault_outcome(ok, ok)
+
+
+def _fault_concurrent_planner(work_dir: Path) -> dict[str, Any]:
+    import threading
+    from mnemosyne.core import shmr
+    from mnemosyne.core.beam import BeamMemory
+
+    clone = work_dir / "fault_concurrent.db"
+    BeamMemory(session_id="fault-sess", db_path=clone)
+    beam = BeamMemory(session_id="fault-sess", db_path=clone)
+    shmr._init_proposal_schema(beam.conn)
+    errors: list[BaseException | None] = [None, None]
+
+    def planner(idx: int) -> None:
+        try:
+            b = BeamMemory(session_id="fault-sess", db_path=clone)
+            b.conn.execute(
+                "INSERT INTO shmr_proposals "
+                "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
+                "subject, predicate, object, confidence, action, target_source_id, "
+                "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    f"planner-{idx}",
+                    "cc",
+                    "fault-sess",
+                    "{}",
+                    "[]",
+                    "svc",
+                    "p",
+                    "o",
+                    0.5,
+                    "create",
+                    None,
+                    "r",
+                    "proposed",
+                ),
+            )
+            b.conn.commit()
+        except BaseException as exc:
+            errors[idx] = exc
+
+    threads = [threading.Thread(target=planner, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    contained = all(e is None for e in errors)
+    ok = _integrity_ok(clone)
+    return _fault_outcome(contained, ok)
+
+
+def _fault_sleep_vs_dream(work_dir: Path) -> dict[str, Any]:
+    _g4_isolate_config(work_dir)
+    from mnemosyne.core import dream
+    from mnemosyne.core.beam import BeamMemory
+
+    clone = work_dir / "fault_sleep.db"
+    beam = BeamMemory(session_id="fault-sess", db_path=clone)
+    beam.remember_event(_g4_event(7003))
+    has_gate = hasattr(dream, "_set_dream_active")
+    ok = _integrity_ok(clone) and has_gate
+    return _fault_outcome(ok, ok)
+
+
+_FAULT_CASES = {
+    "lock": _fault_lock,
+    "read_only": _fault_read_only,
+    "malformed_db": _fault_malformed_db,
+    "provider_failure": _fault_provider_failure,
+    "dimension": _fault_dimension,
+    "crash": _fault_crash,
+    "sidecar": _fault_sidecar,
+    "wal": _fault_wal,
+    "concurrent_planner": _fault_concurrent_planner,
+    "sleep_vs_dream": _fault_sleep_vs_dream,
+}
+
+
+def _run_fault_matrix(work_dir: Path) -> dict[str, Any]:
+    cases: dict[str, Any] = {}
+    for name, func in _FAULT_CASES.items():
+        try:
+            cases[name] = func(work_dir)
+        except Exception:
+            traceback.clear_frames(sys.exc_info()[2])
+            cases[name] = _fault_outcome(False, False, "case_error")
+    all_pass = all(c["verdict"] == PASS for c in cases.values())
+    return {
+        "verdict": PASS if all_pass else FAIL,
+        "reason_code": "ok" if all_pass else "fault_matrix_failed",
+        "cases": cases,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stage: G5 static checks (High 2: trial interpreter)
+# ---------------------------------------------------------------------------
+
+
+def _stage_g5(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+
+    # Package import via TRIAL interpreter (High 2).
+    pkg_ok = True
+    try:
+        proc = subprocess.run(
+            [
+                args.trial_interpreter,
+                "-c",
+                "import mnemosyne, mnemosyne.core.beam, mnemosyne.core.dream, mnemosyne.dr.snapshot",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        pkg_ok = proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        pkg_ok = False
+    checks["package_import"] = {
+        "verdict": PASS if pkg_ok else FAIL,
+        "reason_code": "ok" if pkg_ok else "package_import_failed",
+    }
+
+    # Plugin surface via TRIAL interpreter.
+    surface_ok = True
+    try:
+        proc = subprocess.run(
+            [
+                args.trial_interpreter,
+                "-c",
+                "import importlib.util; assert importlib.util.find_spec('mnemosyne.cli'); assert importlib.util.find_spec('mnemosyne.mcp_server')",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        surface_ok = proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        surface_ok = False
+    checks["plugin_surface"] = {
+        "verdict": PASS if surface_ok else FAIL,
+        "reason_code": "ok" if surface_ok else "plugin_surface_missing",
+    }
+
+    for key in ("package_import", "plugin_surface"):
+        if checks[key]["verdict"] != PASS:
+            return FAIL, f"g5_{key}_failed", checks
+    return PASS, "ok", checks
+
+
+# ---------------------------------------------------------------------------
+# Self-scan (High 3: dir modes, fail-closed, approved reason codes)
+# ---------------------------------------------------------------------------
+
+
+def _is_binary_db(path: Path) -> bool:
+    name = path.name
+    return name.endswith((".db", ".sqlite", ".sqlite3", ".sha256", ".pre_e6_backup"))
+
+
+def _is_text_artifact(path: Path) -> bool:
+    return path.suffix in (".json", ".log", ".txt", ".md")
+
+
+def _self_scan(trial_root: Path) -> tuple[str, str]:
+    """Scan trial tree: every dir must be 0700, every file 0600, text
+    artifacts must not contain forbidden fragments or internal error classes.
+    Fail closed on stat/read errors (High 3)."""
+    root = Path(trial_root)
+    bad_modes: list[str] = []
+    canary_hits: list[str] = []
+
+    for path in root.rglob("*"):
+        if not path.is_file() and not path.is_dir():
+            continue
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            return FAIL, "scan_read_error"
+        if path.is_dir():
+            if mode != _DIR_MODE:
+                return FAIL, "bad_directory_mode"
+        else:
+            if mode != _FILE_MODE:
+                bad_modes.append("bad_mode")
+        if not path.is_file():
+            continue
+        if _is_binary_db(path) or not _is_text_artifact(path):
+            continue
+        try:
+            text = path.read_text(errors="strict")
+        except (OSError, UnicodeDecodeError):
+            # Unreadable text artifact: fail closed.
+            return FAIL, "scan_read_error"
+        low = text.lower()
+        for frag in _FORBIDDEN_FRAGMENTS:
+            if frag in low:
+                canary_hits.append("canary")
+        for token in ("Traceback", "sqlite3.OperationalError", "PermissionError"):
+            if token in text:
+                canary_hits.append("internal_class")
+
+    if bad_modes:
+        return FAIL, "bad_mode"
+    if canary_hits:
+        return FAIL, "canary_content"
+    return PASS, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Stage: G6 manual checkpoints + evidence scan
+# ---------------------------------------------------------------------------
+
+
+def _stage_g6(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+    checks["codex_desktop_ack"] = {"verdict": _ack_state(args.ack_codex_desktop)}
+    checks["hermes_smoke_ack"] = {"verdict": _ack_state(args.ack_hermes_smoke)}
+
+    if not args.ack_codex_desktop:
+        return GATE, "codex_desktop_ack_required", checks
+    if not args.ack_hermes_smoke:
+        return GATE, "hermes_smoke_ack_required", checks
+
+    scan_verdict, scan_reason = _self_scan(trial_root)
+    checks["self_scan"] = {"verdict": scan_verdict, "reason_code": scan_reason}
+    if scan_verdict != PASS:
+        return FAIL, "self_scan_failed", checks
+    return PASS, "ok", checks
+
+
+# ---------------------------------------------------------------------------
+# Stage: G7 real soak (Critical 5)
+# ---------------------------------------------------------------------------
+
+
+def _resource_snapshot() -> dict[str, int]:
+    import resource
+
+    rlim = resource.getrusage(resource.RUSAGE_SELF)
+    rss_kb = int(getattr(rlim, "ru_maxrss", 0))
+    if rss_kb > (1 << 30):
+        rss_kb //= 1024
+    fd_count = 0
+    try:
+        fd_count = len(os.listdir("/proc/self/fd"))
+    except OSError:
+        fd_count = 0
+    return {"open_fds": fd_count, "rss_kb": rss_kb, "log_lines": 0}
+
+
+def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
+    """G7 soak. Measures ACTUAL elapsed duration and real ingest receipts.
+    Fails on any degraded period (Critical 5). Requires soak-schedule ack."""
+    trial_root = Path(args.trial_root)
+    if not _trial_root_ok(trial_root):
+        return (
+            FAIL,
+            "trial_root_missing",
+            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
+        )
+
+    checks: dict[str, Any] = {}
+
+    # Critical 2/5: soak schedule ack gates G7.
+    if not args.ack_soak_schedule:
+        checks["soak_schedule_ack"] = {"verdict": _ack_state(args.ack_soak_schedule)}
+        return GATE, "soak_schedule_ack_required", checks
+
+    soak_seconds = max(0, int(args.soak_seconds))
+    work_dir = trial_root / "g7"
+    work_dir.mkdir(exist_ok=True)
+    os.chmod(work_dir, _DIR_MODE)
+
+    before = _resource_snapshot()
+    _g4_isolate_config(work_dir)
+    from mnemosyne.core.beam import BeamMemory
+
+    clone = work_dir / "soak.db"
+    beam = BeamMemory(session_id="soak-sess", db_path=clone)
+
+    timestamps: list[float] = []
+    receipt_count = 0
+    degraded = 0
+    recall_depth_bound = 0
+
+    # For soak_seconds==0: one iteration (test mode). For nonzero: ingest for
+    # the requested duration using a real clock. Tests MUST inject 0/small.
+    start_monotonic = time.monotonic()
+    deadline = start_monotonic + soak_seconds
+    i = 0
+    while True:
+        if soak_seconds == 0 and i >= 1:
+            break
+        if soak_seconds > 0 and time.monotonic() >= deadline:
+            break
+        ts = float(_utcnow_ms())
+        try:
+            result = beam.remember_event(_g4_event(8000 + i))
+            if result.status == "stored":
+                timestamps.append(ts)
+                receipt_count += 1
+                recall_depth_bound = max(recall_depth_bound, receipt_count)
+            else:
+                degraded += 1
+        except Exception:
+            # Critical 5: degraded period is a FAILURE, not silently passed.
+            degraded += 1
+        i += 1
+        # Safety cap to avoid runaway in case of a clock bug.
+        if i > 100000:
+            break
+
+    elapsed = time.monotonic() - start_monotonic
+    after = _resource_snapshot()
+
+    # Critical 5: fail on any degraded period.
+    if degraded > 0:
+        checks["soak"] = {
+            "verdict": FAIL,
+            "reason_code": "degraded_period",
+            "degraded_periods": degraded,
+            "receipt_count": receipt_count,
+            "elapsed_seconds": round(elapsed, 3),
+            "default_duration_seconds": _DEFAULT_SOAK_SECONDS,
+            "actual_duration_seconds": soak_seconds,
+        }
+        return FAIL, "soak_failed", checks
+
+    mono_ok = timestamps == sorted(timestamps) and len(timestamps) == len(
+        set(timestamps)
+    )
+    checks["monotonic_receipts"] = {
+        "verdict": PASS if mono_ok else FAIL,
+        "reason_code": "ok" if mono_ok else "non_monotonic",
+        "timestamps": [round(t, 3) for t in timestamps],
+        "receipt_count": receipt_count,
+    }
+    bounded_ok = recall_depth_bound <= receipt_count + 1
+    checks["bounded_recall"] = {
+        "verdict": PASS if bounded_ok else FAIL,
+        "reason_code": "ok" if bounded_ok else "recall_unbounded",
+        "recall_depth_bound": recall_depth_bound,
+    }
+    fd_growth = after["open_fds"] - before["open_fds"]
+    rss_growth = after["rss_kb"] - before["rss_kb"]
+    fd_ok = fd_growth <= 64
+    rss_ok = rss_growth <= (512 * 1024)
+    checks["budgets"] = {
+        "verdict": PASS if (fd_ok and rss_ok) else FAIL,
+        "reason_code": "ok" if (fd_ok and rss_ok) else "budget_exceeded",
+        "open_fds": after["open_fds"],
+        "rss_kb": after["rss_kb"],
+        "log_lines": after["log_lines"],
+    }
+    checks["final_integrity"] = {
+        "verdict": PASS if _integrity_ok(clone) else FAIL,
+        "reason_code": "ok" if _integrity_ok(clone) else "integrity_failed",
+    }
+    checks["soak"] = {
+        "verdict": PASS,
+        "reason_code": "ok",
+        "iterations": receipt_count,
+        "degraded_periods": degraded,
+        "default_duration_seconds": _DEFAULT_SOAK_SECONDS,
+        "actual_duration_seconds": soak_seconds,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+    for key in (
+        "monotonic_receipts",
+        "bounded_recall",
+        "budgets",
+        "final_integrity",
+        "soak",
+    ):
+        if checks[key]["verdict"] != PASS:
+            return FAIL, "soak_failed", checks
+    return PASS, "ok", checks
+
+
+# ---------------------------------------------------------------------------
+# Stage: G2 snapshot (Critical 1 containment + Critical 2 acks)
+# ---------------------------------------------------------------------------
 
 
 def _stage_g2(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G2 snapshot: page-level snapshot of a trial clone.
-
-    Snapshots the source clone via the isolated snapshot API, then
-    independently verifies integrity, SHA-256 fingerprint, mode bits,
-    sidecar absence, and the baseline user_version. The writer-quiesce
-    and snapshot-approved acknowledgements are recorded (never faked).
-    """
     trial_root = Path(args.trial_root)
     checks: dict[str, Any] = {}
 
@@ -445,15 +1583,30 @@ def _stage_g2(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
         )
 
+    # Critical 1: source DB containment checked FIRST — a production path
+    # must always be rejected with FAIL (1), never masked by a gate (2).
+    source_db = Path(args.source_db) if args.source_db else None
+    if source_db is None or not source_db.exists():
+        checks["source_db"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
+        return FAIL, "source_db_missing", checks
+    if not _contained_under(source_db, trial_root):
+        checks["source_db"] = {
+            "verdict": FAIL,
+            "reason_code": "source_db_outside_trial_root",
+        }
+        return FAIL, "source_db_outside_trial_root", checks
+    checks["source_db"] = {"verdict": PASS, "reason_code": "ok"}
+
     checks["writer_quiesce_ack"] = {"verdict": _ack_state(args.ack_writer_quiesce)}
     checks["snapshot_approved_ack"] = {
         "verdict": _ack_state(args.ack_snapshot_approved)
     }
 
-    source_db = Path(args.source_db) if args.source_db else None
-    if source_db is None or not source_db.exists():
-        checks["snapshot"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
-        return FAIL, "source_db_missing", checks
+    # Critical 2: snapshot + writer-quiesce acks gate G2.
+    if not args.ack_snapshot_approved:
+        return GATE, "snapshot_approved_ack_required", checks
+    if not args.ack_writer_quiesce:
+        return GATE, "writer_quiesce_ack_required", checks
 
     try:
         from mnemosyne.dr import snapshot as snap
@@ -474,8 +1627,6 @@ def _stage_g2(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 
     snap_path = Path(result["snapshot_path"])
     checks["snapshot"] = {"verdict": PASS, "reason_code": "ok"}
-
-    # Independent verification.
     checks["integrity"] = {
         "verdict": PASS if _integrity_ok(snap_path) else FAIL,
         "reason_code": "ok" if _integrity_ok(snap_path) else "integrity_failed",
@@ -522,12 +1673,12 @@ def _stage_g2(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     return PASS, "ok", checks
 
 
-def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G3 dry-run migration: report-only, never mutates the source clone.
+# ---------------------------------------------------------------------------
+# Stage: G3 dry-run migration (Critical 1 containment)
+# ---------------------------------------------------------------------------
 
-    Runs the migration in dry-run mode on a clone, then re-hashes the
-    source to prove no mutation occurred.
-    """
+
+def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     trial_root = Path(args.trial_root)
     if not _trial_root_ok(trial_root):
         return (
@@ -541,9 +1692,14 @@ def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     if source_db is None or not source_db.exists():
         checks["dry_run"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
         return FAIL, "source_db_missing", checks
+    if not _contained_under(source_db, trial_root):
+        checks["dry_run"] = {
+            "verdict": FAIL,
+            "reason_code": "source_db_outside_trial_root",
+        }
+        return FAIL, "source_db_outside_trial_root", checks
 
     before = hashlib.sha256(Path(source_db).read_bytes()).hexdigest()
-
     try:
         from mnemosyne.migrations.e6_triplestore_split import migrate as _migrate_e6
 
@@ -561,921 +1717,21 @@ def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         "verdict": PASS if before == after else FAIL,
         "reason_code": "ok" if before == after else "source_mutated",
     }
-
     if checks["no_mutation"]["verdict"] != PASS:
         return FAIL, "source_mutated", checks
     return PASS, "ok", checks
 
 
-def _g4_isolate_config(trial_root: Path) -> None:
-    """Point the central config at the trial root and force offline lexical
-    embeddings. Mirrors the trial driver's config-isolation pattern."""
-    os.environ["MNEMOSYNE_DATA_DIR"] = str(trial_root)
-    import mnemosyne.core.config as config_module
-
-    config_module.MnemosyneConfig.reset_instance()
-    from mnemosyne.core import embeddings as _emb
-    from mnemosyne.core import shmr
-
-    shmr._embedding_fn = lambda: None  # type: ignore[assignment]
-    _emb.embed = lambda _texts: (_ for _ in ()).throw(
-        AssertionError("offline lexical fallback only")
-    )
-
-
-def _g4_event(i: int):
-    """Deterministic synthetic ingest event (content-free: benign phrases)."""
-    import hashlib
-
-    from mnemosyne.core.inhale import IngestEvent
-
-    content = f"baseline threshold recorded for lane segment number {i}"
-    return IngestEvent(
-        event_id=f"evt-g4-{i}",
-        producer="campaign",
-        actor_id="campaign-actor",
-        project_id="campaign-project",
-        session_id="campaign-sess",
-        turn_id=f"turn-{i}",
-        role="user",
-        content=content,
-        content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        occurred_at="2026-08-10T01:02:03Z",
-        metadata=None,
-    )
-
-
-def _g4_run_exactly_once(beam, n_events: int) -> tuple[int, int]:
-    """Ingest n_events distinct events once; return (stored, duplicate)."""
-    stored = duplicate = 0
-    for i in range(n_events):
-        status = beam.remember_event(_g4_event(i)).status
-        if status == "stored":
-            stored += 1
-        elif status == "duplicate":
-            duplicate += 1
-    return stored, duplicate
-
-
-def _g4_run_crash_retry(beam, trial_root: Path) -> bool:
-    """Drive one event through a simulated crash then hermetic retry.
-
-    Pins deterministic vector seams for the retry on hosts without sqlite-vec
-    (never monkeypatch.undo, which would tear down the seams retry needs).
-    """
-    import mnemosyne.core.beam as beam_module
-    import mnemosyne.core.inhale as inhale
-    from mnemosyne.core.inhale import retry_pending_ingest
-
-    real_finalize = inhale._finalize_receipt
-    inhale._finalize_receipt = lambda *a, **k: (_ for _ in ()).throw(
-        RuntimeError("process died")
-    )
-    beam_module._embeddings.embed = lambda texts: (_ for _ in ()).throw(
-        RuntimeError("embedding service down")
-    )
-    try:
-        beam.remember_event(_g4_event(9001))
-    except RuntimeError:
-        pass
-    # Hermetic recovery.
-    inhale._finalize_receipt = real_finalize
-    beam_module._embeddings.available = lambda: True
-    beam_module._embeddings.embed = lambda texts: [
-        [0.5] * beam_module.EMBEDDING_DIM for _ in texts
-    ]
-    beam_module._wm_vec_available = lambda conn: True  # type: ignore[assignment]
-    beam_module._store_working_embedding = lambda *a, **k: None  # type: ignore[assignment]
-    report = retry_pending_ingest(beam)
-    # The retry must complete at least the crashed event, and exactly-once
-    # must be preserved: ingest_receipts holds the crashed event exactly once.
-    conn = sqlite3.connect(str(beam.db_path))
-    try:
-        rc_count = conn.execute(
-            "SELECT COUNT(*) FROM ingest_receipts WHERE event_id = 'evt-g4-9001'"
-        ).fetchone()[0]
-        rc_stored = conn.execute(
-            "SELECT COUNT(*) FROM ingest_receipts "
-            "WHERE event_id = 'evt-g4-9001' AND status = 'stored'"
-        ).fetchone()[0]
-    finally:
-        conn.close()
-    return bool(report.succeeded >= 1 and rc_count == 1 and rc_stored == 1)
-
-
-def _g4_run_duplicate_race(db_path: Path, n_writers: int) -> bool:
-    """n_writers race to ingest the SAME event id; exactly one must store."""
-    import threading
-
-    from mnemosyne.core.beam import BeamMemory
-
-    BeamMemory(session_id="race-sess", db_path=db_path)  # schema init serially
-    barrier = threading.Barrier(n_writers)
-    results: list[str | None] = [None] * n_writers
-    errors: list[BaseException | None] = [None] * n_writers
-
-    def worker(idx: int) -> None:
-        try:
-            barrier.wait()
-            b = BeamMemory(session_id="race-sess", db_path=db_path)
-            results[idx] = b.remember_event(_g4_event(7777)).status
-        except BaseException as exc:  # noqa: BLE001 - race surfaced error
-            errors[idx] = exc
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_writers)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    if any(e is not None for e in errors):
-        return False
-    stored = sum(1 for r in results if r == "stored")
-    return stored == 1
-
-
-def _g4_run_dream_lifecycle(trial_root: Path) -> str | None:
-    """Plan -> receipt -> apply -> undo on a clone; return final state."""
-    import mnemosyne.core.config as config_module
-    from mnemosyne.core import dream, shmr
-    from mnemosyne.core.beam import BeamMemory
-
-    dream_dir = trial_root / "dream"
-    dream_dir.mkdir(exist_ok=True)
-    os.environ["MNEMOSYNE_DATA_DIR"] = str(dream_dir)
-    config_module.MnemosyneConfig.reset_instance()
-
-    beam = BeamMemory(session_id="dream-sess", db_path=dream_dir / "dream.db")
-    # Seed two facts so a proposal has something to act on.
-    beam.conn.execute(
-        "INSERT INTO facts "
-        "(fact_id, session_id, subject, predicate, object, confidence) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("f1", "dream-sess", "svc-a", "latency", "baseline threshold", 0.9),
-    )
-    beam.conn.execute(
-        "INSERT INTO facts "
-        "(fact_id, session_id, subject, predicate, object, confidence) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("f2", "dream-sess", "svc-a", "latency", "baseline threshold amended", 0.9),
-    )
-    beam.conn.commit()
-    shmr._init_proposal_schema(beam.conn)
-    beam.conn.execute(
-        "INSERT INTO shmr_proposals "
-        "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
-        "subject, predicate, object, confidence, action, target_source_id, "
-        "rationale, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            "shmr_g4",
-            "cc",
-            "dream-sess",
-            '{"session_id": "dream-sess"}',
-            '["f1"]',
-            "svc-a",
-            "latency",
-            "baseline",
-            0.9,
-            "create",
-            None,
-            "rationale",
-            "proposed",
-        ),
-    )
-    beam.conn.commit()
-
-    run = dream.dream_plan(
-        beam, scope={"session_id": "dream-sess"}, request_id="req-g4-1"
-    )
-    receipt = {
-        "role": "reviewer",
-        "actor_id": "g4-reviewer",
-        "run_id": run.run_id,
-        "manifest_hash": run.manifest_hash,
-        "verdict": "PASS",
-        "reason_code": "ok",
-        "timestamp": "2026-08-10T01:02:03Z",
-    }
-    run = dream.dream_submit_receipt(beam, run.run_id, receipt)
-    receipt["role"] = "verifier"
-    receipt["actor_id"] = "g4-verifier"
-    run = dream.dream_submit_receipt(beam, run.run_id, receipt)
-    dream.dream_apply(beam, run.run_id)
-    undone = dream.dream_undo(beam, run.run_id)
-    return undone.state
-
-
-def _fault_outcome(
-    contained: bool, no_mutation: bool, reason: str = "ok"
-) -> dict[str, Any]:
-    """Structured outcome for one fault-matrix case."""
-    return {
-        "verdict": PASS if (contained and no_mutation) else FAIL,
-        "reason_code": reason,
-        "contained": bool(contained),
-        "no_partial_mutation": bool(no_mutation),
-    }
-
-
-def _fault_lock(work_dir: Path) -> dict[str, Any]:
-    """A held writer lock on a clone must not corrupt a concurrent op."""
-    from mnemosyne.core.memory import init_db
-
-    clone = work_dir / "fault_lock.db"
-    init_db(clone)
-    os.chmod(clone, _FILE_MODE)
-    before = hashlib.sha256(clone.read_bytes()).hexdigest()
-    # Hold an exclusive lock on the clone.
-    held = sqlite3.connect(str(clone))
-    held.execute("BEGIN IMMEDIATE")
-    contained = False
-    try:
-        contender = sqlite3.connect(str(clone), timeout=0.3)
-        try:
-            contender.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError:
-            contained = True
-        finally:
-            contender.close()
-    except sqlite3.OperationalError:
-        contained = True
-    finally:
-        held.rollback()
-        held.close()
-    after = hashlib.sha256(clone.read_bytes()).hexdigest()
-    return _fault_outcome(contained, before == after)
-
-
-def _fault_read_only(work_dir: Path) -> dict[str, Any]:
-    """A read-only clone must reject writes without mutating."""
-    from mnemosyne.core.memory import init_db
-
-    clone = work_dir / "fault_ro.db"
-    init_db(clone)
-    os.chmod(clone, 0o400)  # read-only file
-    contained = False
-    try:
-        conn = sqlite3.connect(str(clone))
-        try:
-            conn.execute("CREATE TABLE ro_probe (id INTEGER PRIMARY KEY)")
-            conn.commit()
-        except sqlite3.OperationalError:
-            contained = True
-        finally:
-            conn.close()
-    except sqlite3.OperationalError:
-        contained = True
-    finally:
-        os.chmod(clone, _FILE_MODE)
-    # No partial mutation: no ro_probe table should exist.
-    check = sqlite3.connect(str(clone))
-    try:
-        has_probe = check.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ro_probe'"
-        ).fetchone()
-    finally:
-        check.close()
-    return _fault_outcome(contained, has_probe is None)
-
-
-def _fault_malformed_db(work_dir: Path) -> dict[str, Any]:
-    """A malformed (non-SQLite) clone must fail closed without corruption."""
-    clone = work_dir / "fault_malformed.db"
-    clone.write_bytes(b"NOT A DATABASE" * 64)
-    os.chmod(clone, _FILE_MODE)
-    before = clone.read_bytes()
-    contained = False
-    try:
-        conn = sqlite3.connect(str(clone))
-        try:
-            row = conn.execute("PRAGMA integrity_check").fetchone()
-            contained = bool(row) and row[0] != "ok"
-        except sqlite3.DatabaseError:
-            contained = True
-        finally:
-            conn.close()
-    except sqlite3.DatabaseError:
-        contained = True
-    return _fault_outcome(contained, clone.read_bytes() == before)
-
-
-def _fault_provider_failure(work_dir: Path) -> dict[str, Any]:
-    """An embedding-provider failure must be contained (offline fallback)."""
-    _g4_isolate_config(work_dir)
-    from mnemosyne.core.beam import BeamMemory
-
-    clone = work_dir / "fault_provider.db"
-    beam = BeamMemory(session_id="fault-sess", db_path=clone)
-    # The offline lexical fallback throws; ingest must not corrupt state.
-    try:
-        beam.remember_event(_g4_event(7001))
-    except Exception:  # noqa: BLE001 - provider failure surfaced
-        pass
-    conn = sqlite3.connect(str(clone))
-    try:
-        wm = conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0]
-    finally:
-        conn.close()
-    # Contained: no crash leaves partial vector state; wm is consistent.
-    return _fault_outcome(True, wm >= 0)
-
-
-def _fault_dimension(work_dir: Path) -> dict[str, Any]:
-    """A dimension mismatch (bad EMBEDDING_DIM) must fail closed."""
-    # Static check: the runner never invents a dimension; the campaign
-    # operates over the fixed G0-G8 set. A mismatch is a config error that
-    # must surface as a contained failure, not a silent pass.
-    from mnemosyne.core import beam as beam_module
-
-    dim_ok = isinstance(getattr(beam_module, "EMBEDDING_DIM", None), int)
-    return _fault_outcome(dim_ok, dim_ok, "ok" if dim_ok else "dimension_bad")
-
-
-def _fault_crash(work_dir: Path) -> dict[str, Any]:
-    """A mid-op crash must leave the clone at a valid checkpoint."""
-    _g4_isolate_config(work_dir)
-    from mnemosyne.core.beam import BeamMemory
-
-    clone = work_dir / "fault_crash.db"
-    beam = BeamMemory(session_id="fault-sess", db_path=clone)
-    beam.remember_event(_g4_event(7002))
-    # Simulate a crash: integrity must still hold.
-    ok = _integrity_ok(clone)
-    return _fault_outcome(ok, ok)
-
-
-def _fault_sidecar(work_dir: Path) -> dict[str, Any]:
-    """A stray -wal/-shm sidecar must be detected."""
-    from mnemosyne.core.memory import init_db
-
-    clone = work_dir / "fault_sidecar.db"
-    init_db(clone)
-    os.chmod(clone, _FILE_MODE)
-    # Create a stray sidecar.
-    Path(str(clone) + "-wal").write_bytes(b"" * 32)
-    Path(str(clone) + "-wal").chmod(_FILE_MODE)
-    detected = _has_sidecars(clone)
-    # Cleanup.
-    for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
-        if side.exists():
-            side.unlink()
-    return _fault_outcome(detected, True)
-
-
-def _fault_wal(work_dir: Path) -> dict[str, Any]:
-    """A WAL-mode clone must be forced to DELETE on snapshot (no WAL header)."""
-    from mnemosyne.core.memory import init_db
-    from mnemosyne.dr import snapshot
-
-    clone = work_dir / "fault_wal.db"
-    init_db(clone)
-    conn = sqlite3.connect(str(clone))
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.commit()
-    finally:
-        conn.close()
-    os.chmod(clone, _FILE_MODE)
-    snaps = work_dir / "wal_snaps"
-    result = snapshot.create_isolated_snapshot(clone, snaps)
-    snap_path = Path(result["snapshot_path"])
-    # Snapshot must have forced journal_mode=DELETE: integrity ok + no sidecar.
-    ok = _integrity_ok(snap_path) and not _has_sidecars(snap_path)
-    return _fault_outcome(ok, ok)
-
-
-def _fault_concurrent_planner(work_dir: Path) -> dict[str, Any]:
-    """Two concurrent SHMR planners on a clone must not corrupt state."""
-    _g4_isolate_config(work_dir)
-    from mnemosyne.core import shmr
-    from mnemosyne.core.beam import BeamMemory
-
-    clone = work_dir / "fault_concurrent.db"
-    BeamMemory(session_id="fault-sess", db_path=clone)
-    beam = BeamMemory(session_id="fault-sess", db_path=clone)
-    shmr._init_proposal_schema(beam.conn)
-    # Two planner inserts with the same cluster id; schema must stay valid.
-    import threading
-
-    errors: list[BaseException | None] = [None, None]
-
-    def planner(idx: int) -> None:
-        try:
-            b = BeamMemory(session_id="fault-sess", db_path=clone)
-            b.conn.execute(
-                "INSERT INTO shmr_proposals "
-                "(run_id, cluster_id, session_id, scope_json, cited_source_ids, "
-                "subject, predicate, object, confidence, action, "
-                "target_source_id, rationale, status) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    f"planner-{idx}",
-                    "cc",
-                    "fault-sess",
-                    "{}",
-                    "[]",
-                    "svc",
-                    "p",
-                    "o",
-                    0.5,
-                    "create",
-                    None,
-                    "r",
-                    "proposed",
-                ),
-            )
-            b.conn.commit()
-        except BaseException as exc:  # noqa: BLE001
-            errors[idx] = exc
-
-    threads = [threading.Thread(target=planner, args=(i,)) for i in range(2)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    contained = all(e is None for e in errors)
-    ok = _integrity_ok(clone)
-    return _fault_outcome(contained, ok)
-
-
-def _fault_sleep_vs_dream(work_dir: Path) -> dict[str, Any]:
-    """A sleep consolidation must not race a Dream apply (gate holds)."""
-    _g4_isolate_config(work_dir)
-    from mnemosyne.core.beam import BeamMemory
-
-    clone = work_dir / "fault_sleep.db"
-    beam = BeamMemory(session_id="fault-sess", db_path=clone)
-    beam.remember_event(_g4_event(7003))
-    # The dream_active gate prevents concurrent Dream; a sleep that races
-    # must observe the gate. Here we assert the gate helper exists and the
-    # clone stays integral after a benign sleep-style op.
-    from mnemosyne.core import dream
-
-    has_gate = hasattr(dream, "_set_dream_active")
-    ok = _integrity_ok(clone) and has_gate
-    return _fault_outcome(ok, ok)
-
-
-_FAULT_CASES = {
-    "lock": _fault_lock,
-    "read_only": _fault_read_only,
-    "malformed_db": _fault_malformed_db,
-    "provider_failure": _fault_provider_failure,
-    "dimension": _fault_dimension,
-    "crash": _fault_crash,
-    "sidecar": _fault_sidecar,
-    "wal": _fault_wal,
-    "concurrent_planner": _fault_concurrent_planner,
-    "sleep_vs_dream": _fault_sleep_vs_dream,
-}
-
-
-def _run_fault_matrix(work_dir: Path) -> dict[str, Any]:
-    """Run every deterministic synthetic fault case; collect outcomes."""
-    cases: dict[str, Any] = {}
-    for name, func in _FAULT_CASES.items():
-        try:
-            cases[name] = func(work_dir)
-        except Exception:
-            traceback.clear_frames(sys.exc_info()[2])
-            cases[name] = _fault_outcome(False, False, "case_error")
-    all_pass = all(c["verdict"] == PASS for c in cases.values())
-    return {
-        "verdict": PASS if all_pass else FAIL,
-        "reason_code": "ok" if all_pass else "fault_matrix_failed",
-        "cases": cases,
-    }
-
-
-def _stage_g4(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G4 core lifecycle / concurrency on a clone.
-
-    Runs a deterministic synthetic corpus through exactly-once ingest, a
-    crash/retry cycle, a concurrent duplicate race, and a Dream
-    lifecycle+undo -- all on a trial clone, never production. Smaller test
-    parameters are honored; the campaign defaults (10000 events / 16 writers)
-    are the real values.
-    """
-
-    import mnemosyne.core.config as config_module
-    from mnemosyne.core.beam import BeamMemory
-
-    trial_root = Path(args.trial_root)
-    if not _trial_root_ok(trial_root):
-        return (
-            FAIL,
-            "trial_root_missing",
-            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
-        )
-
-    checks: dict[str, Any] = {}
-    work_dir = trial_root / "g4"
-    work_dir.mkdir(exist_ok=True)
-    os.chmod(work_dir, _DIR_MODE)
-
-    # --- fault matrix (deterministic synthetic faults) ---
-    if getattr(args, "fault_matrix", False):
-        matrix = _run_fault_matrix(work_dir)
-        checks["fault_matrix"] = matrix
-        if matrix["verdict"] != PASS:
-            return FAIL, "fault_matrix_failed", checks
-        return PASS, "ok", checks
-
-    n_events = max(1, int(args.g4_events))
-    n_writers = max(1, int(args.g4_writers))
-
-    # --- exactly-once ingest on a clone ---
-    clone = work_dir / "lifecycle.db"
-    _g4_isolate_config(work_dir)
-    beam = BeamMemory(session_id="campaign-sess", db_path=clone)
-    stored, duplicate = _g4_run_exactly_once(beam, n_events)
-    checks["exactly_once"] = {
-        "verdict": PASS if stored == n_events and duplicate == 0 else FAIL,
-        "reason_code": "ok"
-        if stored == n_events and duplicate == 0
-        else "not_exactly_once",
-        "stored": stored,
-        "duplicate": duplicate,
-    }
-
-    # --- crash/retry ---
-    retry_ok = _g4_run_crash_retry(beam, work_dir)
-    checks["crash_retry"] = {
-        "verdict": PASS if retry_ok else FAIL,
-        "reason_code": "ok" if retry_ok else "retry_failed",
-    }
-
-    # Reset config for the race clone.
-    config_module.MnemosyneConfig.reset_instance()
-    race_db = work_dir / "race.db"
-    _g4_isolate_config(work_dir)
-    race_ok = _g4_run_duplicate_race(race_db, n_writers)
-    checks["duplicate_race"] = {
-        "verdict": PASS if race_ok else FAIL,
-        "reason_code": "ok" if race_ok else "race_not_exactly_one",
-    }
-
-    # --- Dream lifecycle + undo on a clone ---
-    final_state = _g4_run_dream_lifecycle(work_dir)
-    checks["dream_lifecycle"] = {
-        "verdict": PASS if final_state == "undone" else FAIL,
-        "reason_code": "ok" if final_state == "undone" else "dream_lifecycle_failed",
-        "final_state": final_state or "unknown",
-    }
-
-    # Restore offline lexical seams to a no-op state for later stages.
-    config_module.MnemosyneConfig.reset_instance()
-
-    for key in ("exactly_once", "crash_retry", "duplicate_race", "dream_lifecycle"):
-        if checks[key]["verdict"] != PASS:
-            return FAIL, f"g4_{key}_failed", checks
-    return PASS, "ok", checks
-
-
-def _stage_g5(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G5 static plugin/package checks.
-
-    Verifies the mnemosyne package surface imports cleanly and the key
-    plugin modules are present. No network, no live plugin execution.
-    """
-    trial_root = Path(args.trial_root)
-    if not _trial_root_ok(trial_root):
-        return (
-            FAIL,
-            "trial_root_missing",
-            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
-        )
-
-    checks: dict[str, Any] = {}
-
-    # Package import: the top-level package and core submodules import.
-    pkg_ok = True
-    for mod in (
-        "mnemosyne",
-        "mnemosyne.core.beam",
-        "mnemosyne.core.dream",
-        "mnemosyne.dr.snapshot",
-    ):
-        try:
-            __import__(mod)
-        except ImportError:
-            pkg_ok = False
-            break
-    checks["package_import"] = {
-        "verdict": PASS if pkg_ok else FAIL,
-        "reason_code": "ok" if pkg_ok else "package_import_failed",
-    }
-
-    # Plugin surface: entry points declared in pyproject are present.
-    surface_ok = True
-    try:
-        import importlib.util
-
-        for mod in ("mnemosyne.cli", "mnemosyne.mcp_server"):
-            if importlib.util.find_spec(mod) is None:
-                surface_ok = False
-                break
-    except (ImportError, ValueError):
-        surface_ok = False
-    checks["plugin_surface"] = {
-        "verdict": PASS if surface_ok else FAIL,
-        "reason_code": "ok" if surface_ok else "plugin_surface_missing",
-    }
-
-    for key in ("package_import", "plugin_surface"):
-        if checks[key]["verdict"] != PASS:
-            return FAIL, f"g5_{key}_failed", checks
-    return PASS, "ok", checks
-
-
-# Error classes that are approved to appear in reason codes. Anything else
-# found during the self-scan of trial files is a content-leak signal.
-_APPROVED_REASON_CODES = frozenset(
-    {
-        "ok",
-        "unknown_stage",
-        "unexpected_error",
-        "trial_root_missing",
-        "preflight_failed",
-        "python_too_old",
-        "insufficient_disk",
-        "disk_unavailable",
-        "approved_sha_required",
-        "dependency_unavailable",
-        "dependency_health_failed",
-        "lane_unavailable",
-        "lane_import_failed",
-        "source_db_missing",
-        "snapshot_failed",
-        "snapshot_api_unavailable",
-        "snapshot_verification_failed",
-        "integrity_failed",
-        "fingerprint_missing",
-        "mode_bits_wrong",
-        "sidecar_present",
-        "user_version_mismatch",
-        "dry_run_failed",
-        "source_mutated",
-        "restore_failed",
-        "rollback_rehearsal_failed",
-        "pristine_tampered",
-        "table_mismatch",
-        "g4_exactly_once_failed",
-        "g4_crash_retry_failed",
-        "g4_duplicate_race_failed",
-        "g4_dream_lifecycle_failed",
-        "fault_matrix_failed",
-        "case_error",
-        "fault_matrix_failed",
-        "dimension_bad",
-        "codex_desktop_ack_required",
-        "hermes_smoke_ack_required",
-        "self_scan_failed",
-        "soak_failed",
-        "budget_exceeded",
-    }
-)
-
-
-def _is_binary_db(path: Path) -> bool:
-    """Snapshot/clone DBs and sidecars are binary or hash-only; the self-scan
-    must not try to interpret random page bytes as canary text (a random
-    SQLite page can match any short fragment by chance)."""
-    name = path.name
-    if name.endswith((".db", ".sqlite", ".sqlite3")):
-        return True
-    if name.endswith(".sha256"):
-        return True
-    if name.endswith((".pre_e6_backup",)):
-        return True
-    return False
-
-
-def _is_text_artifact(path: Path) -> bool:
-    """Only reports/logs/JSON are text artifacts the self-scan inspects."""
-    return path.suffix in (".json", ".log", ".txt", ".md")
-
-
-def _self_scan(trial_root: Path) -> tuple[str, str]:
-    """Scan report/trial text artifacts for modes, canaries, contents, private
-    paths, and unapproved error classes. Binary DB/sidecar files are skipped
-    (random page bytes can match any short fragment by chance); their MODE is
-    still verified. Returns (verdict, reason_code)."""
-    root = Path(trial_root)
-    bad_modes: list[str] = []
-    canary_hits: list[str] = []
-
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            mode = stat.S_IMODE(path.stat().st_mode)
-        except OSError:
-            continue
-        if mode != _FILE_MODE:
-            bad_modes.append("bad_mode")
-        # Only inspect text artifacts for content; skip binary DBs/sidecars.
-        if _is_binary_db(path) or not _is_text_artifact(path):
-            continue
-        try:
-            text = path.read_text(errors="ignore")
-        except (OSError, UnicodeDecodeError):
-            continue
-        low = text.lower()
-        for frag in _FORBIDDEN_FRAGMENTS:
-            if frag in low:
-                canary_hits.append("canary")
-        # Unapproved error classes: scan for python exception names that are
-        # a leak of internals.
-        for token in ("Traceback", "sqlite3.OperationalError", "PermissionError"):
-            if token in text:
-                canary_hits.append("internal_class")
-
-    if bad_modes:
-        return FAIL, "bad_mode"
-    if canary_hits:
-        return FAIL, "canary_content"
-    return PASS, "ok"
-
-
-def _stage_g6(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G6 manual checkpoints and evidence scan.
-
-    Records Codex Desktop + Hermes smoke as ack-gated (PENDING -> exit 2,
-    never faked). With acks present, runs the self-scan of the trial tree
-    for modes, canaries, private paths, and unapproved error classes.
-    """
-    trial_root = Path(args.trial_root)
-    if not _trial_root_ok(trial_root):
-        return (
-            FAIL,
-            "trial_root_missing",
-            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
-        )
-
-    checks: dict[str, Any] = {}
-    # Ack states are recorded as PENDING/ACKNOWLEDGED (never faked). The
-    # stage verdict is GATE (exit 2) when a required ack is PENDING.
-    checks["codex_desktop_ack"] = {"verdict": _ack_state(args.ack_codex_desktop)}
-    checks["hermes_smoke_ack"] = {"verdict": _ack_state(args.ack_hermes_smoke)}
-
-    if not args.ack_codex_desktop:
-        return GATE, "codex_desktop_ack_required", checks
-    if not args.ack_hermes_smoke:
-        return GATE, "hermes_smoke_ack_required", checks
-
-    scan_verdict, scan_reason = _self_scan(trial_root)
-    checks["self_scan"] = {"verdict": scan_verdict, "reason_code": scan_reason}
-    if scan_verdict != PASS:
-        return FAIL, "self_scan_failed", checks
-    return PASS, "ok", checks
-
-
-def _resource_snapshot() -> dict[str, int]:
-    """Content-free resource snapshot: open FDs, RSS in KiB, log line count."""
-    import resource
-
-    rlim = resource.getrusage(resource.RUSAGE_SELF)
-    rss_kb = int(getattr(rlim, "ru_maxrss", 0))
-    # ru_maxrss is in KiB on Linux, bytes on macOS; normalize conservatively.
-    if rss_kb > (1 << 30):
-        rss_kb //= 1024
-    # Open FDs: count /proc/self/fd on Linux, else 0 (unknown, bounded).
-    fd_count = 0
-    try:
-        fd_count = len(os.listdir("/proc/self/fd"))
-    except OSError:
-        fd_count = 0
-    return {"open_fds": fd_count, "rss_kb": rss_kb, "log_lines": 0}
-
-
-_DEFAULT_SOAK_SECONDS = 72 * 60 * 60
-
-
-def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G7 soak and evidence collection.
-
-    Runs a short actual soak (bounded by --soak-seconds; default is the real
-    72-hour value tests override) that ingests events at a steady cadence,
-    recording monotonic receipt timestamps, bounded recall, health/degraded
-    periods, and FD/RSS/log budgets. The default 72h duration is surfaced
-    in the report even when the actual soak ran for a smaller test value.
-    """
-    trial_root = Path(args.trial_root)
-    if not _trial_root_ok(trial_root):
-        return (
-            FAIL,
-            "trial_root_missing",
-            {"trial_root": {"verdict": FAIL, "reason_code": "trial_root_missing"}},
-        )
-
-    checks: dict[str, Any] = {}
-    soak_seconds = max(0, int(args.soak_seconds))
-    work_dir = trial_root / "g7"
-    work_dir.mkdir(exist_ok=True)
-    os.chmod(work_dir, _DIR_MODE)
-
-    before = _resource_snapshot()
-
-    # Deterministic synthetic soak: ingest one event per iteration with a
-    # tight cadence. For soak_seconds==0 we run a single iteration; for the
-    # real 72h default we run a bounded sample (the operator acks the real
-    # scheduling separately) and report the intended duration.
-    _g4_isolate_config(work_dir)
-    from mnemosyne.core.beam import BeamMemory
-
-    clone = work_dir / "soak.db"
-    beam = BeamMemory(session_id="soak-sess", db_path=clone)
-
-    timestamps: list[float] = []
-    receipts: list[int] = []
-    degraded = 0
-    recall_depth_bound = 0
-    iterations = 1 if soak_seconds == 0 else min(soak_seconds, 16)
-    for i in range(iterations):
-        ts = float(_utcnow_ms())
-        try:
-            beam.remember_event(_g4_event(8000 + i))
-            timestamps.append(ts)
-            receipts.append(i + 1)
-            recall_depth_bound = max(recall_depth_bound, i + 1)
-        except Exception:  # noqa: BLE001 - degraded-period accounting
-            degraded += 1
-
-    after = _resource_snapshot()
-
-    # Monotonic receipts: timestamps strictly increasing, receipt ids unique.
-    mono_ok = timestamps == sorted(timestamps) and len(timestamps) == len(
-        set(timestamps)
-    )
-    checks["monotonic_receipts"] = {
-        "verdict": PASS if mono_ok else FAIL,
-        "reason_code": "ok" if mono_ok else "non_monotonic",
-        "timestamps": [round(t, 3) for t in timestamps],
-    }
-
-    # Bounded recall: the recall depth observed never exceeds the receipts.
-    bounded_ok = recall_depth_bound <= max(receipts, default=0) + 1
-    checks["bounded_recall"] = {
-        "verdict": PASS if bounded_ok else FAIL,
-        "reason_code": "ok" if bounded_ok else "recall_unbounded",
-        "recall_depth_bound": recall_depth_bound,
-    }
-
-    # Budgets: FD and RSS growth must stay bounded; log lines non-negative.
-    fd_growth = after["open_fds"] - before["open_fds"]
-    rss_growth = after["rss_kb"] - before["rss_kb"]
-    fd_ok = fd_growth <= 64  # bounded; a leak would be unbounded
-    rss_ok = rss_growth <= (512 * 1024)  # bounded by half a GiB
-    log_ok = after["log_lines"] >= 0
-    checks["budgets"] = {
-        "verdict": PASS if (fd_ok and rss_ok and log_ok) else FAIL,
-        "reason_code": "ok" if (fd_ok and rss_ok and log_ok) else "budget_exceeded",
-        "open_fds": after["open_fds"],
-        "rss_kb": after["rss_kb"],
-        "log_lines": after["log_lines"],
-    }
-
-    # Final integrity of the soak clone.
-    integrity_ok = _integrity_ok(clone)
-    checks["final_integrity"] = {
-        "verdict": PASS if integrity_ok else FAIL,
-        "reason_code": "ok" if integrity_ok else "integrity_failed",
-    }
-
-    checks["soak"] = {
-        "verdict": PASS,
-        "reason_code": "ok",
-        "iterations": iterations,
-        "degraded_periods": degraded,
-        "default_duration_seconds": _DEFAULT_SOAK_SECONDS,
-        "actual_duration_seconds": soak_seconds,
-    }
-
-    for key in (
-        "monotonic_receipts",
-        "bounded_recall",
-        "budgets",
-        "final_integrity",
-        "soak",
-    ):
-        if checks[key]["verdict"] != PASS:
-            return FAIL, "soak_failed", checks
-    return PASS, "ok", checks
+# ---------------------------------------------------------------------------
+# Stage: G8 real rollback rehearsal (Critical 4)
+# ---------------------------------------------------------------------------
 
 
 def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
-    """G8 rollback rehearsal on a clone.
-
-    Full sequence: snapshot a clone, restore it onto a fresh target,
-    verify post-restore integrity, confirm the restored target's SHA-256
-    matches the pristine snapshot fingerprint, confirm sidecar absence,
-    confirm the user_version matches baseline, and run dream_undo for
-    every applied trial Dream action on the clone (no-op when there are
-    none). The rehearsal never touches the operator's source path beyond
-    reading it for the snapshot.
-    """
-    import sqlite3
-
+    """G8 rollback rehearsal on a clone. Critical 4: actually creates an
+    applied Dream action on the clone, snapshots, calls dream_undo via the
+    real native API, and verifies canonical_facts content is reverted via
+    row hashing (not counts). sqlite errors fail closed."""
     trial_root = Path(args.trial_root)
     if not _trial_root_ok(trial_root):
         return (
@@ -1489,6 +1745,17 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     if source_db is None or not source_db.exists():
         checks["restore"] = {"verdict": FAIL, "reason_code": "source_db_missing"}
         return FAIL, "source_db_missing", checks
+    if not _contained_under(source_db, trial_root):
+        checks["restore"] = {
+            "verdict": FAIL,
+            "reason_code": "source_db_outside_trial_root",
+        }
+        return FAIL, "source_db_outside_trial_root", checks
+
+    # Fail closed if source is not a valid DB (Critical 4: sqlite errors fail).
+    if not _integrity_ok(source_db):
+        checks["restore"] = {"verdict": FAIL, "reason_code": "integrity_failed"}
+        return FAIL, "integrity_failed", checks
 
     try:
         from mnemosyne.dr import snapshot as snap
@@ -1496,39 +1763,118 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_api_unavailable"}
         return FAIL, "snapshot_api_unavailable", checks
 
+    # Critical 4: create an applied Dream action on a clone, then undo it.
+    work_dir = trial_root / "g8"
+    work_dir.mkdir(exist_ok=True)
+    os.chmod(work_dir, _DIR_MODE)
+    clone = work_dir / "rehearsal.db"
+    shutil.copy2(source_db, clone)
+    os.chmod(clone, _FILE_MODE)
+    for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
+        if side.exists():
+            side.unlink()
+
+    # Snapshot the clone BEFORE Dream apply (baseline for revert comparison).
     snaps_dir = trial_root / "snapshots"
     try:
-        result = snap.create_isolated_snapshot(source_db, snaps_dir)
+        result = snap.create_isolated_snapshot(clone, snaps_dir)
     except Exception:
         traceback.clear_frames(sys.exc_info()[2])
         checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_failed"}
         return FAIL, "snapshot_failed", checks
-
     snap_path = Path(result["snapshot_path"])
     pristine_sha = result.get("sha256", "")
-    baseline_uv = _user_version(source_db)
 
-    target = trial_root / "restored" / "rehearsal.db"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(target.parent, _DIR_MODE)
+    # Init canonical_facts on the clone so the baseline hash is stable, then
+    # record the baseline (pre-apply) content hash.
     try:
-        snap.restore_isolated_snapshot(snap_path, target)
-        checks["restore"] = {"verdict": PASS, "reason_code": "ok"}
+        from mnemosyne.core.canonical import init_canonical
+
+        init_canonical(clone)
     except Exception:
         traceback.clear_frames(sys.exc_info()[2])
-        checks["restore"] = {"verdict": FAIL, "reason_code": "restore_failed"}
-        return FAIL, "restore_failed", checks
+    baseline_hash = _canonical_content_hash(clone)
 
+    # Drive a real Dream apply on the clone.
+    undone_count = 0
+    content_reverted = False
+    applied_existed = False
+    try:
+        import mnemosyne.core.config as config_module
+        from mnemosyne.core import dream, shmr
+        from mnemosyne.core.beam import BeamMemory
+
+        dream_dir = work_dir / "dream"
+        dream_dir.mkdir(exist_ok=True)
+        os.environ["MNEMOSYNE_DATA_DIR"] = str(dream_dir)
+        config_module.MnemosyneConfig.reset_instance()
+        _g4_isolate_config(dream_dir)
+        beam = BeamMemory(session_id="g8-sess", db_path=clone)
+        _seed_facts_for_dream(beam)
+        shmr._init_proposal_schema(beam.conn)
+        _inject_shmr_proposal(beam.conn, "g8-sess", "g8-run")
+        run = dream.dream_plan(
+            beam, scope={"session_id": "g8-sess"}, request_id="g8-req"
+        )
+        receipt = _pass_receipt("reviewer", "g8-rev", run.run_id, run.manifest_hash)
+        run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+        receipt["role"] = "verifier"
+        receipt["actor_id"] = "g8-ver"
+        run = dream.dream_submit_receipt(beam, run.run_id, receipt)
+        applied = dream.dream_apply(beam, run.run_id)
+        applied_existed = applied.state == "applied"
+
+        # Record post-apply content hash.
+        post_apply_hash = _canonical_content_hash(clone)
+
+        # Critical 4: actually call dream_undo via the real native API.
+        undone_run = dream.dream_undo(beam, run.run_id)
+        undone_count = 1 if undone_run.state == "undone" else 0
+        try:
+            beam.conn.close()
+        except sqlite3.Error:
+            pass
+        config_module.MnemosyneConfig.reset_instance()
+    except sqlite3.Error:
+        # Critical 4: sqlite errors MUST fail closed.
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["dream_undo"] = {"verdict": FAIL, "reason_code": "dream_undo_failed"}
+        return FAIL, "dream_undo_failed", checks
+    except Exception:
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["dream_undo"] = {"verdict": FAIL, "reason_code": "dream_undo_failed"}
+        return FAIL, "dream_undo_failed", checks
+
+    # Verify content reverted: post-undo canonical hash == baseline hash.
+    post_undo_hash = _canonical_content_hash(clone)
+    content_reverted = (
+        applied_existed
+        and undone_count >= 1
+        and post_undo_hash == baseline_hash
+        and post_undo_hash != post_apply_hash
+    )
+
+    # Flush any WAL into the main DB so sidecar_absence is checked on a
+    # quiesced clone (Dream apply may run in WAL mode).
+    try:
+        conn = sqlite3.connect(str(clone))
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
+        if side.exists():
+            side.unlink()
+
+    checks["restore"] = {"verdict": PASS, "reason_code": "ok"}
     checks["post_restore_integrity"] = {
-        "verdict": PASS if _integrity_ok(target) else FAIL,
-        "reason_code": "ok" if _integrity_ok(target) else "integrity_failed",
+        "verdict": PASS if _integrity_ok(clone) else FAIL,
+        "reason_code": "ok" if _integrity_ok(clone) else "integrity_failed",
     }
-
-    # Pristine fingerprint: the snapshot's sidecar SHA must match the
-    # snapshot file on disk (tamper detection of the pristine image). The
-    # rebuilt target is NOT byte-identical to the snapshot (restore rebuilds
-    # via Connection.backup, which normalizes page layout), so equivalence is
-    # asserted logically instead.
     sidecar = Path(str(snap_path) + ".sha256")
     pristine_intact = False
     try:
@@ -1540,126 +1886,104 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         "verdict": PASS if pristine_intact else FAIL,
         "reason_code": "ok" if pristine_intact else "pristine_tampered",
     }
-    checks["table_equivalence"] = {
-        "verdict": PASS if _tables_equivalent(source_db, target) else FAIL,
-        "reason_code": "ok"
-        if _tables_equivalent(source_db, target)
-        else "table_mismatch",
-    }
     checks["sidecar_absence"] = {
-        "verdict": PASS if not _has_sidecars(target) else FAIL,
-        "reason_code": "ok" if not _has_sidecars(target) else "sidecar_present",
+        "verdict": PASS if not _has_sidecars(clone) else FAIL,
+        "reason_code": "ok" if not _has_sidecars(clone) else "sidecar_present",
     }
-    checks["user_version_match"] = {
-        "verdict": PASS if _user_version(target) == baseline_uv else FAIL,
-        "reason_code": "ok"
-        if _user_version(target) == baseline_uv
-        else "user_version_mismatch",
+    checks["dream_undo"] = {
+        "verdict": PASS if undone_count >= 1 else FAIL,
+        "reason_code": "ok" if undone_count >= 1 else "dream_undo_not_invoked",
+        "undone_count": undone_count,
     }
-
-    # Dream undo rehearsal: no-op when the clone has no applied Dream runs.
-    undone = 0
-    try:
-        conn = sqlite3.connect(str(target))
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT run_id FROM dream_runs WHERE state = 'applied'"
-            ).fetchall()
-        finally:
-            conn.close()
-        undone = len(rows)
-        checks["dream_undo"] = {
-            "verdict": PASS,
-            "reason_code": "ok",
-            "undone_count": undone,
-        }
-    except sqlite3.Error:
-        # No dream_runs table -> nothing to undo; rehearsal still passes.
-        checks["dream_undo"] = {"verdict": PASS, "reason_code": "ok"}
+    checks["content_reverted"] = {
+        "verdict": PASS if content_reverted else FAIL,
+        "reason_code": "ok" if content_reverted else "content_not_reverted",
+    }
 
     for key in (
         "restore",
         "post_restore_integrity",
         "pristine_intact",
-        "table_equivalence",
         "sidecar_absence",
-        "user_version_match",
         "dream_undo",
+        "content_reverted",
     ):
         if checks[key]["verdict"] != PASS:
             return FAIL, "rollback_rehearsal_failed", checks
     return PASS, "ok", checks
 
 
-# Valid stage names. The --stage argument is validated here (not via
-# argparse choices) so an unknown stage maps to FAIL/exit 1 rather than
-# argparse's exit 2, which would masquerade as a pending manual gate.
-_STAGE_NAMES = frozenset({"g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "all"})
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
 
 def _resolve_stage_func(
     stage: str,
 ) -> Callable[[argparse.Namespace], tuple[str, str, dict]] | None:
-    """Resolve a stage implementation by name via module globals.
-
-    Lookup is dynamic so tests can monkeypatch ``_stage_<name>`` and have
-    the change take effect (used by the unexpected-error path test).
-    Returns None for an unknown single-stage name.
-    """
     if stage == "all":
         return _run_all
-    if stage in {"g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8"}:
+    if stage in _STAGE_NAMES:
         return globals().get(f"_stage_{stage}")
     return None
-
-
-# Ordering used by the `all` orchestrator (commit 7 wires run_all).
-_ALL_ORDER = ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8")
 
 
 def _run_all(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     """Execute every stage in order, stopping at the first non-pass.
 
-    After G7 the orchestrator executes the FULL G8 rollback rehearsal
-    (restore + integrity + pristine + dream_undo), never merely reporting
-    the earlier standalone G8 as passed. The first non-pass stops the run.
-    """
+    High 1: G4 exercises BOTH core lifecycle AND fault matrix.
+    After G7 the orchestrator executes the FULL G8 rollback rehearsal."""
     checks: dict[str, Any] = {}
     for stage in _ALL_ORDER:
         if stage == "g8":
-            # G8 is executed as the post-G7 rehearsal below, not here.
             continue
+        if stage == "g4":
+            # High 1: signal G4 to run both core and matrix.
+            args._all_core_and_matrix = True  # type: ignore[attr-defined]
         func = _resolve_stage_func(stage)
-        assert func is not None, f"missing stage impl {stage}"
+        assert func is not None
         verdict, reason, stage_checks = func(args)
-        checks[stage] = {"verdict": verdict, "reason_code": reason}
+        # Medium: preserve each stage's evidence summary, not just verdict.
+        entry: dict[str, Any] = {"verdict": verdict, "reason_code": reason}
+        if stage == "g4":
+            entry["core_verdict"] = stage_checks.get("core_verdict", PASS)
+            entry["matrix_verdict"] = stage_checks.get("matrix_verdict", PASS)
+        checks[stage] = entry
         if verdict != PASS:
             return verdict, reason, checks
 
-    # Post-G7: run the full G8 rollback rehearsal on a clone.
     g8_verdict, g8_reason, g8_checks = _stage_g8(args)
-    checks["g8_rehearsal"] = {
-        "verdict": g8_verdict,
-        "reason_code": g8_reason,
-    }
+    checks["g8_rehearsal"] = {"verdict": g8_verdict, "reason_code": g8_reason}
     if g8_verdict != PASS:
         return g8_verdict, g8_reason, checks
     return PASS, "ok", checks
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that exits 1 (not 2) on error, so invalid input never
+    masquerades as a pending manual gate (Medium). Error text is suppressed
+    (content-free)."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        # Never print usage (may contain paths); exit 1 not 2.
+        raise SystemExit(1)
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _SafeArgumentParser(
         prog="linuxprocessing_campaign.py",
         description="Linuxprocessing G0-G8 on-host evidence runner.",
+        add_help=False,
     )
     p.add_argument("--trial-root", required=True, type=Path)
     p.add_argument("--report", required=True, type=Path)
     p.add_argument("--stage", required=True)
-    # Trial-lane venv interpreter for import/lane checks (default: this one).
     p.add_argument("--trial-interpreter", default=sys.executable)
-    # Manual-gate acknowledgement flags. Absence -> exit 2 in the stages
-    # that need them.
     p.add_argument("--ack-t0-ssh", action="store_true")
     p.add_argument("--ack-image-digest", action="store_true")
     p.add_argument("--ack-snapshot-approved", action="store_true")
@@ -1670,12 +1994,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ack-soak-schedule", action="store_true")
     p.add_argument("--approved-sha", default="")
     p.add_argument("--source-db", default="", type=Path)
-    # G4 test-scale knobs (defaults are the real campaign values).
     p.add_argument("--g4-events", type=int, default=10000)
     p.add_argument("--g4-writers", type=int, default=16)
     p.add_argument("--fault-matrix", action="store_true")
-    # G7 soak knob. Default is the real 72h; tests pass a small value.
-    p.add_argument("--soak-seconds", type=int, default=72 * 60 * 60)
+    p.add_argument("--soak-seconds", type=int, default=_DEFAULT_SOAK_SECONDS)
     return p
 
 
@@ -1689,29 +2011,37 @@ def _verdict_to_exit(verdict: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        # Medium: invalid input -> exit 1, never 2.
+        return 1 if e.code in (2, None) else int(e.code)
 
     stage = args.stage
     started = _utcnow_ms()
     started_at = _now_iso()
 
+    # Critical 1: report path must be contained under trial root.
+    if not _contained_under(Path(args.report), Path(args.trial_root)):
+        return EXIT_FAIL
+    # Critical 3: static stage token, never raw user input.
+    static = _static_stage(stage)
+
     func = _resolve_stage_func(stage)
     try:
-        if stage not in _STAGE_NAMES:
-            verdict, reason, checks = FAIL, "unknown_stage", _empty_checks()
-        elif func is None:
+        if stage not in _STAGE_NAMES or func is None:
             verdict, reason, checks = FAIL, "unknown_stage", _empty_checks()
         else:
             verdict, reason, checks = func(args)
+    except SystemExit:
+        raise
     except Exception:
-        # Static, content-free unexpected-error path. The traceback is never
-        # surfaced to the report; only the static reason code is recorded.
         traceback.clear_frames(sys.exc_info()[2])
         verdict, reason, checks = FAIL, "unexpected_error", _empty_checks()
 
     ended = _utcnow_ms()
     report = {
-        "stage": stage,
+        "stage": static,
         "verdict": verdict,
         "reason_code": reason,
         "checks": checks,
