@@ -1402,6 +1402,7 @@ class TestBoundedDegradationObservabilityI3:
         def _boom(conn, query_embedding, k=20):
             raise RuntimeError("synthetic backend failure")
 
+        monkeypatch.setattr(beam_mod, "_vec_search", _boom)
         monkeypatch.setattr(beam_mod, "_in_memory_vec_search", _boom)
         with caplog.at_level(logging.INFO, logger="mnemosyne.core.recall_bounded"):
             env = beam.recall_bounded(
