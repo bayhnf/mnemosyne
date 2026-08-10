@@ -124,12 +124,18 @@ def _build_mcp_server() -> Server:
             result = handle_tool_call(params.name, params.arguments or {})
             content = [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
             return CallToolResult(content=content)
-        except Exception as e:
+        except Exception:
             # SDK 2.x contract: return a CallToolResult with is_error=True so
             # clients can distinguish implementation failures from successful
-            # calls. Preserves the existing error payload shape for backward
-            # compatibility with any caller already parsing the error content.
-            content = [TextContent(type="text", text=json.dumps({"status": "error", "message": str(e)}, indent=2))]
+            # calls. The error message is a static literal so exception text
+            # or class names can never reach the client envelope.
+            content = [TextContent(
+                type="text",
+                text=json.dumps(
+                    {"status": "error", "message": "tool_call_failed"},
+                    indent=2,
+                ),
+            )]
             return CallToolResult(content=content, is_error=True)
 
     return Server(

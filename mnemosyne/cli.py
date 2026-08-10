@@ -2115,7 +2115,7 @@ _DREAM_USAGE = (
 )
 
 
-def cmd_dream(args):
+def _cmd_dream_impl(args):
     """Native Dream lifecycle CLI.
 
     Subcommands map to the dream core module: plan, review, verify, status,
@@ -2309,6 +2309,55 @@ def cmd_dream(args):
             _fail("--run-id is required for dream undo")
         run = mem.dream_undo(run_id)
         _dream_emit_and_exit(run, label="undo", json_output=json_output)
+
+
+_STATIC_DREAM_BOUNDARY_PROJECTION = {
+    "run_id": "",
+    "state": "failed_terminal",
+    "manifest_hash": "",
+    "checkpoint": "",
+    "error_code": "integrity_failure",
+    "created_at": "",
+    "updated_at": "",
+    "request_id": None,
+    "action_count": 0,
+    "receipt_counts": {},
+}
+
+
+def _emit_static_dream_boundary_failure(args) -> None:
+    """Emit a content-free static Dream failure projection and exit 1.
+
+    Self-contained: never calls ``_dream_run_projection`` (which may itself be
+    the fault source). If ``--json`` is present in ``args``, emit the static
+    projection JSON; otherwise print a single safe text line. A write failure
+    is suppressed so the boundary never re-raises on output.
+    """
+    try:
+        if isinstance(args, list) and "--json" in args:
+            print(json.dumps(_STATIC_DREAM_BOUNDARY_PROJECTION))
+        else:
+            print("Dream error: integrity_failure")
+    except Exception:
+        pass
+    raise SystemExit(1)
+
+
+def cmd_dream(args):
+    """Public Dream CLI boundary.
+
+    Delegates to :func:`_cmd_dream_impl`. Ordinary usage exits (including
+    ``SystemExit`` from ``_dream_emit_and_exit``) are re-raised unchanged.
+    Any other ``Exception`` that escapes the impl -- a memory construction
+    fault or a projection failure -- is funneled to the static failure emitter
+    so no traceback or canary reaches combined output.
+    """
+    try:
+        return _cmd_dream_impl(args)
+    except SystemExit:
+        raise
+    except Exception:
+        _emit_static_dream_boundary_failure(args)
 
 
 
