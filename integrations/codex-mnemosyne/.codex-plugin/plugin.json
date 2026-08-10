@@ -1,0 +1,32 @@
+{
+  "name": "codex-mnemosyne",
+  "version": "0.1.0",
+  "description": "Mnemosyne primary-memory integration for Codex. Hooks SessionStart, UserPromptSubmit, Stop, and SessionEnd to durable native ingest and bounded recall. Built-in Codex memory stays disabled; Mnemosyne is the sole persistent memory provider.",
+  "author": {
+    "name": "Mnemosyne Contributors",
+    "url": "https://github.com/mnemosyne-oss/mnemosyne"
+  },
+  "repository": "https://github.com/mnemosyne-oss/mnemosyne",
+  "license": "MIT",
+  "keywords": ["memory", "mnemosyne", "persistent-memory", "recall", "codex"],
+  "interface": {
+    "displayName": "Mnemosyne Memory",
+    "shortDescription": "Persistent cross-session memory via Mnemosyne native ingest and bounded recall",
+    "longDescription": "Hooks Codex's lifecycle (SessionStart, UserPromptSubmit, Stop, SessionEnd) to Mnemosyne's durable native ingest and bounded recall. The adapter is fail-open for Codex; memory failures surface as visible non-sensitive warnings. Uses a 0600 transport-only spool for failed delivery and never parses transcripts. Mnemosyne remains the sole persistent memory provider.",
+    "developerName": "Mnemosyne Contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Durable event ingest with stable event IDs",
+      "Bounded recall context injection",
+      "Post-compact session re-hydration",
+      "Fail-open with visible structured failure reporting",
+      "Transport-only 0600 spool with ack-based deletion"
+    ],
+    "defaultPrompt": [
+      "What do you remember about my preferences?",
+      "Recall relevant project context."
+    ],
+    "websiteURL": "https://github.com/mnemosyne-oss/mnemosyne",
+    "brandColor": "#7C3AED"
+  }
+}
