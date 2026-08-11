@@ -42,13 +42,54 @@ def embeddings_mod(monkeypatch):
     # The PREFIXES are read at call time by the patch, so no reload is ever
     # needed for prefix changes (see test_unset_prefixes_unchanged).
     original_module_state = dict(embeddings.__dict__)
-    importlib.reload(embeddings)
     try:
+        importlib.reload(embeddings)
         yield embeddings
     finally:
         embeddings.__dict__.clear()
         embeddings.__dict__.update(original_module_state)
         server.shutdown()
+
+
+def test_embeddings_fixture_cleans_up_if_reload_fails(monkeypatch):
+    from mnemosyne.core import embeddings
+
+    class FakeServer:
+        server_port = 12345
+
+        def __init__(self):
+            self.shutdown_called = False
+
+        def serve_forever(self):
+            pass
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    server = FakeServer()
+    original_module_state = dict(embeddings.__dict__)
+
+    def failing_reload(module):
+        module.__fixture_reload_poison__ = True
+        raise RuntimeError("synthetic reload failure")
+
+    monkeypatch.setitem(
+        globals(), "HTTPServer", lambda *_args, **_kwargs: server
+    )
+    monkeypatch.setattr(importlib, "reload", failing_reload)
+    generator = embeddings_mod.__wrapped__(monkeypatch)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic reload failure"):
+            next(generator)
+        assert server.shutdown_called
+        assert not hasattr(embeddings, "__fixture_reload_poison__")
+    finally:
+        # Preserve test-process isolation while the current implementation
+        # still leaks state during RED.
+        generator.close()
+        embeddings.__dict__.clear()
+        embeddings.__dict__.update(original_module_state)
+
 
 def test_query_prefix_byte_exact(embeddings_mod):
     # No cache manipulation: the cache is keyed on the PREFIXED text, so prefix
