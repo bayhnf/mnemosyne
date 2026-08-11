@@ -550,12 +550,19 @@ def test_provider_audit_unavailable_after_record_failure_emits_static_diagnostic
 
     with caplog.at_level(logging.DEBUG, logger=module.logger.name):
         provider._audit_event("remember")           # trips the failure
+        caplog.clear()
         provider._audit_event("remember")           # must short-circuit
 
     fields = _all_log_fields(caplog.records)
     assert provider._audit.healthy is False
     # Second event must emit the static audit_unavailable diagnostic.
-    assert fields.count("audit: event_dropped reason=audit_unavailable") >= 1
+    unavailable_records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "audit: event_dropped reason=audit_unavailable"
+    ]
+    assert len(unavailable_records) == 1
+    assert unavailable_records[0].levelno >= logging.WARNING
     # The canaries (path or exception text) must never appear.
     assert path_canary not in fields
     assert record_canary not in fields

@@ -1005,6 +1005,7 @@ class TestPluginLoadFailureIsContentFree:
         secret_token = "plugin-failure-secret-canary-4242"
         with tempfile.TemporaryDirectory() as tmpdir:
             plugin_file = Path(tmpdir) / "boom.py"
+            plugin_basename = plugin_file.name
             plugin_file.write_text(f"raise RuntimeError('{secret_token}')\n")
             mgr = PluginManager(plugin_dir=Path(tmpdir))
             with caplog.at_level(logging.WARNING, logger="mnemosyne.core.plugins"):
@@ -1020,5 +1021,9 @@ class TestPluginLoadFailureIsContentFree:
         joined = "\n".join(fields)
         # The temporary path (which contains the test tmpdir) must not be logged.
         assert tmpdir not in joined
+        # The plugin basename must not be logged either.
+        assert plugin_basename not in joined
+        assert "plugin: load_failed reason=RuntimeError" in joined
+        assert "plugin: load_failed file=" not in joined
         # The exception text must not be logged.
         assert secret_token not in joined

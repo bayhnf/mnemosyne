@@ -970,7 +970,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
         if self._audit is None or not self._audit.healthy:
-            logger.debug("audit: event_dropped reason=audit_unavailable")
+            logger.warning("audit: event_dropped reason=audit_unavailable")
             return
         kwargs.setdefault("profile", getattr(self, "_agent_identity", None) or "")
         kwargs.setdefault("session_id", self._session_id)

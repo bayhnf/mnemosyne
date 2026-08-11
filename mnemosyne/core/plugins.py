@@ -650,8 +650,8 @@ class PluginManager:
                 if created and sys.modules.get(module_key) is module:
                     del sys.modules[module_key]
                 logger.warning(
-                    "plugin: load_failed file=%s reason=%s",
-                    file_path.name, type(exc).__name__,
+                    "plugin: load_failed reason=%s",
+                    type(exc).__name__,
                 )
 
         return discovered
