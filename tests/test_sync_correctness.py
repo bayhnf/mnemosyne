@@ -576,7 +576,7 @@ def test_blind_relay_rejects_unauthenticated_structural_ciphertext(memory):
 
     assert result["accepted"] == 0
     assert result["errors"] == 1
-    assert "authenticated transport" in result["details"][0]
+    assert result["details"] == ["invalid_event"]
     assert result["acknowledged_event_ids"] == []
     assert engine.conn.execute(
         "SELECT COUNT(*) FROM memory_events WHERE event_id = 'unauthenticated-poison'"
@@ -1204,6 +1204,70 @@ def create_event():
         }
 
     return _make
+
+
+def test_push_changes_details_are_static(sync_engine, monkeypatch, create_event):
+    event = create_event(content="safe")
+    event["event_id"] = "event-id-canary"
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("SYNC-CANARY /secret/db.sqlite schema_x")
+
+    monkeypatch.setattr(sync_engine, "_apply_memory_event", _boom)
+    result = sync_engine.push_changes([event])
+
+    assert result["details"] == ["apply_failed"]
+    assert "event-id-canary" not in "".join(result["details"])
+
+
+def test_push_changes_validation_details_are_static(memory, create_event):
+    engine = SyncEngine(
+        memory,
+        device_id="receiver",
+        relay_mode=True,
+        require_encryption=True,
+        allow_unscoped_sync=True,
+    )
+
+    invalid_operation = create_event(content="safe")
+    invalid_operation["operation"] = "EXPLODE"
+
+    future_timestamp = create_event(content="safe")
+    future_timestamp["timestamp"] = (
+        datetime.now(timezone.utc) + timedelta(hours=1)
+    ).isoformat()
+
+    mismatched_hash = create_event(content="safe")
+    mismatched_hash["event_hash"] = "f" * 64
+
+    plaintext_event = create_event(content="safe")
+    plaintext_payload = create_event(content="safe")
+    plaintext_payload["_transport_authenticated"] = True
+
+    for event in (
+        invalid_operation,
+        future_timestamp,
+        mismatched_hash,
+        plaintext_event,
+        plaintext_payload,
+    ):
+        result = engine.push_changes([event])
+        assert result["errors"] == 1
+        assert result["details"] == ["invalid_event"]
+        assert "canary" not in "".join(result["details"]).lower()
+
+    surface_engine = SyncEngine(
+        memory,
+        device_id="receiver",
+        surface_only=True,
+        initialize_surface=True,
+    )
+    wrong_surface = create_event(content="safe")
+    wrong_surface["surface_id"] = "other-surface-v1"
+    result = surface_engine.push_changes([wrong_surface])
+    assert result["errors"] == 1
+    assert result["details"] == ["invalid_event"]
+    assert "canary" not in "".join(result["details"]).lower()
 
 
 def test_push_changes_counts_failed_embedding_preparation(

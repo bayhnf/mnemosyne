@@ -1582,7 +1582,10 @@ class SyncEngine:
                 return None, True
             return vector, False
         except Exception as exc:
-            logger.warning("sync embedding preparation failed: %s", exc)
+            logger.warning(
+                "sync_embedding_preparation_failed exception=%s",
+                type(exc).__name__,
+            )
             return None, True
 
     def _apply_memory_event(
@@ -1731,7 +1734,10 @@ class SyncEngine:
                 )
             except Exception as exc:
                 vector_degraded = True
-                logger.warning("sync embedding storage failed for %s: %s", event.memory_id, exc)
+                logger.warning(
+                    "sync_embedding_storage_failed exception=%s",
+                    type(exc).__name__,
+                )
 
         normalized_payload = self._working_payload(event.memory_id) or payload
         fingerprint = self._payload_fingerprint(normalized_payload)
@@ -1779,6 +1785,10 @@ class SyncEngine:
                     and raw.get("_transport_authenticated") is not True
                 ):
                     raise ValueError("blind relay requires authenticated transport")
+                if self.require_encryption and not self._payload_looks_encrypted(
+                    raw.get("payload") or ""
+                ):
+                    raise ValueError("plaintext payload rejected because encryption is required")
                 event = SyncEvent.from_dict(raw)
                 if not event.event_id or not event.memory_id or not event.device_id:
                     raise ValueError("event_id, memory_id, and device_id are required")
@@ -1815,9 +1825,9 @@ class SyncEngine:
                         raise ValueError("pending retry does not match the stored event")
                     event = stored_event
                 incoming.append((event, existing_state == "pending"))
-            except Exception as exc:
+            except Exception:
                 stats["errors"] += 1
-                stats["details"].append(f"invalid event: {exc}")
+                stats["details"].append("invalid_event")
 
         incoming.sort(key=lambda item: _event_sort_key(item[0]))
         total = len(incoming)
@@ -1877,8 +1887,10 @@ class SyncEngine:
             except Exception as exc:
                 self.conn.rollback()
                 stats["errors"] += 1
-                stats["details"].append(f"event {event.event_id}: {exc}")
-                logger.warning("Failed to apply event %s: %s", event.event_id, exc)
+                stats["details"].append("apply_failed")
+                logger.warning(
+                    "sync_apply_failed exception=%s", type(exc).__name__
+                )
 
         return stats
 

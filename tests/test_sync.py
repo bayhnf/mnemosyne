@@ -277,7 +277,7 @@ def test_sync_server_rejects_forged_hs256_jwt_signature():
         _request_sync_status_with_jwt(token)
 
     assert exc.value.code == 401
-    assert "invalid JWT signature" in exc.value.read().decode("utf-8")
+    assert json.loads(exc.value.read())["error"] == "jwt_invalid"
 
 
 def test_sync_server_rejects_unsupported_jwt_algorithm():
@@ -291,7 +291,7 @@ def test_sync_server_rejects_unsupported_jwt_algorithm():
         _request_sync_status_with_jwt(token)
 
     assert exc.value.code == 401
-    assert "unsupported JWT algorithm" in exc.value.read().decode("utf-8")
+    assert json.loads(exc.value.read())["error"] == "jwt_invalid"
 
 
 def test_sync_server_rejects_malformed_jwt_signature_cleanly():
@@ -304,7 +304,7 @@ def test_sync_server_rejects_malformed_jwt_signature_cleanly():
         _request_sync_status_with_jwt(token)
 
     assert exc.value.code == 401
-    assert "invalid JWT signature" in exc.value.read().decode("utf-8")
+    assert json.loads(exc.value.read())["error"] == "jwt_invalid"
 
 
 def test_sync_server_accepts_valid_hs256_jwt():
@@ -323,6 +323,7 @@ def test_sync_server_rejects_expired_jwt():
         _request_sync_status_with_jwt(token)
 
     assert exc.value.code == 401
+    assert json.loads(exc.value.read())["error"] == "jwt_invalid"
 
 
 def test_e2e_plaintext_sync():

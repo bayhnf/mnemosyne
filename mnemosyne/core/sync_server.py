@@ -89,13 +89,13 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(content_length)
             self._last_raw_body = raw
             return json.loads(raw.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             self._body_error_sent = True
-            self._send_error(400, f"Invalid JSON body: {e}")
+            self._send_error(400, "invalid_json")
             return None
-        except Exception as e:
+        except Exception:
             self._body_error_sent = True
-            self._send_error(400, f"Failed to read body: {e}")
+            self._send_error(400, "invalid_body")
             return None
 
     @staticmethod
@@ -178,8 +178,8 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
             try:
                 self._validate_jwt(auth[7:])
                 return True
-            except ValueError as e:
-                self._send_error(401, f"JWT validation failed: {e}")
+            except ValueError:
+                self._send_error(401, "jwt_invalid")
                 return False
 
         return True  # No auth configured
@@ -212,7 +212,7 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = self._parse_path(self.path)
         if parsed is None:
-            self._send_error(404, f"Not found: {self.path}")
+            self._send_error(404, "not_found")
             return
 
         endpoint, _ = parsed
@@ -222,13 +222,13 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         elif endpoint == "/sync/push":
             self._handle_push()
         else:
-            self._send_error(404, f"Not found: {self.path}")
+            self._send_error(404, "not_found")
 
     # --- GET /healthz or /sync/status ---
     def do_GET(self) -> None:
         parsed = self._parse_path(self.path)
         if parsed is None:
-            self._send_error(404, f"Not found: {self.path}")
+            self._send_error(404, "not_found")
             return
 
         endpoint, _ = parsed
@@ -238,7 +238,7 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         elif endpoint == "/sync/status":
             self._handle_status()
         else:
-            self._send_error(404, f"Not found: {self.path}")
+            self._send_error(404, "not_found")
 
     @staticmethod
     def _parse_path(path: str):
@@ -284,9 +284,9 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
                 since_cursor=since, limit=limit, device_id=device_id
             )
             self._send_json(200, result)
-        except Exception as e:
-            logger.exception("Error in pull_changes")
-            self._send_error(500, f"Pull failed: {e}")
+        except Exception as exc:
+            logger.error("sync_pull_failed exception=%s", type(exc).__name__)
+            self._send_error(500, "pull_failed")
 
     def _handle_push(self) -> None:
         """Handle POST /sync/push — accept and apply events."""
@@ -323,9 +323,9 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         try:
             result = self.sync_engine.push_changes(authenticated_events)
             self._send_json(200, result)
-        except Exception as e:
-            logger.exception("Error in push_changes")
-            self._send_error(500, f"Push failed: {e}")
+        except Exception as exc:
+            logger.error("sync_push_failed exception=%s", type(exc).__name__)
+            self._send_error(500, "push_failed")
 
     def _handle_status(self) -> None:
         """Handle GET /sync/status — return server sync stats."""
@@ -339,9 +339,9 @@ class SyncHTTPHandler(BaseHTTPRequestHandler):
         try:
             status = self.sync_engine.get_status()
             self._send_json(200, status)
-        except Exception as e:
-            logger.exception("Error in get_status")
-            self._send_error(500, f"Status failed: {e}")
+        except Exception as exc:
+            logger.error("sync_status_failed exception=%s", type(exc).__name__)
+            self._send_error(500, "status_failed")
 
 
 def run_sync_server(

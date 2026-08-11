@@ -11,6 +11,70 @@ from mnemosyne.cli import _read_secret_file
 from mnemosyne.core.memory import Mnemosyne
 from mnemosyne.core.sync_server import run_sync_server
 
+CANARY_TOKENS = ("SYNC-CANARY", "/secret/", "db.sqlite", "schema_x")
+
+
+class _ExplodingSyncEngine:
+    """Server-side engine that fails with a privacy canary payload."""
+
+    def pull_changes(self, **_kwargs):
+        raise RuntimeError("SYNC-CANARY /secret/db.sqlite schema_x")
+
+    def push_changes(self, events):
+        raise RuntimeError("SYNC-CANARY /secret/db.sqlite schema_x")
+
+    def get_status(self):
+        raise RuntimeError("SYNC-CANARY /secret/db.sqlite schema_x")
+
+
+@pytest.fixture
+def sync_server(tmp_path):
+    memory = Mnemosyne(db_path=tmp_path / "server.db")
+    server = run_sync_server(
+        host="127.0.0.1",
+        port=0,
+        beam_instance=memory,
+        daemon=True,
+        initialize_surface=True,
+    )
+    server.RequestHandlerClass.sync_engine = _ExplodingSyncEngine()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def test_sync_server_errors_are_content_free(sync_server, caplog):
+    import urllib.error
+    import urllib.request
+
+    remote = f"http://127.0.0.1:{sync_server.server_address[1]}"
+    requests = [
+        ("/sync/pull", "pull_failed", json.dumps({}).encode()),
+        ("/sync/push", "push_failed", json.dumps({"events": []}).encode()),
+        ("/sync/status", "status_failed", None),
+    ]
+
+    for path, code, body in requests:
+        request = urllib.request.Request(
+            f"{remote}{path}",
+            data=body,
+            method="POST" if body is not None else "GET",
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request, timeout=5)
+        assert error.value.code == 500
+        response_body = error.value.read().decode("utf-8")
+        assert json.loads(response_body)["error"] == code
+        for token in CANARY_TOKENS:
+            assert token not in response_body
+
+    assert "Traceback" not in caplog.text
+    for record in caplog.records:
+        for token in CANARY_TOKENS:
+            assert token not in record.getMessage()
+            assert token not in repr(record.args)
+            assert token not in (record.exc_text or "")
+
 
 def test_top_level_sync_help_lists_required_db_path(monkeypatch, capsys):
     from mnemosyne import cli
@@ -326,7 +390,7 @@ def test_server_rejects_oversized_and_invalid_json_once(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as invalid_error:
             urllib.request.urlopen(invalid, timeout=5)
         assert invalid_error.value.code == 400
-        assert "Invalid JSON" in json.loads(invalid_error.value.read())["error"]
+        assert json.loads(invalid_error.value.read())["error"] == "invalid_json"
 
         invalid_limit_body = b'{"limit": 0}'
         invalid_limit_headers = dict(headers)
@@ -395,10 +459,7 @@ def test_relay_rejects_plaintext_events_by_default(tmp_path):
             result = json.loads(response.read())
         assert result["accepted"] == 0
         assert result["errors"] == 1
-        assert any(
-            word in result["details"][0].lower()
-            for word in ("plaintext", "encrypt")
-        )
+        assert result["details"] == ["invalid_event"]
         assert relay.beam.conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0] == 0
         assert relay.beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
     finally:
