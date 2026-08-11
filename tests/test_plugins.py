@@ -785,6 +785,29 @@ class TestPluginDiscovery:
                 == 1
             )
 
+    def test_discovery_rediscovery_keeps_imported_class_registered(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_file = Path(tmpdir) / "my_plugin.py"
+            plugin_file.write_text(
+                "from mnemosyne.core.plugins import MnemosynePlugin\n"
+                "class MyPlugin(MnemosynePlugin):\n"
+                "    name = 'myplugin'\n"
+                "    def on_remember(self, memory): pass\n"
+                "    def on_recall(self, memory): pass\n"
+                "    def on_consolidate(self, summary): pass\n"
+                "    def on_invalidate(self, memory_id): pass\n"
+            )
+            manager = PluginManager(plugin_dir=Path(tmpdir))
+            assert manager.discover_plugins() == ["myplugin"]
+            module_key = next(
+                key
+                for key in sys.modules
+                if key.startswith("_mnemosyne_user_plugin_my_plugin_")
+            )
+            manager.discover_plugins()
+            imported = importlib.import_module(module_key)
+            assert imported.MyPlugin is manager._registry["myplugin"]
+
 
 # ============================================================================
 # Global Manager

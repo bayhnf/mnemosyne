@@ -586,19 +586,23 @@ class PluginManager:
                 continue
             module_key = ""
             module = None
+            created = False
             try:
                 digest = hashlib.sha256(
                     f"{file_path.resolve()}:{file_path.stem}".encode("utf-8")
                 ).hexdigest()
                 module_key = f"_mnemosyne_user_plugin_{file_path.stem}_{digest}"
-                spec = importlib.util.spec_from_file_location(
-                    module_key, str(file_path)
-                )
-                if spec is None or spec.loader is None:
-                    continue
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[module_key] = module
-                spec.loader.exec_module(module)
+                module = sys.modules.get(module_key)
+                if module is None:
+                    spec = importlib.util.spec_from_file_location(
+                        module_key, str(file_path)
+                    )
+                    if spec is None or spec.loader is None:
+                        continue
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_key] = module
+                    created = True
+                    spec.loader.exec_module(module)
 
                 for attr_name in dir(module):
                     obj = getattr(module, attr_name)
@@ -613,7 +617,7 @@ class PluginManager:
                             self.register_plugin(plugin_name, obj)
                             discovered.append(plugin_name)
             except Exception as exc:
-                if module is not None and sys.modules.get(module_key) is module:
+                if created and sys.modules.get(module_key) is module:
                     del sys.modules[module_key]
                 logger.warning("Failed to load plugin from %s: %s", file_path, exc)
 
