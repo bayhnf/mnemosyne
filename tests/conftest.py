@@ -223,3 +223,9 @@ def _restore_hermes_module_cache():
             ):
                 sys.modules.pop(name, None)
         sys.modules.update(saved)
+        for name, module in saved.items():
+            parent_name, _, child_name = name.rpartition(".")
+            if parent_name:
+                parent = sys.modules.get(parent_name)
+                if parent is not None:
+                    setattr(parent, child_name, module)
