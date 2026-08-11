@@ -587,7 +587,7 @@ def test_remote_status_response_is_bounded(tmp_path, monkeypatch):
 
     status = engine.get_status(remote_url="https://relay.invalid")
 
-    assert "exceeds configured size limit" in status["remote_error"]
+    assert status["remote_error"] == "transport_error"
 
 
 def test_remote_status_is_authenticated_and_read_only(tmp_path):
@@ -623,3 +623,120 @@ def test_remote_status_is_authenticated_and_read_only(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# --------------------------------------------------------------------------
+# R4-B: client transport results must be content-free
+# --------------------------------------------------------------------------
+
+def test_sync_with_http_error_omits_remote_body(tmp_path):
+    """sync_with must keep only http_status=<code>; never the remote body."""
+    import http.server
+    import socketserver
+    import threading
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    class CanaryHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = b"SYNC-CANARY /secret/db.sqlite schema_x"
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), CanaryHandler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    memory = Mnemosyne(db_path=tmp_path / "client-http-error.db")
+    engine = SyncEngine(memory, device_id="client", allow_unscoped_sync=True)
+    engine.log_event("m-canary", "CREATE", payload={"content": "trigger push"})
+    try:
+        result = engine.sync_with(
+            f"http://127.0.0.1:{port}", mode="push", api_key="k"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    joined = " ".join(result["errors"])
+    assert "http_status=503" in joined
+    for token in CANARY_TOKENS:
+        assert token not in str(result)
+
+
+def test_sync_with_generic_exception_is_static_transport_error(tmp_path, monkeypatch):
+    """Non-HTTP transport failures must collapse to a static transport_error."""
+    import urllib.request
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("SYNC-CANARY /secret/db.sqlite schema_x")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    memory = Mnemosyne(db_path=tmp_path / "client-transport.db")
+    engine = SyncEngine(memory, device_id="client", allow_unscoped_sync=True)
+    engine.log_event("m-canary", "CREATE", payload={"content": "trigger push"})
+
+    result = engine.sync_with("http://127.0.0.1:1", mode="push", api_key="k")
+
+    assert result["errors"] == ["transport_error"]
+    for token in CANARY_TOKENS:
+        assert token not in str(result)
+
+
+def test_get_status_http_error_keeps_only_status_code(tmp_path, monkeypatch):
+    """get_status must distinguish HTTPError (status-only) from other failures."""
+    import urllib.error
+    import urllib.request
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    def _http_error(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            url="https://relay.invalid/sync/status",
+            code=503,
+            msg="SYNC-CANARY /secret/db.sqlite",
+            hdrs=None,
+            fp=None,
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _http_error)
+    memory = Mnemosyne(db_path=tmp_path / "status-http-error.db")
+    engine = SyncEngine(memory, device_id="client")
+
+    status = engine.get_status(remote_url="https://relay.invalid")
+
+    assert status["remote_error"] == "http_error http_status=503"
+    for token in CANARY_TOKENS:
+        assert token not in str(status)
+
+
+def test_get_status_generic_failure_is_static_transport_error(tmp_path, monkeypatch):
+    """get_status non-HTTP failures must be a static transport_error."""
+    import urllib.request
+
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.sync import SyncEngine
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("SYNC-CANARY /secret/db.sqlite schema_x")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    memory = Mnemosyne(db_path=tmp_path / "status-transport.db")
+    engine = SyncEngine(memory, device_id="client")
+
+    status = engine.get_status(remote_url="https://relay.invalid")
+
+    assert status["remote_error"] == "transport_error"
+    for token in CANARY_TOKENS:
+        assert token not in str(status)

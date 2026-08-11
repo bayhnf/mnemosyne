@@ -2004,16 +2004,9 @@ class SyncEngine:
                         self._read_bounded_http_response(response).decode("utf-8")
                     )
             except _error.HTTPError as exc:
-                body_text = (
-                    self._read_bounded_http_response(exc).decode(
-                        "utf-8", errors="replace"
-                    )
-                    if exc.fp
-                    else str(exc)
-                )
-                result["errors"].append(f"HTTP {exc.code} on {endpoint}: {body_text}")
-            except Exception as exc:
-                result["errors"].append(f"{endpoint}: {exc}")
+                result["errors"].append(f"http_error http_status={exc.code}")
+            except Exception:
+                result["errors"].append("transport_error")
             return None
 
         page_size = 1000
@@ -2257,6 +2250,7 @@ class SyncEngine:
                 result["last_sync"] = last_sync
             try:
                 import urllib.request as _request
+                import urllib.error as _error
 
                 headers = {"Accept": "application/json"}
                 if api_key:
@@ -2270,7 +2264,9 @@ class SyncEngine:
                     result["remote_status"] = json.loads(
                         self._read_bounded_http_response(response).decode("utf-8")
                     )
-            except Exception as exc:
-                result["remote_error"] = str(exc)
+            except _error.HTTPError as exc:
+                result["remote_error"] = f"http_error http_status={exc.code}"
+            except Exception:
+                result["remote_error"] = "transport_error"
 
         return result
