@@ -440,8 +440,8 @@ def run_sync_server(
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(tls_cert, tls_key)
             server.socket = ctx.wrap_socket(server.socket, server_side=True)
-        except Exception as e:
-            logger.error("Failed to configure TLS: %s", e)
+        except Exception as exc:
+            logger.error("sync_tls_config_failed exception=%s", type(exc).__name__)
             raise
 
     if daemon:

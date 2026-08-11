@@ -352,6 +352,35 @@ def test_server_requires_complete_tls_pair(tmp_path):
         )
 
 
+def test_sync_server_tls_failure_log_is_content_free(tmp_path, monkeypatch, caplog):
+    import ssl
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("SYNC-CANARY /secret/db.sqlite schema_x")
+
+    monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", _boom)
+    memory = Mnemosyne(db_path=tmp_path / "server-tls-failure.db")
+
+    with pytest.raises(RuntimeError, match="SYNC-CANARY"):
+        run_sync_server(
+            host="127.0.0.1",
+            port=0,
+            beam_instance=memory,
+            tls_cert="cert.pem",
+            tls_key="key.pem",
+            daemon=True,
+            initialize_surface=True,
+        )
+
+    assert "sync_tls_config_failed exception=RuntimeError" in caplog.text
+    assert "Traceback" not in caplog.text
+    for record in caplog.records:
+        for token in CANARY_TOKENS:
+            assert token not in record.getMessage()
+            assert token not in repr(record.args)
+            assert token not in (record.exc_text or "")
+
+
 def test_server_rejects_oversized_and_invalid_json_once(tmp_path):
     import hashlib
     import hmac
