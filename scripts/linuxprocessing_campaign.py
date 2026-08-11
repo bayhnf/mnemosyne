@@ -406,7 +406,7 @@ def _assert_recursive_schema(obj: Any, trail: str = "root") -> None:
                         "check field not on allowlist; report not written"
                     )
             _assert_recursive_schema(value, f"{trail}.{key}")
-    elif isinstance(obj, list):
+    elif isinstance(obj, (list, tuple)):
         for i, item in enumerate(obj):
             _assert_recursive_schema(item, f"{trail}[{i}]")
 
@@ -420,7 +420,7 @@ def _assert_reason_codes_approved(obj: Any) -> None:
             raise RuntimeError("reason code not approved; report not written")
         for value in obj.values():
             _assert_reason_codes_approved(value)
-    elif isinstance(obj, list):
+    elif isinstance(obj, (list, tuple)):
         for value in obj:
             _assert_reason_codes_approved(value)
 
@@ -474,12 +474,11 @@ def write_report(report_path: Path, report: dict[str, Any]) -> None:
     only then written with fsync + chmod verification.
     """
     report_path = Path(report_path)
-    _ensure_report_tree(report_path)
-
     _assert_recursive_schema(report)
     _assert_reason_codes_approved(report)
     blob = json.dumps(report, sort_keys=True, separators=(",", ":"))
     _assert_content_free(blob)
+    _ensure_report_tree(report_path)
 
     fd = os.open(str(report_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
     with os.fdopen(fd, "w") as f:

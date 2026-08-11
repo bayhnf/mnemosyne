@@ -415,7 +415,7 @@ class TestReportProjection:
         _assert_recursive_allowlist(report)
 
     def test_unapproved_top_level_reason_code_is_not_written(self, tmp_path):
-        report_path = tmp_path / "r.json"
+        report_path = tmp_path / "not-created" / "r.json"
         report = {
             "stage": "g0",
             "verdict": PASS,
@@ -428,6 +428,7 @@ class TestReportProjection:
         with pytest.raises(RuntimeError, match="reason code not approved"):
             lpc.write_report(report_path, report)
         assert not report_path.exists()
+        assert not report_path.parent.exists()
 
     def test_unapproved_nested_reason_code_is_not_written(self, tmp_path):
         report_path = tmp_path / "r.json"
@@ -446,6 +447,32 @@ class TestReportProjection:
             lpc.write_report(report_path, report)
         assert not report_path.exists()
 
+    @pytest.mark.parametrize(
+        ("tuple_payload", "message"),
+        [
+            (({"not_allowed": "value"},), "check field not on allowlist"),
+            (({"reason_code": "not_approved"},), "reason code not approved"),
+        ],
+        ids=("schema", "reason-code"),
+    )
+    def test_tuple_values_cannot_bypass_report_validation(
+        self, tmp_path, tuple_payload, message
+    ):
+        report_path = tmp_path / "not-created" / "r.json"
+        report = {
+            "stage": "g0",
+            "verdict": PASS,
+            "reason_code": "ok",
+            "checks": {"self_scan": tuple_payload},
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:00:00Z",
+            "duration_ms": 1.0,
+        }
+        with pytest.raises(RuntimeError, match=message):
+            lpc.write_report(report_path, report)
+        assert not report_path.exists()
+        assert not report_path.parent.exists()
+
     def test_current_emitted_reason_codes_are_approved(self):
         assert {
             "g4_core_failed",
@@ -457,25 +484,37 @@ class TestReportProjection:
             "g5_plugin_surface_failed",
         } <= lpc._APPROVED_REASON_CODES
 
-    def test_nested_path_like_string_rejected(self, tmp_path, monkeypatch):
-        """A path-like string in a nested field must not be written."""
-        trial = tmp_path / "trial"
-        trial.mkdir()
-        report_path = trial / "r.json"
-        # Construct a report with a nested forbidden path and confirm
-        # write_report refuses to write it.
-        bad_report = {
+    def test_content_validation_failure_has_no_filesystem_side_effects(
+        self, tmp_path
+    ):
+        existing_parent = tmp_path / "existing"
+        existing_parent.mkdir()
+        existing_parent.chmod(0o750)
+        missing_parent = tmp_path / "missing"
+        report = {
             "stage": "g0",
             "verdict": PASS,
             "reason_code": "ok",
-            "checks": {"leak": {"verdict": "/home/bell/secret"}},
+            "checks": {
+                "self_scan": {
+                    "verdict": "/home/canary",
+                    "reason_code": "ok",
+                }
+            },
             "started_at": "2026-01-01T00:00:00Z",
             "ended_at": "2026-01-01T00:00:00Z",
             "duration_ms": 1.0,
         }
-        with pytest.raises(RuntimeError):
-            lpc.write_report(report_path, bad_report)
-        assert not report_path.exists()
+        for report_path in (
+            existing_parent / "r.json",
+            missing_parent / "r.json",
+        ):
+            with pytest.raises(RuntimeError, match="content-free"):
+                lpc.write_report(report_path, report)
+            assert not report_path.exists()
+
+        assert stat.S_IMODE(existing_parent.stat().st_mode) == 0o750
+        assert not missing_parent.exists()
 
     def test_unknown_nested_key_rejected(self, tmp_path, monkeypatch):
         trial = tmp_path / "trial"
