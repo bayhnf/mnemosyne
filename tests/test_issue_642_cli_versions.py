@@ -55,7 +55,7 @@ def test_core_help_advertises_standalone_version_command(tmp_path):
 def _load_host_provider_cli(monkeypatch):
     for module_name in tuple(sys.modules):
         if module_name == "hermes_memory_provider" or module_name.startswith("hermes_memory_provider."):
-            del sys.modules[module_name]
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
     from hermes_memory_provider import cli
 
     return cli
@@ -65,7 +65,7 @@ def _load_integration_cli(monkeypatch):
     monkeypatch.syspath_prepend(str(INTEGRATION_SRC))
     for module_name in tuple(sys.modules):
         if module_name == "mnemosyne_hermes" or module_name.startswith("mnemosyne_hermes."):
-            del sys.modules[module_name]
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
     from mnemosyne_hermes import cli
 
     return cli
