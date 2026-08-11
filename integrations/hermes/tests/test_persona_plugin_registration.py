@@ -1,7 +1,14 @@
 """Regression tests for standalone-plugin persona tool registration."""
 
+import sys
+
 import mnemosyne_hermes as plugin
 from mnemosyne_hermes import persona_adapter
+
+
+def test_parity_suite_keeps_collection_time_plugin_modules_live():
+    assert sys.modules["mnemosyne_hermes"] is plugin
+    assert sys.modules["mnemosyne_hermes.persona_adapter"] is persona_adapter
 
 
 class _Context:

@@ -17,6 +17,31 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INTEGRATION_SRC = PROJECT_ROOT / "integrations" / "hermes" / "src"
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _restore_plugin_module_cache():
+    prefixes = ("hermes_memory_provider", "mnemosyne_hermes")
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == prefixes[0]
+        or name.startswith(f"{prefixes[0]}.")
+        or name == prefixes[1]
+        or name.startswith(f"{prefixes[1]}.")
+    }
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if (
+                name == prefixes[0]
+                or name.startswith(f"{prefixes[0]}.")
+                or name == prefixes[1]
+                or name.startswith(f"{prefixes[1]}.")
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved)
+
+
 def _drop_modules(prefix: str) -> None:
     for name in list(sys.modules):
         if name == prefix or name.startswith(f"{prefix}."):
