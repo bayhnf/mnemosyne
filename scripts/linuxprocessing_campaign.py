@@ -142,6 +142,7 @@ _ALLOWED_CHECK_NAMES = frozenset(
         "sidecar",
         "user_version",
         "dry_run",
+        "dry_run_e7",
         "no_mutation",
         "fault_matrix",
         "fault_strategy_ack",
@@ -226,6 +227,8 @@ _APPROVED_REASON_CODES = frozenset(
         "user_version_mismatch",
         "dry_run_failed",
         "source_mutated",
+        "source_clone_failed",
+        "source_changed_during_clone",
         "restore_failed",
         "rollback_rehearsal_failed",
         "pristine_tampered",
@@ -794,6 +797,18 @@ def _user_version(db_path: Path) -> int:
 
 def _has_sidecars(db_path: Path) -> bool:
     return Path(str(db_path) + "-wal").exists() or Path(str(db_path) + "-shm").exists()
+
+
+def _artifact_manifest(db_path: Path) -> dict[str, tuple[bool, str]]:
+    """Content-free record of a DB's main file and SQLite sidecars."""
+    result = {}
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(f"{db_path}{suffix}")
+        result[suffix] = (
+            path.exists(),
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "",
+        )
+    return result
 
 
 def _table_row_counts(db_path: Path) -> dict[str, int]:
@@ -1879,12 +1894,58 @@ def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         }
         return FAIL, "source_db_outside_trial_root", checks
 
-    before = hashlib.sha256(Path(source_db).read_bytes()).hexdigest()
+    checks["writer_quiesce_ack"] = {
+        "verdict": _ack_state(args.ack_writer_quiesce),
+        "reason_code": "ok"
+        if args.ack_writer_quiesce
+        else "writer_quiesce_ack_required",
+    }
+    if not args.ack_writer_quiesce:
+        return GATE, "writer_quiesce_ack_required", checks
+
+    before = _artifact_manifest(source_db)
+    work_dir = trial_root / "g3"
+    migration_db = work_dir / "migration.db"
+    try:
+        work_dir.mkdir(exist_ok=True)
+        os.chmod(work_dir, _DIR_MODE)
+        for name in (
+            "migration.db",
+            "migration.db-wal",
+            "migration.db-shm",
+            "migration.db-journal",
+        ):
+            stale = work_dir / name
+            if stale.exists():
+                stale.unlink()
+        shutil.copy2(source_db, migration_db)
+        if Path(f"{source_db}-wal").exists():
+            shutil.copy2(Path(f"{source_db}-wal"), Path(f"{migration_db}-wal"))
+        if Path(f"{source_db}-journal").exists():
+            shutil.copy2(
+                Path(f"{source_db}-journal"), Path(f"{migration_db}-journal")
+            )
+    except Exception:
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["no_mutation"] = {
+            "verdict": FAIL,
+            "reason_code": "source_clone_failed",
+        }
+        return FAIL, "source_clone_failed", checks
+
+    after_copy = _artifact_manifest(source_db)
+    if after_copy != before:
+        checks["no_mutation"] = {
+            "verdict": FAIL,
+            "reason_code": "source_changed_during_clone",
+        }
+        return FAIL, "source_changed_during_clone", checks
+
     try:
         from mnemosyne.migrations.e6_triplestore_split import migrate as _migrate_e6
 
         _migrate_e6(
-            Path(source_db), dry_run=True, backup=False, log_fn=lambda *_a: None
+            migration_db, dry_run=True, backup=False, log_fn=lambda *_a: None
         )
         checks["dry_run"] = {"verdict": PASS, "reason_code": "ok"}
     except Exception:
@@ -1892,7 +1953,19 @@ def _stage_g3(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         checks["dry_run"] = {"verdict": FAIL, "reason_code": "dry_run_failed"}
         return FAIL, "dry_run_failed", checks
 
-    after = hashlib.sha256(Path(source_db).read_bytes()).hexdigest()
+    try:
+        from mnemosyne.migrations.e7_311_tables import (
+            migrate_311_tables as _migrate_e7,
+        )
+
+        _migrate_e7(migration_db, dry_run=True)
+        checks["dry_run_e7"] = {"verdict": PASS, "reason_code": "ok"}
+    except Exception:
+        traceback.clear_frames(sys.exc_info()[2])
+        checks["dry_run_e7"] = {"verdict": FAIL, "reason_code": "dry_run_failed"}
+        return FAIL, "dry_run_failed", checks
+
+    after = _artifact_manifest(source_db)
     checks["no_mutation"] = {
         "verdict": PASS if before == after else FAIL,
         "reason_code": "ok" if before == after else "source_mutated",

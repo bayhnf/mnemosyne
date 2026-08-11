@@ -167,6 +167,17 @@ def _make_trial_db(path: Path) -> Path:
     return path
 
 
+def _artifact_manifest(db_path: Path) -> dict[str, tuple[bool, str]]:
+    result = {}
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(f"{db_path}{suffix}")
+        result[suffix] = (
+            path.exists(),
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "",
+        )
+    return result
+
+
 def _make_candidate_repo(root: Path) -> tuple[Path, str]:
     candidate = root / "candidate"
     (candidate / "mnemosyne").mkdir(parents=True)
@@ -1509,10 +1520,99 @@ class TestG3MigrationDryRun:
         trial.mkdir()
         source = _make_trial_db(trial / "source.db")
         before = hashlib.sha256(source.read_bytes()).hexdigest()
-        code, _ = _run_stage("g3", trial, monkeypatch, "--source-db", str(source))
+        code, _ = _run_stage(
+            "g3",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+            "--ack-writer-quiesce",
+        )
         assert code == 0
         after = hashlib.sha256(source.read_bytes()).hexdigest()
         assert before == after
+
+    def test_g3_rehearses_e6_and_e7_on_clone_without_touching_source_sidecars(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        from mnemosyne.core.memory import init_db
+        from mnemosyne.migrations.e6_triplestore_split import migrate as real_e6
+        from mnemosyne.migrations.e7_311_tables import migrate_311_tables as real_e7
+
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = trial / "source.db"
+        init_db(source)
+        writer = sqlite3.connect(str(source))
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE wal_witness (value TEXT NOT NULL)")
+            writer.execute(
+                "INSERT INTO wal_witness(value) VALUES ('committed-wal-frame')"
+            )
+            writer.commit()
+            assert Path(str(source) + "-wal").exists()
+        finally:
+            writer.close()
+
+        before = _artifact_manifest(source)
+
+        e6_calls: list[tuple] = []
+        e7_calls: list[tuple] = []
+
+        def _recording_e6(db_path, dry_run, backup, log_fn):
+            e6_calls.append((Path(db_path), dry_run, backup))
+            return real_e6(db_path, dry_run=dry_run, backup=backup, log_fn=log_fn)
+
+        def _recording_e7(db_path, dry_run):
+            e7_calls.append((Path(db_path), dry_run))
+            return real_e7(db_path, dry_run=dry_run)
+
+        import mnemosyne.migrations.e6_triplestore_split as e6_mod
+        import mnemosyne.migrations.e7_311_tables as e7_mod
+
+        monkeypatch.setattr(e6_mod, "migrate", _recording_e6)
+        monkeypatch.setattr(e7_mod, "migrate_311_tables", _recording_e7)
+
+        code, report_path = _run_stage(
+            "g3",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(source),
+            "--ack-writer-quiesce",
+        )
+        assert code == 0, f"G3 should PASS, got {code}"
+        report = _read_report(report_path)
+
+        assert _artifact_manifest(source) == before
+        assert e6_calls and e6_calls[0][1:] == (True, False)
+        assert e7_calls and e7_calls[0][1] is True
+        assert Path(e6_calls[0][0]).parent != source.parent
+        assert Path(e7_calls[0][0]) == Path(e6_calls[0][0])
+        assert sqlite3.connect(e6_calls[0][0]).execute(
+            "SELECT COUNT(*) FROM wal_witness"
+        ).fetchone()[0] == 1
+        assert report["checks"]["dry_run"]["verdict"] == PASS
+        assert report["checks"]["dry_run_e7"]["verdict"] == PASS
+        assert report["checks"]["no_mutation"]["verdict"] == PASS
+
+    def test_g3_gates_without_writer_quiesce_ack(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = _make_trial_db(trial / "source.db")
+        code, report_path = _run_stage(
+            "g3", trial, monkeypatch, "--source-db", str(source)
+        )
+        assert code == lpc.EXIT_GATE
+        report = _read_report(report_path)
+        assert (
+            report["checks"]["writer_quiesce_ack"]["reason_code"]
+            == "writer_quiesce_ack_required"
+        )
 
 
 # ===========================================================================
