@@ -30,6 +30,40 @@ RAW_CONTENT = "Only the hidden cobalt-archive content may contain this phrase."
 RAW_EMBEDDING = "[0.125, 0.875]"
 RAW_BLOB_HEX = "DEADBEEF"
 
+_CAP_DAC_READ_SEARCH = 1 << 2
+_CAPABILITY_SKIP_REASON = (
+    "CAP_DAC_READ_SEARCH not effective: linkat(AT_EMPTY_PATH) requires it; "
+    "re-run under root or ambient-cap exec"
+)
+
+
+def _cap_dac_read_search_effective() -> bool:
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("CapEff:"):
+                return bool(int(line.split(":", 1)[1].strip(), 16) & _CAP_DAC_READ_SEARCH)
+    except OSError:
+        pass
+    return False
+
+
+requires_dac_read_search = pytest.mark.skipif(
+    not _cap_dac_read_search_effective(),
+    reason=_CAPABILITY_SKIP_REASON,
+)
+
+
+def test_cap_dac_read_search_effective_detects_effective_capability(monkeypatch):
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: "CapEff:\t0000000000000004\n")
+
+    assert _cap_dac_read_search_effective() is True
+
+
+def test_cap_dac_read_search_effective_rejects_zero_mask(monkeypatch):
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: "CapEff:\t0000000000000000\n")
+
+    assert _cap_dac_read_search_effective() is False
+
 
 def _fd_target_counts() -> Counter[str]:
     counts: Counter[str] = Counter()
@@ -286,6 +320,7 @@ def test_manifest_bank_fingerprint_and_parse_fail_closed_before_backup_or_write(
     assert not requested_backup.exists()
 
 
+@requires_dac_read_search
 def test_apply_revalidates_manifest_fingerprint_under_lock_before_backup_or_write(tmp_path, monkeypatch):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)
@@ -334,6 +369,7 @@ def test_apply_revalidates_manifest_fingerprint_under_lock_before_backup_or_writ
         conn.close()
 
 
+@requires_dac_read_search
 def test_apply_creates_and_quick_checks_backup_before_mutation(tmp_path, monkeypatch):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)
@@ -383,6 +419,7 @@ def test_apply_creates_and_quick_checks_backup_before_mutation(tmp_path, monkeyp
         conn.close()
 
 
+@requires_dac_read_search
 def test_missing_stale_and_already_expired_rows_skip_without_backup_or_write(tmp_path):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)
@@ -416,6 +453,7 @@ def test_missing_stale_and_already_expired_rows_skip_without_backup_or_write(tmp
     assert _hash(db_path) == before
 
 
+@requires_dac_read_search
 def test_controlled_vec_backfill_only_selected_row_and_is_idempotent(tmp_path, monkeypatch):
     db_path = tmp_path / "memory.db"
     _create_db(db_path, with_vector_cache=True)
@@ -485,6 +523,7 @@ def test_controlled_vec_backfill_only_selected_row_and_is_idempotent(tmp_path, m
     assert not second_backup.exists()
 
 
+@requires_dac_read_search
 def test_unloadable_vec_backfill_skips_without_backup_or_mutation_and_stays_content_safe(tmp_path, monkeypatch):
     db_path = tmp_path / "memory.db"
     _create_db(db_path, with_vector_cache=True)
@@ -524,6 +563,7 @@ def test_unloadable_vec_backfill_skips_without_backup_or_mutation_and_stays_cont
         assert raw not in output
 
 
+@requires_dac_read_search
 def test_expiry_changes_only_selected_valid_until_and_never_deletes(tmp_path, monkeypatch):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)
@@ -567,6 +607,7 @@ def test_expiry_changes_only_selected_valid_until_and_never_deletes(tmp_path, mo
     assert untouched == ("untouched content", None)
 
 
+@requires_dac_read_search
 def test_apply_binds_connection_to_authorized_inode_during_a_to_b_to_a_swap(tmp_path, monkeypatch):
     """The writable connection must not follow the public name after binding."""
 
@@ -774,6 +815,7 @@ def test_sidecar_rejection_detects_duplicate_repair_fd(tmp_path, monkeypatch):
             os.close(leaked_fd)
 
 
+@requires_dac_read_search
 def test_backup_parent_swap_cannot_redirect_fd_anchored_backup(tmp_path, monkeypatch):
     """The requested backup parent may be renamed only after its FD is retained."""
 
@@ -826,6 +868,7 @@ def test_backup_parent_swap_cannot_redirect_fd_anchored_backup(tmp_path, monkeyp
     assert len(os.listdir("/proc/self/fd")) == fd_before
 
 
+@requires_dac_read_search
 def test_working_memory_trigger_fails_closed_before_backup_or_selected_update(tmp_path):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)
@@ -877,7 +920,7 @@ def test_working_memory_trigger_fails_closed_before_backup_or_selected_update(tm
     assert not list(tmp_path.glob(".mnemosyne-repair-*"))
 
 
-def test_rejects_unknown_selection_action_and_database_or_hardlink_backup_targets(tmp_path):
+def test_rejects_unknown_selection_and_action_during_dry_run(tmp_path):
     db_path = tmp_path / "memory.db"
     _create_db(db_path)
     _insert_memory(db_path, "selected")
@@ -901,6 +944,17 @@ def test_rejects_unknown_selection_action_and_database_or_hardlink_backup_target
             selections=["working_memory:selected"],
             action="delete-all",
         )
+    assert _hash(db_path) == before
+
+
+@requires_dac_read_search
+def test_rejects_unknown_selection_action_and_database_or_hardlink_backup_targets(tmp_path):
+    db_path = tmp_path / "memory.db"
+    _create_db(db_path)
+    _insert_memory(db_path, "selected")
+    report_path = _write_manifest(db_path, tmp_path)
+    before = _hash(db_path)
+
     with pytest.raises(RepairError, match="must not be the inspected database"):
         run_repair(
             db_path=db_path,
