@@ -20,7 +20,7 @@ def beam(tmp_path: Path) -> BeamMemory:
 def _seed_children(beam: BeamMemory, memory_id: str) -> None:
     """Add child records that the MCP delete handler must remove."""
     beam.conn.execute(
-        "INSERT INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
+        "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json) VALUES (?, ?)",
         (memory_id, "[0.1, 0.2]"),
     )
     beam.conn.execute(
@@ -85,8 +85,7 @@ def test_mcp_validate_delete_rolls_back_on_child_failure(beam: BeamMemory):
 
     result = _validate_delete(beam, memory_id)
 
-    assert result["error"] == "validation_failed"
-    assert "forced annotation failure" in result["reason"]
+    assert result == {"error": "validation_failed", "memory_id": memory_id}
     assert not beam.conn.in_transaction
     assert _count(beam, "memory_embeddings", memory_id) == 1
     assert _count(beam, "annotations", memory_id) == annotation_count
@@ -139,8 +138,7 @@ def test_mcp_validate_update_rolls_back_when_validation_log_fails(beam: BeamMemo
             },
         )
 
-    assert result["error"] == "validation_failed"
-    assert "forced validation-log failure" in result["reason"]
+    assert result == {"error": "validation_failed", "memory_id": memory_id}
     assert not beam.conn.in_transaction
     assert beam.conn.execute(
         "SELECT content FROM working_memory WHERE id = ?", (memory_id,)
