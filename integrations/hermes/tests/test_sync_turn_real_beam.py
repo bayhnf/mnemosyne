@@ -150,12 +150,12 @@ def test_real_beam_default_construction_stores_sync_turn(real_beam):
     assert all(r["status"] in ("stored", "duplicate") for r in receipt_rows)
 
 
-def test_real_beam_with_provenance_stores_sync_turn(real_beam):
+def test_real_beam_with_provenance_stores_sync_turn(real_beam, monkeypatch):
     """When provenance is populated, a real BeamMemory must store both roles
     and report last_outcome='stored' with real receipt rows."""
     from mnemosyne.core import beam as beam_module
 
-    beam_module._embeddings.available = lambda: False
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
 
     real_beam.author_id = "actor-real"
     real_beam.author_type = "hermes"
