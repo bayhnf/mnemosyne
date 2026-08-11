@@ -236,6 +236,7 @@ _APPROVED_REASON_CODES = frozenset(
         "content_not_reverted",
         "dream_undo_failed",
         "dream_undo_not_invoked",
+        "sqlite_cleanup_failed",
         "g4_core_failed",
         "g4_exactly_once_failed",
         "g4_crash_retry_failed",
@@ -853,6 +854,42 @@ def _canonical_content_hash(db_path: Path) -> str:
     except sqlite3.Error:
         return ""
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Strict sqlite cleanup (G8 silent-error hardening)
+# ---------------------------------------------------------------------------
+
+
+def _close_sqlite_strict(conn: sqlite3.Connection) -> bool:
+    """Close a sqlite connection and return False on any sqlite error.
+
+    A swallowed close error can mask an unflushed rollback; G8 must treat a
+    failed close as a failed cleanup, not a silent success.
+    """
+    try:
+        conn.close()
+    except sqlite3.Error:
+        return False
+    return True
+
+
+def _flush_wal_to_delete(conn: sqlite3.Connection) -> bool:
+    """Checkpoint WAL into the main DB and switch journal_mode to DELETE.
+
+    Returns True only after wal_checkpoint(TRUNCATE), journal_mode=DELETE
+    (verified to read back "delete"), and commit() all succeed. Returning
+    False without unlinking sidecars prevents a false "clean rollback" proof.
+    """
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        if str(mode).lower() != "delete":
+            return False
+        conn.commit()
+    except sqlite3.Error:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2113,10 +2150,14 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             # Critical 4: actually call dream_undo via the real native API.
             undone_run = dream.dream_undo(beam, run.run_id)
             undone_count = 1 if undone_run.state == "undone" else 0
-            try:
-                beam.conn.close()
-            except sqlite3.Error:
-                pass
+            if not _close_sqlite_strict(beam.conn):
+                config_module.MnemosyneConfig.reset_instance()
+                traceback.clear_frames(sys.exc_info()[2])
+                checks["dream_undo"] = {
+                    "verdict": FAIL,
+                    "reason_code": "dream_undo_failed",
+                }
+                return FAIL, "dream_undo_failed", checks
             config_module.MnemosyneConfig.reset_instance()
         except sqlite3.Error:
             # Critical 4: sqlite errors MUST fail closed.
@@ -2138,17 +2179,24 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         )
 
         # Flush any WAL into the main DB so sidecar_absence is checked on a
-        # quiesced clone (Dream apply may run in WAL mode).
+        # quiesced clone (Dream apply may run in WAL mode). A failed or
+        # non-DELETE checkpoint must NOT be masked by unlinking sidecars.
+        flush_ok = False
         try:
             conn = sqlite3.connect(str(clone))
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.execute("PRAGMA journal_mode=DELETE")
-                conn.commit()
+                flush_ok = _flush_wal_to_delete(conn)
             finally:
                 conn.close()
         except sqlite3.Error:
-            pass
+            flush_ok = False
+        if not flush_ok:
+            traceback.clear_frames(sys.exc_info()[2])
+            checks["sidecar_absence"] = {
+                "verdict": FAIL,
+                "reason_code": "sqlite_cleanup_failed",
+            }
+            return FAIL, "sqlite_cleanup_failed", checks
         for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
             if side.exists():
                 side.unlink()

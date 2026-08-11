@@ -1069,6 +1069,110 @@ class TestG8RealRollback:
 
 
 # ===========================================================================
+# G8 strict SQLite cleanup (silent-error hardening)
+# ===========================================================================
+
+
+class TestG8StrictSqliteCleanup:
+    """G8 must fail closed when a sqlite close/checkpoint/journal-mode step
+    fails, and must never unlink sidecars after an unverified checkpoint."""
+
+    def test_close_sqlite_strict_returns_false_on_close_error(self):
+        import sqlite3
+
+        class _FailingClose:
+            def close(self):
+                raise sqlite3.OperationalError("synthetic")
+
+        assert lpc._close_sqlite_strict(_FailingClose()) is False
+
+    def test_close_sqlite_strict_returns_true_on_success(self):
+        class _OkClose:
+            closed = False
+
+            def close(self):
+                type(self).closed = True
+
+        assert lpc._close_sqlite_strict(_OkClose()) is True
+        assert _OkClose.closed is True
+
+    def test_flush_wal_to_delete_returns_false_on_checkpoint_error(self):
+        import sqlite3
+
+        class _FailingCheckpoint:
+            def execute(self, sql):
+                raise sqlite3.OperationalError("synthetic")
+
+            def commit(self):
+                raise AssertionError("commit must not run after checkpoint fail")
+
+            def close(self):
+                return None
+
+        assert lpc._flush_wal_to_delete(_FailingCheckpoint()) is False
+
+    def test_flush_wal_to_delete_returns_false_when_mode_not_delete(self):
+        class _Cursor:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class _NonDeleteMode:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, sql):
+                self.calls += 1
+                # wal_checkpoint(TRUNCATE) then journal_mode=DELETE.
+                if self.calls == 1:
+                    return _Cursor((0, 0, 0))
+                # journal_mode came back as something other than "delete".
+                return _Cursor(("wal",))
+
+            def commit(self):
+                raise AssertionError("commit must not run when mode != delete")
+
+            def close(self):
+                return None
+
+        assert lpc._flush_wal_to_delete(_NonDeleteMode()) is False
+
+    def test_flush_wal_to_delete_returns_true_only_after_all_three_succeed(self):
+        class _Cursor:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        class _OkFlush:
+            def __init__(self):
+                self.executed = []
+                self.committed = False
+
+            def execute(self, sql):
+                self.executed.append(sql)
+                if sql == "PRAGMA journal_mode=DELETE":
+                    return _Cursor(("delete",))
+                return _Cursor((0, 0, 0))
+
+            def commit(self):
+                self.committed = True
+
+        fake = _OkFlush()
+        assert lpc._flush_wal_to_delete(fake) is True
+        assert fake.executed == ["PRAGMA wal_checkpoint(TRUNCATE)", "PRAGMA journal_mode=DELETE"]
+        assert fake.committed is True
+
+    def test_sqlite_cleanup_failed_is_approved_reason_code(self):
+        """The static failure code must be in the allowlist so a report
+        carrying it passes self-scan instead of being rejected."""
+        assert "sqlite_cleanup_failed" in lpc._APPROVED_REASON_CODES
+
+
+# ===========================================================================
 # Critical 5: G7 real soak
 # ===========================================================================
 
