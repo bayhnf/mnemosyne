@@ -179,7 +179,11 @@ def test_sync_adapter_dispatch_catch_is_static(package, monkeypatch, caplog):
     monkeypatch.setattr(adapter, "_handle_status", _raiser(CANARY))
     with caplog.at_level(logging.DEBUG, logger=mod.logger.name):
         out = json.loads(adapter.handle_tool_call("mnemosyne_sync_status", {}))
-    assert out == {"status": "error", "error": "sync_tool_failed"}
+    assert out == {
+        "status": "error",
+        "error": "sync_tool_failed",
+        "tool": "mnemosyne_sync_status",
+    }
     assert CANARY not in json.dumps(out)
     assert [record.getMessage() for record in caplog.records] == [
         "sync_adapter: tool_failed"

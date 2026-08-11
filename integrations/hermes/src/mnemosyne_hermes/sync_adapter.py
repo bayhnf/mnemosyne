@@ -257,6 +257,7 @@ class SyncAdapter:
             return json.dumps({
                 "status": "error",
                 "error": "sync_tool_failed",
+                "tool": tool_name,
             })
 
     # --- Push --------------------------------------------------------------
