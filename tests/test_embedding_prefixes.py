@@ -41,9 +41,14 @@ def embeddings_mod(monkeypatch):
     # Reload ONLY because upstream reads the API URL/model at module import time.
     # The PREFIXES are read at call time by the patch, so no reload is ever
     # needed for prefix changes (see test_unset_prefixes_unchanged).
+    original_module_state = dict(embeddings.__dict__)
     importlib.reload(embeddings)
-    yield embeddings
-    server.shutdown()
+    try:
+        yield embeddings
+    finally:
+        embeddings.__dict__.clear()
+        embeddings.__dict__.update(original_module_state)
+        server.shutdown()
 
 def test_query_prefix_byte_exact(embeddings_mod):
     # No cache manipulation: the cache is keyed on the PREFIXED text, so prefix
