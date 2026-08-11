@@ -95,6 +95,7 @@ _ALLOWED_CHECK_KEYS = frozenset(
         "verdict",
         "reason_code",
         "digest",
+        "sha",
         "stored",
         "duplicate",
         "final_state",
@@ -127,6 +128,7 @@ _ALLOWED_CHECK_NAMES = frozenset(
         "t0_ssh_ack",
         "image_digest_ack",
         "image_digest",
+        "candidate",
         "approved_sha",
         "dependency_health",
         "lane_imports",
@@ -205,6 +207,10 @@ _APPROVED_REASON_CODES = frozenset(
         "codex_desktop_ack_required",
         "hermes_smoke_ack_required",
         "approved_sha_required",
+        "candidate_unavailable",
+        "candidate_outside_trial_root",
+        "approved_sha_invalid",
+        "approved_sha_mismatch",
         "dependency_unavailable",
         "dependency_health_failed",
         "lane_unavailable",
@@ -542,19 +548,49 @@ def _normalize_image_digest(value: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def _normalize_commit_sha(value: str) -> str | None:
+    value = value.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value):
+        return value.lower()
+    return None
+
+
+def _candidate_head(
+    candidate: Path, pass_fds: tuple[int, ...] = ()
+) -> tuple[str, str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(candidate), "rev-parse", "--verify", "HEAD^{commit}"],
+            capture_output=True,
+            pass_fds=pass_fds,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return FAIL, "candidate_unavailable"
+    if proc.returncode != 0:
+        return FAIL, "candidate_unavailable"
+    head = _normalize_commit_sha(proc.stdout)
+    return (PASS, head) if head else (FAIL, "candidate_unavailable")
+
+
 # ---------------------------------------------------------------------------
 # Interpreter check (High 2: trial interpreter for every trial-lane check)
 # ---------------------------------------------------------------------------
 
 
-def _lane_import_check(interpreter: str) -> tuple[str, str]:
+def _lane_import_check(
+    interpreter: str, candidate: Path, pass_fds: tuple[int, ...] = ()
+) -> tuple[str, str]:
     """Run the trial-lane import check using the configured trial venv
     interpreter. Subprocess verdict is returncode-first; argv[0] IS the
     trial interpreter (asserted in tests)."""
     try:
         proc = subprocess.run(
-            [interpreter, "-c", "import sqlite3, hashlib, json, argparse, pathlib"],
+            [interpreter, "-c", "import mnemosyne"],
+            cwd=str(candidate),
             capture_output=True,
+            pass_fds=pass_fds,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
@@ -569,18 +605,14 @@ def _dependency_health_via_trial(interpreter: str) -> tuple[str, str]:
     campaign interpreter (High 2)."""
     try:
         proc = subprocess.run(
-            [
-                interpreter,
-                "-c",
-                "import argparse,json,os,shutil,sqlite3,hashlib,pathlib",
-            ],
+            [interpreter, "-m", "pip", "check"],
             capture_output=True,
             timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
         return FAIL, "dependency_unavailable"
     if proc.returncode != 0:
-        return FAIL, "dependency_unavailable"
+        return FAIL, "dependency_health_failed"
     return PASS, "ok"
 
 
@@ -653,24 +685,85 @@ def _stage_g1(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         checks["trial_root"] = {"verdict": FAIL, "reason_code": "trial_root_missing"}
         return FAIL, "trial_root_missing", checks
 
-    if not args.approved_sha or len(args.approved_sha) < 40:
-        checks["approved_sha"] = {
-            "verdict": GATE,
-            "reason_code": "approved_sha_required",
+    candidate = (
+        args.candidate
+        if args.candidate is not None
+        else trial_root / "candidate"
+    )
+    if not _contained_under(candidate, trial_root):
+        checks["candidate"] = {
+            "verdict": FAIL,
+            "reason_code": "candidate_outside_trial_root",
         }
-        return GATE, "approved_sha_required", checks
-    checks["approved_sha"] = {"verdict": PASS, "reason_code": "ok"}
+        return FAIL, "candidate_outside_trial_root", checks
 
-    dh = _dependency_health_via_trial(args.trial_interpreter)
-    checks["dependency_health"] = {"verdict": dh[0], "reason_code": dh[1]}
-    li = _lane_import_check(args.trial_interpreter)
-    checks["lane_imports"] = {"verdict": li[0], "reason_code": li[1]}
+    try:
+        candidate_fd = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        checks["candidate"] = {
+            "verdict": GATE,
+            "reason_code": "candidate_unavailable",
+        }
+        return GATE, "candidate_unavailable", checks
 
-    if checks["dependency_health"]["verdict"] != PASS:
-        return FAIL, "dependency_health_failed", checks
-    if checks["lane_imports"]["verdict"] != PASS:
-        return FAIL, "lane_import_failed", checks
-    return PASS, "ok", checks
+    candidate = Path(f"/proc/self/fd/{candidate_fd}")
+    pass_fds = (candidate_fd,)
+    try:
+        if not _contained_under(candidate, trial_root):
+            checks["candidate"] = {
+                "verdict": FAIL,
+                "reason_code": "candidate_outside_trial_root",
+            }
+            return FAIL, "candidate_outside_trial_root", checks
+
+        head_verdict, head = _candidate_head(candidate, pass_fds)
+        if head_verdict != PASS:
+            checks["candidate"] = {
+                "verdict": GATE,
+                "reason_code": "candidate_unavailable",
+            }
+            return GATE, "candidate_unavailable", checks
+        checks["candidate"] = {"verdict": PASS, "reason_code": "ok"}
+
+        if not args.approved_sha:
+            checks["approved_sha"] = {
+                "verdict": GATE,
+                "reason_code": "approved_sha_required",
+            }
+            return GATE, "approved_sha_required", checks
+
+        approved_sha = _normalize_commit_sha(args.approved_sha)
+        if approved_sha is None:
+            checks["approved_sha"] = {
+                "verdict": FAIL,
+                "reason_code": "approved_sha_invalid",
+            }
+            return FAIL, "approved_sha_invalid", checks
+        if approved_sha != head:
+            checks["approved_sha"] = {
+                "verdict": FAIL,
+                "reason_code": "approved_sha_mismatch",
+                "sha": approved_sha,
+            }
+            return FAIL, "approved_sha_mismatch", checks
+        checks["approved_sha"] = {
+            "verdict": PASS,
+            "reason_code": "ok",
+            "sha": approved_sha,
+        }
+
+        dh = _dependency_health_via_trial(args.trial_interpreter)
+        checks["dependency_health"] = {"verdict": dh[0], "reason_code": dh[1]}
+        li = _lane_import_check(args.trial_interpreter, candidate, pass_fds)
+        checks["lane_imports"] = {"verdict": li[0], "reason_code": li[1]}
+
+        if checks["dependency_health"]["verdict"] != PASS:
+            return FAIL, "dependency_health_failed", checks
+        if checks["lane_imports"]["verdict"] != PASS:
+            return FAIL, "lane_import_failed", checks
+        return PASS, "ok", checks
+    finally:
+        os.close(candidate_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -2154,6 +2247,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ack-hermes-smoke", action="store_true")
     p.add_argument("--ack-fault-strategy", action="store_true")
     p.add_argument("--ack-soak-schedule", action="store_true")
+    p.add_argument("--candidate", default=None, type=Path)
     p.add_argument("--approved-sha", default="")
     p.add_argument("--source-db", default="", type=Path)
     p.add_argument("--g4-events", type=int, default=10000)

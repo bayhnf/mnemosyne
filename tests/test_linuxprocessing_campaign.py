@@ -167,6 +167,33 @@ def _make_trial_db(path: Path) -> Path:
     return path
 
 
+def _make_candidate_repo(root: Path) -> tuple[Path, str]:
+    candidate = root / "candidate"
+    (candidate / "mnemosyne").mkdir(parents=True)
+    (candidate / "mnemosyne" / "__init__.py").write_text("", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(candidate)], check=True)
+    subprocess.run(["git", "-C", str(candidate), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(candidate),
+            "-c",
+            "user.name=campaign-test",
+            "-c",
+            "user.email=campaign@example.invalid",
+            "commit",
+            "-qm",
+            "candidate",
+        ],
+        check=True,
+    )
+    sha = subprocess.check_output(
+        ["git", "-C", str(candidate), "rev-parse", "HEAD"], text=True
+    ).strip()
+    return candidate, sha
+
+
 def _assert_all_dirs_0700(root: Path) -> None:
     """Every directory under root must be 0700."""
     for p in [root, *root.rglob("*")]:
@@ -189,11 +216,14 @@ def _ack_all() -> list[str]:
 
 
 def _all_pass_args(trial: Path, source: Path) -> list[str]:
+    candidate, sha = _make_candidate_repo(trial)
     return [
         "--source-db",
         str(source),
+        "--candidate",
+        str(candidate),
         "--approved-sha",
-        "deadbeef" * 8,
+        sha,
         "--image-digest",
         "a" * 64,
         "--g4-events",
@@ -440,6 +470,165 @@ class TestMandatoryGates:
 
 
 # ===========================================================================
+# G1: reviewed candidate binding + real dependency health
+# ===========================================================================
+
+
+class TestG1ReviewedCandidate:
+    def test_g1_approved_sha_invalid(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        candidate, _ = _make_candidate_repo(trial)
+
+        code, report_path = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--candidate",
+            str(candidate),
+            "--approved-sha",
+            "g" * 40,
+            "--trial-interpreter",
+            sys.executable,
+        )
+
+        assert code == lpc.EXIT_FAIL
+        assert (
+            _read_report(report_path)["checks"]["approved_sha"]["reason_code"]
+            == "approved_sha_invalid"
+        )
+        assert str(candidate) not in report_path.read_text(encoding="utf-8")
+
+    def test_g1_approved_sha_mismatch(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        candidate, _ = _make_candidate_repo(trial)
+
+        code, report_path = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--candidate",
+            str(candidate),
+            "--approved-sha",
+            "A" * 64,
+            "--trial-interpreter",
+            sys.executable,
+        )
+
+        assert code == lpc.EXIT_FAIL
+        assert (
+            _read_report(report_path)["checks"]["approved_sha"]["reason_code"]
+            == "approved_sha_mismatch"
+        )
+        assert str(candidate) not in report_path.read_text(encoding="utf-8")
+
+    def test_g1_candidate_outside_trial_root(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        candidate, sha = _make_candidate_repo(tmp_path / "outside")
+
+        code, report_path = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--candidate",
+            str(candidate),
+            "--approved-sha",
+            sha,
+            "--trial-interpreter",
+            sys.executable,
+        )
+
+        assert code == lpc.EXIT_FAIL
+        assert (
+            _read_report(report_path)["checks"]["candidate"]["reason_code"]
+            == "candidate_outside_trial_root"
+        )
+        assert str(candidate) not in report_path.read_text(encoding="utf-8")
+
+    def test_g1_candidate_unavailable_gates(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+
+        code, report_path = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--approved-sha",
+            "a" * 40,
+            "--trial-interpreter",
+            sys.executable,
+        )
+
+        assert code == lpc.EXIT_GATE
+        assert (
+            _read_report(report_path)["checks"]["candidate"]["reason_code"]
+            == "candidate_unavailable"
+        )
+
+    def test_g1_pins_candidate_before_symlink_swap(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        inside, sha = _make_candidate_repo(trial / "inside")
+        outside, _ = _make_candidate_repo(tmp_path / "outside")
+        (outside / "mnemosyne" / "__init__.py").write_text(
+            "raise RuntimeError('outside candidate')\n", encoding="utf-8"
+        )
+        candidate = trial / "candidate-link"
+        candidate.symlink_to(inside, target_is_directory=True)
+
+        def _swap_candidate(*_):
+            candidate.unlink()
+            candidate.symlink_to(outside, target_is_directory=True)
+            return PASS, "ok"
+
+        monkeypatch.setattr(lpc, "_dependency_health_via_trial", _swap_candidate)
+
+        code, report_path = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--candidate",
+            str(candidate),
+            "--approved-sha",
+            sha,
+            "--trial-interpreter",
+            sys.executable,
+        )
+
+        assert candidate.resolve() == outside
+        assert code == lpc.EXIT_PASS
+        assert _read_report(report_path)["checks"]["approved_sha"]["sha"] == sha
+        assert str(outside) not in report_path.read_text(encoding="utf-8")
+
+    def test_g1_matching_candidate_sha_passes(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        candidate, sha = _make_candidate_repo(trial)
+        monkeypatch.setattr(
+            lpc, "_dependency_health_via_trial", lambda *_: (PASS, "ok")
+        )
+        monkeypatch.setattr(lpc, "_lane_import_check", lambda *_: (PASS, "ok"))
+
+        code, report_path = _run_stage(
+            "g1",
+            trial,
+            monkeypatch,
+            "--candidate",
+            str(candidate),
+            "--approved-sha",
+            sha.upper(),
+            "--trial-interpreter",
+            sys.executable,
+        )
+
+        assert code == lpc.EXIT_PASS
+        assert _read_report(report_path)["checks"]["approved_sha"]["sha"] == sha
+        assert str(candidate) not in report_path.read_text(encoding="utf-8")
+
+
+# ===========================================================================
 # Critical 3: recursive schema projection + privacy
 # ===========================================================================
 
@@ -647,6 +836,9 @@ class TestArgparseSafety:
         trial = tmp_path / "trial"
         trial.mkdir()
         source = _make_trial_db(trial / "source.db")
+        monkeypatch.setattr(
+            lpc, "_dependency_health_via_trial", lambda *_: (PASS, "ok")
+        )
         code, report_path = _run_stage(
             "all", trial, monkeypatch, *_all_pass_args(trial, source)
         )
@@ -959,6 +1151,9 @@ class TestFaultMatrixAndAll:
         trial = tmp_path / "trial"
         trial.mkdir()
         source = _make_trial_db(trial / "source.db")
+        monkeypatch.setattr(
+            lpc, "_dependency_health_via_trial", lambda *_: (PASS, "ok")
+        )
         code, report_path = _run_stage(
             "all", trial, monkeypatch, *_all_pass_args(trial, source)
         )
@@ -997,33 +1192,53 @@ class TestFaultMatrixAndAll:
 
 class TestTruthfulChecks:
     def test_g1_lane_import_uses_trial_interpreter_argv(self, tmp_path, monkeypatch):
-        """The lane import subprocess must use the configured trial interpreter
-        as argv[0], unconditionally asserted."""
+        """The candidate import must use the configured trial interpreter."""
         trial = tmp_path / "trial"
         trial.mkdir()
-        captured: list[list[str]] = []
+        candidate, sha = _make_candidate_repo(trial)
+        captured: list[tuple[list[str], Path, dict[str, Any]]] = []
         original_run = subprocess.run
+        monkeypatch.setattr(
+            lpc, "_dependency_health_via_trial", lambda *_: (PASS, "ok")
+        )
 
         def _spy(cmd, *a, **kw):
-            if cmd and "import sqlite3" in " ".join(cmd):
-                captured.append(list(cmd))
+            if cmd and cmd[1:] == ["-c", "import mnemosyne"]:
+                captured.append((list(cmd), Path(kw["cwd"]).resolve(), kw))
             return original_run(cmd, *a, **kw)
 
         monkeypatch.setattr(lpc.subprocess, "run", _spy)
-        _run_stage(
+        code, report_path = _run_stage(
             "g1",
             trial,
             monkeypatch,
+            "--candidate",
+            str(candidate),
             "--approved-sha",
-            "deadbeef" * 8,
-            "--ack-t0-ssh",
-            "--ack-image-digest",
+            sha,
             "--trial-interpreter",
             sys.executable,
         )
-        # The first argv element must be the trial interpreter, always.
-        assert len(captured) >= 1
-        assert captured[0][0] == sys.executable
+
+        assert code == lpc.EXIT_PASS
+        assert len(captured) == 1
+        assert captured[0][0][0] == sys.executable
+        assert captured[0][1] == candidate.resolve()
+        assert captured[0][2]["capture_output"] is True
+        assert str(candidate) not in report_path.read_text(encoding="utf-8")
+
+    def test_g1_dependency_health_uses_trial_pip_check(self, monkeypatch):
+        captured: list[tuple[list[str], dict[str, Any]]] = []
+
+        def _spy(cmd, *a, **kw):
+            captured.append((list(cmd), kw))
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(lpc.subprocess, "run", _spy)
+
+        assert lpc._dependency_health_via_trial(sys.executable) == (PASS, "ok")
+        assert captured[0][0] == [sys.executable, "-m", "pip", "check"]
+        assert captured[0][1]["capture_output"] is True
 
     def test_g5_uses_trial_interpreter_for_package_check(self, tmp_path, monkeypatch):
         """G5 package import must use the trial interpreter, not the campaign
@@ -1166,6 +1381,9 @@ class TestOracleStrength:
         trial = tmp_path / "trial"
         trial.mkdir()
         source = _make_trial_db(trial / "source.db")
+        monkeypatch.setattr(
+            lpc, "_dependency_health_via_trial", lambda *_: (PASS, "ok")
+        )
         _, report_path = _run_stage(
             "all", trial, monkeypatch, *_all_pass_args(trial, source)
         )
