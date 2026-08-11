@@ -7,6 +7,8 @@ between tests, and that default-disable the local LLM so tests don't
 make real CPU inference calls when a model is available on disk.
 """
 
+import sys
+
 import pytest
 
 
@@ -196,3 +198,28 @@ def local_llm_enabled(monkeypatch):
     monkeypatch.setattr(local_llm, "_llm_available", True, raising=False)
     monkeypatch.setattr(local_llm, "_llm_backend", "llamacpp", raising=False)
     return fake
+
+
+_HERMES_MODULE_PREFIXES = ("hermes_memory_provider", "mnemosyne_hermes")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_hermes_module_cache():
+    saved = {
+        name: module
+        for name, module in sys.modules.items()
+        if any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in _HERMES_MODULE_PREFIXES
+        )
+    }
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if any(
+                name == prefix or name.startswith(f"{prefix}.")
+                for prefix in _HERMES_MODULE_PREFIXES
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved)
