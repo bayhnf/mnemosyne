@@ -867,7 +867,7 @@ def _pass_receipt(
         "manifest_hash": manifest_hash,
         "verdict": "PASS",
         "reason_code": "ok",
-        "timestamp": "2026-08-10T01:02:03Z",
+        "timestamp": _now_iso(),
     }
 
 

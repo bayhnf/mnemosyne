@@ -89,6 +89,17 @@ def _run_stage_custom(
     return code, report_path
 
 
+def test_campaign_pass_receipt_uses_current_utc_clock(monkeypatch):
+    expected = "2026-08-11T02:32:09Z"
+    monkeypatch.setattr(lpc, "_now_iso", lambda: expected)
+
+    receipt = lpc._pass_receipt(
+        "reviewer", "campaign-reviewer", "run-id", "manifest-hash"
+    )
+
+    assert receipt["timestamp"] == expected
+
+
 def _read_report(path: Path) -> dict[str, Any]:
     assert path.exists(), f"report not written at {path}"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
