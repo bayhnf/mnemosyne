@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import numpy as np
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,27 @@ from mnemosyne.core.beam import BeamMemory
 from mnemosyne.mcp_tools import (
     TOOLS, get_tool_definitions, handle_tool_call, _create_instance,
 )
+
+
+def _enable_plain_vec_working(monkeypatch, beam):
+    """Force the vector-write path without requiring sqlite-vec locally."""
+    from mnemosyne.core import beam as beam_module
+
+    beam.conn.execute("DROP TABLE IF EXISTS vec_working")
+    beam.conn.execute(
+        "CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY, embedding TEXT)"
+    )
+    beam.conn.commit()
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam_module._embeddings,
+        "embed",
+        lambda contents: [
+            np.full(beam_module.EMBEDDING_DIM, 0.1, dtype=np.float32)
+            for _ in contents
+        ],
+    )
+    monkeypatch.setattr(beam_module, "_wm_vec_available", lambda _conn: True)
 
 
 class TestToolSchemas:
@@ -470,6 +492,43 @@ class TestToolHandlers:
             ("mcp rollback",),
         ).fetchone()
         assert row[0] == 0
+
+    def test_handle_batch_failure_rolls_back_vectorized_remember(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mem = _create_instance(bank="default")
+        _enable_plain_vec_working(monkeypatch, mem.beam)
+
+        with patch.object(mcp_tools, "_create_instance", return_value=mem):
+            result = handle_tool_call("mnemosyne_batch", {
+                "operations": [
+                    {"action": "remember", "content": "mcp vector rollback"},
+                    {"action": "update", "memory_id": "missing", "content": "x"},
+                ],
+            })
+
+        assert result == {
+            "status": "error",
+            "error": "batch_failed",
+            "failed_index": 1,
+            "action": "update",
+            "bank": "default",
+        }
+        assert mem.beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory"
+        ).fetchone()[0] == 0
+        assert mem.beam.conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings"
+        ).fetchone()[0] == 0
+        assert mem.beam.conn.execute(
+            "SELECT COUNT(*) FROM vec_working"
+        ).fetchone()[0] == 0
+        assert mem.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE content = ?",
+            ("mcp vector rollback",),
+        ).fetchone()[0] == 0
 
     def test_handle_recall_uses_mcp_bank_env_default(self, mock_mnemosyne, monkeypatch):
         """MCP recall should use the server default bank when omitted."""

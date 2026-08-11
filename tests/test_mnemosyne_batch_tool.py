@@ -1,6 +1,8 @@
 import json
+import sqlite3
 from pathlib import Path
 
+import numpy as np
 from hermes_memory_provider import MnemosyneMemoryProvider
 from mnemosyne.core.beam import BeamMemory
 
@@ -23,6 +25,41 @@ def _count_matching(beam, text):
         (text,),
     ).fetchone()
     return row[0]
+
+
+def _enable_plain_vec_working(monkeypatch, beam):
+    """Force the vector-write path without requiring sqlite-vec locally."""
+    from mnemosyne.core import beam as beam_module
+
+    beam.conn.execute("DROP TABLE IF EXISTS vec_working")
+    beam.conn.execute(
+        "CREATE TABLE vec_working (rowid INTEGER PRIMARY KEY, embedding TEXT)"
+    )
+    beam.conn.commit()
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam_module._embeddings,
+        "embed",
+        lambda contents: [
+            np.full(beam_module.EMBEDDING_DIM, 0.1, dtype=np.float32)
+            for _ in contents
+        ],
+    )
+    monkeypatch.setattr(beam_module, "_wm_vec_available", lambda _conn: True)
+
+
+def _vector_row_counts(beam):
+    return {
+        "working_memory": beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory"
+        ).fetchone()[0],
+        "memory_embeddings": beam.conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings"
+        ).fetchone()[0],
+        "vec_working": beam.conn.execute(
+            "SELECT COUNT(*) FROM vec_working"
+        ).fetchone()[0],
+    }
 
 
 def test_batch_schema_registered_and_dispatches(tmp_path):
@@ -141,6 +178,51 @@ def test_batch_failure_rolls_back_earlier_remember(tmp_path):
     assert result["failed_index"] == 1
     assert result["action"] == "update"
     assert _count_matching(provider._beam, "rollback me") == 0
+
+
+def test_batch_failure_rolls_back_vectorized_remember(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    _enable_plain_vec_working(monkeypatch, provider._beam)
+
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [
+            {"action": "remember", "content": "vector rollback"},
+            {"action": "update", "memory_id": "missing", "content": "x"},
+        ],
+    }))
+
+    assert result == {
+        "status": "error",
+        "error": "batch_failed",
+        "failed_index": 1,
+        "action": "update",
+    }
+    assert _vector_row_counts(provider._beam) == {
+        "working_memory": 0,
+        "memory_embeddings": 0,
+        "vec_working": 0,
+    }
+
+
+def test_batch_success_commits_vectorized_remember(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    _enable_plain_vec_working(monkeypatch, provider._beam)
+
+    result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+        "operations": [{"action": "remember", "content": "vector commit"}],
+    }))
+
+    assert result["status"] == "ok"
+    with sqlite3.connect(provider._beam.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM working_memory"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM memory_embeddings"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM vec_working"
+        ).fetchone()[0] == 1
 
 
 def test_batch_failure_rolls_back_earlier_update(tmp_path):

@@ -2327,11 +2327,9 @@ def _vec_table_insert(conn: sqlite3.Connection, table: str, rowid: int, embeddin
             f"INSERT INTO {table}(rowid, embedding) VALUES (?, ?)",
             (rowid, emb_json)
         )
-    # Ensure the insert is committed even when the caller's connection
-    # has _defer_commit=True (_BeamConnection). Without this, inserts
-    # sit in the deferred transaction and disappear if the caller
-    # later rolls back or the connection is reused in a different context.
-    if commit:
+    # A deferred batch owns the transaction outcome. Its outer context commits
+    # successful vector writes once or rolls every batch write back on failure.
+    if commit and not getattr(conn, "_defer_commit", False):
         if isinstance(conn, _BeamConnection):
             conn._real_commit()
         else:
