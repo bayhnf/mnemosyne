@@ -658,6 +658,122 @@ class TestG8RealRollback:
         # Content hash verification (not counts only).
         assert checks["content_reverted"]["verdict"] == PASS
 
+    def test_g8_restores_snapshot_on_a_disposable_target(
+        self, tmp_path, monkeypatch
+    ):
+        """G8 must call the real snapshot.restore_isolated_snapshot onto a
+        fresh, nonexistent disposable target and prove the restored DB is
+        logically equivalent to the pristine snapshot (table row counts,
+        canonical-content hash, user_version), with no sidecars. The report
+        evidence is corroborated by direct inspection of the real target."""
+        import sqlite3
+
+        from mnemosyne.core.canonical import init_canonical
+        from mnemosyne.core.memory import init_db
+        from mnemosyne.dr import snapshot as snap
+
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        db = trial / "seed.db"
+        init_db(db)
+        init_canonical(db)
+
+        # Wrap restore_isolated_snapshot so the test observes the real call
+        # (args + delegation to the real implementation). The wrapper delegates
+        # to the original real implementation; it does NOT mock the oracle.
+        restore_calls: list[tuple] = []
+        real_restore = snap.restore_isolated_snapshot
+
+        def _recording_restore(snapshot_path, target_path):
+            restore_calls.append((Path(snapshot_path), Path(target_path)))
+            return real_restore(snapshot_path, target_path)
+
+        monkeypatch.setattr(snap, "restore_isolated_snapshot", _recording_restore)
+        # The campaign imports snapshot as `snap` inside _stage_g8; patch the
+        # attribute the campaign fetches lazily too, so the wrapper is honored.
+        import mnemosyne.dr.snapshot as snap_module
+
+        monkeypatch.setattr(snap_module, "restore_isolated_snapshot", _recording_restore)
+
+        code, report_path = _run_stage(
+            "g8",
+            trial,
+            monkeypatch,
+            "--source-db",
+            str(db),
+        )
+        assert code == 0, f"G8 should PASS, got {code}"
+        report = _read_report(report_path)
+        checks = report["checks"]
+
+        # The restore was invoked exactly once, on a fresh target under trial.
+        assert len(restore_calls) == 1
+        snapshot_path, restore_target = restore_calls[0]
+        assert snapshot_path.exists()
+        # Fresh target: it must now exist (restore created it) and be contained.
+        assert restore_target.exists()
+        assert trial in restore_target.resolve().parents or restore_target.resolve() == trial.resolve()
+
+        # Report evidence.
+        assert checks["restore"]["verdict"] == PASS
+        assert checks["table_equivalence"]["verdict"] == PASS
+        assert checks["restore_content_match"]["verdict"] == PASS
+        assert checks["user_version_match"]["verdict"] == PASS
+        assert checks["post_restore_integrity"]["verdict"] == PASS
+        assert checks["sidecar_absence"]["verdict"] == PASS
+
+        # Independent corroboration against the REAL target file: logical
+        # equivalence to the pristine snapshot by row counts, content hash,
+        # and user_version; integrity_check ok; no sidecars.
+        def _row_counts(path):
+            conn = sqlite3.connect(str(path))
+            try:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                counts = {}
+                for (name,) in rows:
+                    counts[name] = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+                return counts
+            finally:
+                conn.close()
+
+        assert _row_counts(snapshot_path) == _row_counts(restore_target)
+
+        def _content_hash(path):
+            conn = sqlite3.connect(str(path))
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT id, owner_id, category, name, body, confidence, "
+                    "version, valid_from, valid_until FROM canonical_facts ORDER BY id"
+                ).fetchall()
+                return hashlib.sha256(
+                    json.dumps([dict(r) for r in rows], sort_keys=True, default=str).encode()
+                ).hexdigest()
+            finally:
+                conn.close()
+
+        assert _content_hash(snapshot_path) == _content_hash(restore_target)
+
+        def _user_version(path):
+            conn = sqlite3.connect(str(path))
+            try:
+                return conn.execute("PRAGMA user_version").fetchone()[0]
+            finally:
+                conn.close()
+
+        assert _user_version(snapshot_path) == _user_version(restore_target)
+
+        conn = sqlite3.connect(str(restore_target))
+        try:
+            assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            conn.close()
+        assert not Path(str(restore_target) + "-wal").exists()
+        assert not Path(str(restore_target) + "-shm").exists()
+
     def test_g8_sqlite_error_fails_closed(self, tmp_path, monkeypatch):
         """If the dream_runs query hits a sqlite error, G8 must FAIL not PASS."""
         trial = tmp_path / "trial"

@@ -157,6 +157,7 @@ _ALLOWED_CHECK_NAMES = frozenset(
         "post_restore_integrity",
         "pristine_intact",
         "table_equivalence",
+        "restore_content_match",
         "content_reverted",
         "sidecar_absence",
         "user_version_match",
@@ -1834,7 +1835,11 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
     """G8 rollback rehearsal on a clone. Critical 4: actually creates an
     applied Dream action on the clone, snapshots, calls dream_undo via the
     real native API, and verifies canonical_facts content is reverted via
-    row hashing (not counts). sqlite errors fail closed."""
+    row hashing (not counts). It then restores the pristine snapshot onto a
+    fresh disposable target via snapshot.restore_isolated_snapshot and proves
+    the restored DB is logically equivalent to the snapshot (table row
+    counts, canonical-content hash, user_version) with integrity_check ok and
+    no -wal/-shm sidecars. sqlite errors fail closed."""
     with _campaign_process_state():
         trial_root = Path(args.trial_root)
         if not _trial_root_ok(trial_root):
@@ -1878,7 +1883,21 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             if side.exists():
                 side.unlink()
 
-        # Snapshot the clone BEFORE Dream apply (baseline for revert comparison).
+        # Initialize canonical_facts on the clone BEFORE snapshotting so the
+        # pristine baseline includes the canonical schema and the restore
+        # target can be compared against it content-for-content. Fail closed
+        # if the schema cannot be initialized.
+        try:
+            from mnemosyne.core.canonical import init_canonical
+
+            init_canonical(clone)
+        except Exception:
+            traceback.clear_frames(sys.exc_info()[2])
+            checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_failed"}
+            return FAIL, "snapshot_failed", checks
+
+        # Snapshot the clone AFTER canonical init (baseline for revert and
+        # restore comparison). This is the pristine pre-apply image.
         snaps_dir = trial_root / "snapshots"
         try:
             result = snap.create_isolated_snapshot(clone, snaps_dir)
@@ -1889,14 +1908,8 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         snap_path = Path(result["snapshot_path"])
         pristine_sha = result.get("sha256", "")
 
-        # Init canonical_facts on the clone so the baseline hash is stable, then
-        # record the baseline (pre-apply) content hash.
-        try:
-            from mnemosyne.core.canonical import init_canonical
-
-            init_canonical(clone)
-        except Exception:
-            traceback.clear_frames(sys.exc_info()[2])
+        # Record the baseline (pre-apply) content hash, identical to the
+        # snapshot's canonical content because the snapshot was taken here.
         baseline_hash = _canonical_content_hash(clone)
 
         # Drive a real Dream apply on the clone.
@@ -1974,10 +1987,44 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             if side.exists():
                 side.unlink()
 
+        # Critical 4 truth: restore the pristine snapshot onto a FRESH
+        # disposable target via the real restore_isolated_snapshot. The
+        # target must not pre-exist (no probe table, no reused target) and
+        # must live under the contained trial root. Fail closed on any error.
+        restore_target = work_dir / "restore_target.db"
+        if restore_target.exists():
+            # Ensure a truly fresh target; remove any stale file/sidecars.
+            restore_target.unlink()
+        for side in (Path(str(restore_target) + "-wal"), Path(str(restore_target) + "-shm")):
+            if side.exists():
+                side.unlink()
+        try:
+            snap.restore_isolated_snapshot(snap_path, restore_target)
+        except Exception:
+            traceback.clear_frames(sys.exc_info()[2])
+            checks["restore"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["table_equivalence"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["restore_content_match"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["user_version_match"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["post_restore_integrity"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["pristine_intact"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["sidecar_absence"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["dream_undo"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            checks["content_reverted"] = {"verdict": FAIL, "reason_code": "restore_failed"}
+            return FAIL, "restore_failed", checks
+
+        # Compare the restored target against the pristine snapshot: logical
+        # table row counts, canonical-content hash, and user_version.
+        tables_equiv = _tables_equivalent(snap_path, restore_target)
+        content_match = _canonical_content_hash(restore_target) == baseline_hash
+        uv_match = _user_version(snap_path) == _user_version(restore_target)
+        target_integrity = _integrity_ok(restore_target)
+        target_no_sidecars = not _has_sidecars(restore_target)
+
         checks["restore"] = {"verdict": PASS, "reason_code": "ok"}
         checks["post_restore_integrity"] = {
-            "verdict": PASS if _integrity_ok(clone) else FAIL,
-            "reason_code": "ok" if _integrity_ok(clone) else "integrity_failed",
+            "verdict": PASS if target_integrity else FAIL,
+            "reason_code": "ok" if target_integrity else "integrity_failed",
         }
         sidecar = Path(str(snap_path) + ".sha256")
         pristine_intact = False
@@ -1990,9 +2037,21 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             "verdict": PASS if pristine_intact else FAIL,
             "reason_code": "ok" if pristine_intact else "pristine_tampered",
         }
+        checks["table_equivalence"] = {
+            "verdict": PASS if tables_equiv else FAIL,
+            "reason_code": "ok" if tables_equiv else "table_mismatch",
+        }
+        checks["restore_content_match"] = {
+            "verdict": PASS if content_match else FAIL,
+            "reason_code": "ok" if content_match else "content_not_reverted",
+        }
+        checks["user_version_match"] = {
+            "verdict": PASS if uv_match else FAIL,
+            "reason_code": "ok" if uv_match else "user_version_mismatch",
+        }
         checks["sidecar_absence"] = {
-            "verdict": PASS if not _has_sidecars(clone) else FAIL,
-            "reason_code": "ok" if not _has_sidecars(clone) else "sidecar_present",
+            "verdict": PASS if target_no_sidecars else FAIL,
+            "reason_code": "ok" if target_no_sidecars else "sidecar_present",
         }
         checks["dream_undo"] = {
             "verdict": PASS if undone_count >= 1 else FAIL,
@@ -2008,6 +2067,9 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             "restore",
             "post_restore_integrity",
             "pristine_intact",
+            "table_equivalence",
+            "restore_content_match",
+            "user_version_match",
             "sidecar_absence",
             "dream_undo",
             "content_reverted",
@@ -2015,6 +2077,8 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             if checks[key]["verdict"] != PASS:
                 return FAIL, "rollback_rehearsal_failed", checks
         return PASS, "ok", checks
+
+
 
 
 # ---------------------------------------------------------------------------
