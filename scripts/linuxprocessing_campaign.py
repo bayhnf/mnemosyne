@@ -1617,7 +1617,10 @@ def _stage_g6(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 def _resource_snapshot() -> dict[str, int] | None:
     import resource
 
-    rlim = resource.getrusage(resource.RUSAGE_SELF)
+    try:
+        rlim = resource.getrusage(resource.RUSAGE_SELF)
+    except OSError:
+        return None
     rss_kb = int(getattr(rlim, "ru_maxrss", 0))
     if rss_kb > (1 << 30):
         rss_kb //= 1024

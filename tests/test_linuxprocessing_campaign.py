@@ -1155,6 +1155,27 @@ class TestG7RealSoak:
         )
         assert lpc._resource_snapshot() is None
 
+    def test_g7_getrusage_failure_is_explicit(self, tmp_path, monkeypatch):
+        """getrusage OSError must yield None and resource_measurement_failed,
+        never unexpected_error."""
+        import resource
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("measurement failed")
+
+        monkeypatch.setattr(resource, "getrusage", _boom)
+        assert lpc._resource_snapshot() is None
+
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g7", trial, monkeypatch, "--soak-seconds", "0", "--ack-soak-schedule"
+        )
+        assert code == 1
+        report = _read_report(report_path)
+        assert report["reason_code"] == "resource_measurement_failed"
+        assert report["checks"]["budgets"]["reason_code"] == "resource_measurement_failed"
+
     def test_g7_fails_with_resource_measurement_failed(self, tmp_path, monkeypatch):
         """An unavailable resource measurement must fail G7, not emit a zero."""
         trial = tmp_path / "trial"
