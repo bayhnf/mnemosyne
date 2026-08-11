@@ -42,6 +42,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -93,6 +94,7 @@ _ALLOWED_CHECK_KEYS = frozenset(
     {
         "verdict",
         "reason_code",
+        "digest",
         "stored",
         "duplicate",
         "final_state",
@@ -122,11 +124,9 @@ _ALLOWED_CHECK_NAMES = frozenset(
         "trial_root",
         "python",
         "disk_space",
-        "endpoint",
-        "dimension",
-        "lane",
         "t0_ssh_ack",
         "image_digest_ack",
+        "image_digest",
         "approved_sha",
         "dependency_health",
         "lane_imports",
@@ -197,6 +197,7 @@ _APPROVED_REASON_CODES = frozenset(
         "disk_unavailable",
         "t0_ssh_ack_required",
         "image_digest_ack_required",
+        "image_digest_invalid",
         "snapshot_approved_ack_required",
         "writer_quiesce_ack_required",
         "fault_strategy_ack_required",
@@ -532,34 +533,13 @@ def _check_disk_space(trial_root: Path, min_bytes: int = 1 << 30) -> tuple[str, 
     return FAIL, "insufficient_disk"
 
 
-def _check_endpoint_static(trial_root: Path) -> tuple[str, str]:
-    """Endpoint readiness: the Linuxprocessing endpoint lane is configured
-    when the trial root is a real, contained directory. NOT a tautology: it
-    verifies the trial root resolves and is not a symlink escape."""
-    if _trial_root_ok(trial_root):
-        return PASS, "ok"
-    return FAIL, "trial_root_missing"
-
-
-def _check_dimension_static() -> tuple[str, str]:
-    """Dimension check: verifies the actual G0-G8 stage set matches the
-    expected nine stages, not just a count."""
-    expected = ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8")
-    if _ALL_ORDER == expected:
-        return PASS, "ok"
-    return FAIL, "dimension_mismatch"
-
-
-def _check_lane_static(trial_root: Path) -> tuple[str, str]:
-    """Lane check: the local lane is available when the trial root is a real
-    contained directory. Not tautological: tied to trial-root validity."""
-    if _trial_root_ok(trial_root):
-        return PASS, "ok"
-    return FAIL, "trial_root_missing"
-
-
 def _ack_state(flag: bool) -> str:
     return "ACKNOWLEDGED" if flag else "PENDING"
+
+
+def _normalize_image_digest(value: str) -> str | None:
+    match = re.fullmatch(r"(?:sha256:)?([0-9a-fA-F]{64})", value.strip())
+    return match.group(1).lower() if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -628,32 +608,35 @@ def _stage_g0(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         "verdict": _check_disk_space(trial_root)[0],
         "reason_code": _check_disk_space(trial_root)[1],
     }
-    checks["endpoint"] = {
-        "verdict": _check_endpoint_static(trial_root)[0],
-        "reason_code": _check_endpoint_static(trial_root)[1],
-    }
-    checks["dimension"] = {
-        "verdict": _check_dimension_static()[0],
-        "reason_code": _check_dimension_static()[1],
-    }
-    checks["lane"] = {
-        "verdict": _check_lane_static(trial_root)[0],
-        "reason_code": _check_lane_static(trial_root)[1],
-    }
 
     # Critical 2: T0 SSH and image-digest acks now GATE at G0.
     checks["t0_ssh_ack"] = {"verdict": _ack_state(args.ack_t0_ssh)}
     checks["image_digest_ack"] = {"verdict": _ack_state(args.ack_image_digest)}
 
-    if any(
-        checks[k]["verdict"] != PASS
-        for k in ("python", "disk_space", "endpoint", "dimension", "lane")
-    ):
+    if any(checks[k]["verdict"] != PASS for k in ("python", "disk_space")):
         return FAIL, "preflight_failed", checks
     if not args.ack_t0_ssh:
         return GATE, "t0_ssh_ack_required", checks
     if not args.ack_image_digest:
         return GATE, "image_digest_ack_required", checks
+    if not args.image_digest:
+        checks["image_digest"] = {
+            "verdict": GATE,
+            "reason_code": "image_digest_ack_required",
+        }
+        return GATE, "image_digest_ack_required", checks
+    digest = _normalize_image_digest(args.image_digest)
+    if digest is None:
+        checks["image_digest"] = {
+            "verdict": FAIL,
+            "reason_code": "image_digest_invalid",
+        }
+        return FAIL, "image_digest_invalid", checks
+    checks["image_digest"] = {
+        "verdict": PASS,
+        "reason_code": "ok",
+        "digest": digest,
+    }
     return PASS, "ok", checks
 
 
@@ -2164,6 +2147,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trial-interpreter", default=sys.executable)
     p.add_argument("--ack-t0-ssh", action="store_true")
     p.add_argument("--ack-image-digest", action="store_true")
+    p.add_argument("--image-digest", default="")
     p.add_argument("--ack-snapshot-approved", action="store_true")
     p.add_argument("--ack-writer-quiesce", action="store_true")
     p.add_argument("--ack-codex-desktop", action="store_true")

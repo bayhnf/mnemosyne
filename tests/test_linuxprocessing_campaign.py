@@ -194,6 +194,8 @@ def _all_pass_args(trial: Path, source: Path) -> list[str]:
         str(source),
         "--approved-sha",
         "deadbeef" * 8,
+        "--image-digest",
+        "a" * 64,
         "--g4-events",
         "4",
         "--g4-writers",
@@ -316,13 +318,52 @@ class TestMandatoryGates:
         report = _read_report(report_path)
         assert report["verdict"] == GATE
 
-    def test_g0_passes_with_all_acks(self, tmp_path, monkeypatch):
+    def test_g0_requires_a_bound_image_digest(self, tmp_path, monkeypatch):
         trial = tmp_path / "trial"
         trial.mkdir()
-        code, _ = _run_stage(
+        code, report_path = _run_stage(
             "g0", trial, monkeypatch, "--ack-t0-ssh", "--ack-image-digest"
         )
-        assert code == 0
+        assert code == lpc.EXIT_GATE
+        assert _read_report(report_path)["checks"]["image_digest"]["verdict"] == GATE
+
+    def test_g0_rejects_malformed_image_digest(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g0",
+            trial,
+            monkeypatch,
+            "--ack-t0-ssh",
+            "--ack-image-digest",
+            "--image-digest",
+            "not-a-digest",
+        )
+        assert code == lpc.EXIT_FAIL
+        assert (
+            _read_report(report_path)["checks"]["image_digest"]["reason_code"]
+            == "image_digest_invalid"
+        )
+
+    def test_g0_records_valid_digest_without_static_claims(
+        self, tmp_path, monkeypatch
+    ):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        digest = "a" * 64
+        code, report_path = _run_stage(
+            "g0",
+            trial,
+            monkeypatch,
+            "--ack-t0-ssh",
+            "--ack-image-digest",
+            "--image-digest",
+            f"sha256:{digest}",
+        )
+        assert code == lpc.EXIT_PASS
+        checks = _read_report(report_path)["checks"]
+        assert checks["image_digest"]["digest"] == digest
+        assert {"endpoint", "dimension", "lane"}.isdisjoint(checks)
 
     def test_g2_gates_without_snapshot_or_writer_ack(self, tmp_path, monkeypatch):
         trial = tmp_path / "trial"
@@ -983,21 +1024,6 @@ class TestTruthfulChecks:
         # The first argv element must be the trial interpreter, always.
         assert len(captured) >= 1
         assert captured[0][0] == sys.executable
-
-    def test_endpoint_check_not_tautological(self):
-        """The endpoint check must do something real, not always return PASS."""
-        # It must at least verify the trial root exists (containment), not
-        # blindly return PASS.
-        v_bad, _ = lpc._check_endpoint_static(Path("/nonexistent"))
-        v_bad2 = v_bad
-        # A real check varies by input; verify it's tied to a real condition.
-        assert v_bad2 in (PASS, FAIL)
-
-    def test_dimension_check_not_just_count(self):
-        """The dimension check must verify the actual stage set, not just len."""
-        v, r = lpc._check_dimension_static()
-        # If _ALL_ORDER is tampered, it must fail.
-        assert v in (PASS, FAIL)
 
     def test_g5_uses_trial_interpreter_for_package_check(self, tmp_path, monkeypatch):
         """G5 package import must use the trial interpreter, not the campaign
