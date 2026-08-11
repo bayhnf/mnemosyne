@@ -1,16 +1,21 @@
 """Tests for embedding multilingual model dimension detection and API model routing."""
-import os
 
 import pytest
 
 from mnemosyne.core import embeddings
 
 
-def setup_module():
-    """Clean env vars that would shadow dimension lookups."""
-    os.environ.pop("MNEMOSYNE_EMBEDDING_DIM", None)
-    os.environ.pop("OPENROUTER_BASE_URL", None)
-    os.environ.pop("MNEMOSYNE_EMBEDDING_API_URL", None)
+_EMBEDDING_ENV_KEYS = (
+    "MNEMOSYNE_EMBEDDING_DIM",
+    "OPENROUTER_BASE_URL",
+    "MNEMOSYNE_EMBEDDING_API_URL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_embedding_environment(monkeypatch):
+    for key in _EMBEDDING_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_get_embedding_dim_english_models():
@@ -67,14 +72,11 @@ def test_get_embedding_dim_jina_v2_base_family():
         assert embeddings._get_embedding_dim(model) == 768, model
 
 
-def test_get_embedding_dim_env_override():
+def test_get_embedding_dim_env_override(monkeypatch):
     """MNEMOSYNE_EMBEDDING_DIM env var overrides model-based detection."""
-    os.environ["MNEMOSYNE_EMBEDDING_DIM"] = "768"
-    try:
-        assert embeddings._get_embedding_dim("BAAI/bge-small-en-v1.5") == 768
-        assert embeddings._get_embedding_dim("unknown-model") == 768
-    finally:
-        del os.environ["MNEMOSYNE_EMBEDDING_DIM"]
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_DIM", "768")
+    assert embeddings._get_embedding_dim("BAAI/bge-small-en-v1.5") == 768
+    assert embeddings._get_embedding_dim("unknown-model") == 768
 
 
 def test_get_embedding_dim_unknown_model_raises(monkeypatch):
@@ -146,15 +148,8 @@ def test_get_embedding_dim_openai_models():
 # _is_api_model tests — custom endpoint detection (PR #161)
 # ---------------------------------------------------------------------------
 
-def _clean_env():
-    """Remove test env vars that influence _is_api_model()."""
-    for key in ("OPENROUTER_BASE_URL", "MNEMOSYNE_EMBEDDING_API_URL"):
-        os.environ.pop(key, None)
-
-
 def test_is_api_model_openai_patterns():
     """Model names matching openai/text-embedding patterns return True."""
-    _clean_env()
     assert embeddings._is_api_model("openai/text-embedding-3-small") is True
     assert embeddings._is_api_model("text-embedding-3-large") is True
     assert embeddings._is_api_model("openai/custom-model") is True
@@ -162,40 +157,29 @@ def test_is_api_model_openai_patterns():
 
 def test_is_api_model_unknown_without_custom_endpoint():
     """Unknown model names return False when no custom endpoint is set."""
-    _clean_env()
     assert embeddings._is_api_model("BAAI/bge-small-en-v1.5") is False
     assert embeddings._is_api_model("jina-embeddings-v5-omni-nano") is False
     assert embeddings._is_api_model("some/random-model") is False
 
 
-def test_is_api_model_custom_endpoint_non_openrouter():
+def test_is_api_model_custom_endpoint_non_openrouter(monkeypatch):
     """Custom endpoint (non-OpenRouter URL) -> any model name returns True."""
-    _clean_env()
-    # intentional space for readability
-    os.environ["MNEMOSYNE_EMBEDDING_API_URL"] = "https://llama.floory.uk/v1"
-    try:
-        assert embeddings._is_api_model("jina-embeddings-v5-omni-nano") is True
-        assert embeddings._is_api_model("BAAI/bge-small-en-v1.5") is True
-        assert embeddings._is_api_model("some/random-model") is True
-    finally:
-        _clean_env()
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://llama.floory.uk/v1")
+    assert embeddings._is_api_model("jina-embeddings-v5-omni-nano") is True
+    assert embeddings._is_api_model("BAAI/bge-small-en-v1.5") is True
+    assert embeddings._is_api_model("some/random-model") is True
 
 
-def test_is_api_model_openrouter_url_not_custom():
+def test_is_api_model_openrouter_url_not_custom(monkeypatch):
     """OpenRouter URL itself should NOT trigger custom endpoint detection."""
-    _clean_env()
-    os.environ["MNEMOSYNE_EMBEDDING_API_URL"] = "https://openrouter.ai/api/v1"
-    try:
-        # Unknown model on OpenRouter still uses fastembed (False)
-        assert embeddings._is_api_model("jina-embeddings-v5-omni-nano") is False
-        # But openai/ patterns still match on their own
-        assert embeddings._is_api_model("openai/text-embedding-3-small") is True
-    finally:
-        _clean_env()
+    monkeypatch.setenv("MNEMOSYNE_EMBEDDING_API_URL", "https://openrouter.ai/api/v1")
+    # Unknown model on OpenRouter still uses fastembed (False)
+    assert embeddings._is_api_model("jina-embeddings-v5-omni-nano") is False
+    # But openai/ patterns still match on their own
+    assert embeddings._is_api_model("openai/text-embedding-3-small") is True
 
 
 def test_is_api_model_text_embedding_substring():
     """Models containing 'text-embedding' anywhere in name return True."""
-    _clean_env()
     assert embeddings._is_api_model("my-org/text-embedding-custom") is True
     assert embeddings._is_api_model("prefix-text-embedding-suffix") is True
