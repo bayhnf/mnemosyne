@@ -1598,7 +1598,7 @@ class TestOnlyActiveVectorPathRound2:
         # Insert a matching embedding so _wm_vec_search_fallback finds it.
         fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
         beam.conn.execute(
-            "INSERT INTO memory_embeddings(memory_id, embedding_json, model) "
+            "INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model) "
             "VALUES (?, ?, ?)",
             (mid, __import__("json").dumps(fake_vec.tolist()), "test"),
         )
@@ -1645,7 +1645,7 @@ class TestOnlyActiveVectorPathRound2:
         )
         fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
         beam.conn.execute(
-            "INSERT INTO memory_embeddings(memory_id, embedding_json, model) "
+            "INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model) "
             "VALUES (?, ?, ?)",
             (mid, __import__("json").dumps(fake_vec.tolist()), "test"),
         )
@@ -1691,7 +1691,7 @@ class TestOnlyActiveVectorPathRound2:
         )
         fake_vec = np.ones(emb_mod.EMBEDDING_DIM, dtype=np.float32)
         beam.conn.execute(
-            "INSERT INTO memory_embeddings(memory_id, embedding_json, model) "
+            "INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model) "
             "VALUES (?, ?, ?)",
             (mid, __import__("json").dumps(fake_vec.tolist()), "test"),
         )
