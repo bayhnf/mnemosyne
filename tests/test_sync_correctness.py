@@ -1243,6 +1243,30 @@ def test_push_changes_counts_empty_embedding_but_not_embeddings_off(
     )
 
 
+def test_push_changes_counts_empty_per_item_embedding_as_degraded(
+    sync_engine, monkeypatch, create_event
+):
+    """A non-empty batch containing an empty vector must not be persisted."""
+    from mnemosyne.core import beam
+    import numpy as np
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed",
+        lambda texts: np.empty((1, 0), dtype=np.float32),
+    )
+
+    event = create_event(content="safe")
+    result = sync_engine.push_changes([event])
+
+    assert result["accepted"] == 1
+    assert result["degraded_embeddings"] == 1
+    assert sync_engine.conn.execute(
+        "SELECT 1 FROM memory_embeddings WHERE memory_id = ?", (event["memory_id"],)
+    ).fetchone() is None
+
+
 def test_push_changes_keeps_no_content_delete_at_zero(sync_engine, create_event):
     """A valid DELETE with no content does not attempt or degrade embedding."""
     result = sync_engine.push_changes([create_event(content=None, operation="DELETE")])

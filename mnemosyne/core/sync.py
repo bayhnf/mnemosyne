@@ -1577,7 +1577,10 @@ class SyncEngine:
             vectors = _embeddings.embed([str(payload["content"])])
             if vectors is None or not len(vectors):
                 return None, True
-            return vectors[0], False
+            vector = vectors[0]
+            if vector is None or not len(vector):
+                return None, True
+            return vector, False
         except Exception as exc:
             logger.warning("sync embedding preparation failed: %s", exc)
             return None, True
