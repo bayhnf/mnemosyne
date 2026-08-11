@@ -3,11 +3,22 @@
 import pytest
 import os
 import tempfile
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 
 class TestSyncRoles:
     """Verify sync_roles controls which conversation roles are autosaved."""
+
+    @staticmethod
+    def _stored_contents(provider):
+        """Return persisted working_memory contents."""
+        conn = sqlite3.connect(provider._beam.db_path)
+        try:
+            rows = conn.execute("SELECT content FROM working_memory").fetchall()
+            return [r[0] for r in rows]
+        finally:
+            conn.close()
 
     @pytest.fixture
     def provider(self):
@@ -38,36 +49,33 @@ class TestSyncRoles:
 
     def test_default_saves_user_only(self, provider):
         """Default sync_roles saves user turns only; assistant autosave is opt-in."""
-        provider._beam.remember = MagicMock()
         provider.sync_turn("Tell me about memory systems", "Here is what I know about memory.")
 
-        sources = [c.kwargs.get("content", "") for c in provider._beam.remember.call_args_list]
-        user_calls = [s for s in sources if s.startswith("[USER]")]
-        assistant_calls = [s for s in sources if s.startswith("[ASSISTANT]")]
+        contents = self._stored_contents(provider)
+        user_calls = [c for c in contents if c.startswith("[USER]")]
+        assistant_calls = [c for c in contents if c.startswith("[ASSISTANT]")]
         assert len(user_calls) == 1
         assert len(assistant_calls) == 0
 
     def test_user_only(self, provider):
         """sync_roles=['user'] saves user turns, skips assistant."""
         provider._sync_roles = {"user"}
-        provider._beam.remember = MagicMock()
         provider.sync_turn("Tell me about memory systems", "Here is what I know about memory.")
 
-        sources = [c.kwargs.get("content", "") for c in provider._beam.remember.call_args_list]
-        user_calls = [s for s in sources if s.startswith("[USER]")]
-        assistant_calls = [s for s in sources if s.startswith("[ASSISTANT]")]
+        contents = self._stored_contents(provider)
+        user_calls = [c for c in contents if c.startswith("[USER]")]
+        assistant_calls = [c for c in contents if c.startswith("[ASSISTANT]")]
         assert len(user_calls) == 1
         assert len(assistant_calls) == 0
 
     def test_assistant_only(self, provider):
         """sync_roles=['assistant'] saves assistant turns, skips user."""
         provider._sync_roles = {"assistant"}
-        provider._beam.remember = MagicMock()
         provider.sync_turn("Tell me about memory systems", "Here is what I know about memory.")
 
-        sources = [c.kwargs.get("content", "") for c in provider._beam.remember.call_args_list]
-        user_calls = [s for s in sources if s.startswith("[USER]")]
-        assistant_calls = [s for s in sources if s.startswith("[ASSISTANT]")]
+        contents = self._stored_contents(provider)
+        user_calls = [c for c in contents if c.startswith("[USER]")]
+        assistant_calls = [c for c in contents if c.startswith("[ASSISTANT]")]
         assert len(user_calls) == 0
         assert len(assistant_calls) == 1
 
