@@ -61,6 +61,10 @@ class _FailingAudit:
     def __init__(self, exception: Exception):
         self._exception = exception
 
+    @property
+    def healthy(self) -> bool:
+        return True
+
     def record(self, *_args, **_kwargs) -> None:
         raise self._exception
 
@@ -512,3 +516,47 @@ class TestAuditIntegration:
         provider._agent_context = "primary"
         # _audit is None, should not crash
         provider._audit_event("remember", memory_id="x")
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_provider_audit_unavailable_after_record_failure_emits_static_diagnostic(
+    package, caplog, tmp_path
+):
+    """Once the audit object becomes unhealthy, subsequent events must emit the
+    static ``audit_unavailable`` diagnostic instead of touching the dead
+    connection again."""
+    module = _provider_module(package)
+    audit = _audit_module(package)
+
+    path_canary = "SECRET-CANARY-r5-unhealthy-path"
+    record_canary = "SECRET-CANARY-r5-unhealthy-record"
+
+    log = audit.AuditLog(tmp_path / f"{path_canary}.db")
+    assert log.healthy is True
+
+    # Monkeypatch record() to fail and close the connection, exactly as a real
+    # SQLite error would. healthy must become False afterwards.
+    def _failing_record(*_args, **_kwargs):
+        log._conn.close()
+        log._conn = None
+        raise RuntimeError(record_canary)
+
+    log.record = _failing_record
+
+    provider = module.MnemosyneMemoryProvider()
+    provider._audit = log
+    provider._session_id = "audit-unhealthy"
+    provider._agent_identity = "audit-r5"
+
+    with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+        provider._audit_event("remember")           # trips the failure
+        provider._audit_event("remember")           # must short-circuit
+
+    fields = _all_log_fields(caplog.records)
+    assert provider._audit.healthy is False
+    # Second event must emit the static audit_unavailable diagnostic.
+    assert fields.count("audit: event_dropped reason=audit_unavailable") >= 1
+    # The canaries (path or exception text) must never appear.
+    assert path_canary not in fields
+    assert record_canary not in fields
+    assert all(record.exc_info is None for record in caplog.records)

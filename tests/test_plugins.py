@@ -11,6 +11,7 @@ Validates:
 """
 
 import importlib
+import logging
 import os
 import sys
 import pytest
@@ -930,3 +931,94 @@ class TestPluginIntegration:
             assert hasattr(mem, "plugins")
             assert manager.is_loaded("logging")
             assert manager.is_loaded("metrics")
+
+# ============================================================================
+# Task 4: Plugin rediscovery and content-free load-failure observability
+# ============================================================================
+
+
+class TestPluginRediscovery:
+    """A changed plugin file must be re-executed on rediscovery."""
+
+    @pytest.fixture(autouse=True)
+    def plugin_module_cleanup(self):
+        yield
+        for key in [
+            key for key in sys.modules if key.startswith("_mnemosyne_user_plugin_")
+        ]:
+            del sys.modules[key]
+
+    def test_rediscover_picks_up_changed_file(self, manager):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_file = Path(tmpdir) / "vplugin.py"
+            plugin_file.write_text(
+                "from mnemosyne.core.plugins import MnemosynePlugin\n"
+                "class Versioned(MnemosynePlugin):\n"
+                "    name = 'versioned'\n"
+                "    marker = 'one'\n"
+                "    def on_remember(self, memory): pass\n"
+                "    def on_recall(self, memory): pass\n"
+                "    def on_consolidate(self, summary): pass\n"
+                "    def on_invalidate(self, memory_id): pass\n"
+            )
+            mgr = PluginManager(plugin_dir=Path(tmpdir))
+            assert mgr.discover_plugins() == ["versioned"]
+            assert mgr._registry["versioned"].marker == "one"
+
+            # Rewrite the file with version two. stat mtime granularity on some
+            # filesystems is 1s, but content size also changes (the literal
+            # 'one' -> 'two' is the same length, so bump mtime explicitly).
+            import os as _os
+            plugin_file.write_text(
+                "from mnemosyne.core.plugins import MnemosynePlugin\n"
+                "class Versioned(MnemosynePlugin):\n"
+                "    name = 'versioned'\n"
+                "    marker = 'two'\n"
+                "    def on_remember(self, memory): pass\n"
+                "    def on_recall(self, memory): pass\n"
+                "    def on_consolidate(self, summary): pass\n"
+                "    def on_invalidate(self, memory_id): pass\n"
+            )
+            next_year = int(_os.stat(plugin_file).st_mtime) + 10
+            _os.utime(plugin_file, (next_year, next_year))
+
+            discovered_again = mgr.discover_plugins()
+            # Class identity must reflect version two, regardless of whether
+            # the registry reported it as a new registration.
+            assert mgr._registry["versioned"].marker == "two"
+            # The file changed, so rediscovery reports the name again.
+            assert discovered_again == ["versioned"]
+
+
+class TestPluginLoadFailureIsContentFree:
+    """Load failures must not leak private paths or exception messages."""
+
+    @pytest.fixture(autouse=True)
+    def plugin_module_cleanup(self):
+        yield
+        for key in [
+            key for key in sys.modules if key.startswith("_mnemosyne_user_plugin_")
+        ]:
+            del sys.modules[key]
+
+    def test_load_failure_omits_path_and_exception(self, manager, caplog):
+        secret_token = "plugin-failure-secret-canary-4242"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plugin_file = Path(tmpdir) / "boom.py"
+            plugin_file.write_text(f"raise RuntimeError('{secret_token}')\n")
+            mgr = PluginManager(plugin_dir=Path(tmpdir))
+            with caplog.at_level(logging.WARNING, logger="mnemosyne.core.plugins"):
+                discovered = mgr.discover_plugins()
+            assert discovered == []
+
+        fields = []
+        for record in caplog.records:
+            fields.append(record.getMessage())
+            if record.exc_info:
+                import traceback as _tb
+                fields.append("".join(_tb.format_exception(*record.exc_info)))
+        joined = "\n".join(fields)
+        # The temporary path (which contains the test tmpdir) must not be logged.
+        assert tmpdir not in joined
+        # The exception text must not be logged.
+        assert secret_token not in joined

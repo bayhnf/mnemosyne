@@ -438,6 +438,10 @@ class PluginManager:
         self._registry: Dict[str, Type[MnemosynePlugin]] = {}
         self._instances: Dict[str, MnemosynePlugin] = {}
         self._plugin_dir = plugin_dir or DEFAULT_PLUGIN_DIR
+        # Maps a registered plugin name to the source file path that produced
+        # it, so a re-discovered (changed) file can replace its own prior
+        # registration without clobbering builtins or other files' plugins.
+        self._plugin_sources: Dict[str, Path] = {}
 
         # Register built-in plugins
         self.register_plugin("logging", LoggingPlugin)
@@ -574,6 +578,13 @@ class PluginManager:
         Scans ~/.hermes/mnemosyne/plugins/ for Python files and
         registers any MnemosynePlugin subclasses found.
 
+        A plugin file whose on-disk identity (mtime + size) changed since the
+        last discovery is re-executed so the registry reflects the current
+        class definition rather than stale module state. Plugin load failures
+        are logged as a static event with the exception class name only --
+        never the file path (which may be user-supplied) or the exception
+        message (which may echo user content).
+
         Returns:
             List of newly registered plugin names.
         """
@@ -592,14 +603,21 @@ class PluginManager:
                     f"{file_path.resolve()}:{file_path.stem}".encode("utf-8")
                 ).hexdigest()
                 module_key = f"_mnemosyne_user_plugin_{file_path.stem}_{digest}"
+                file_stat = file_path.stat()
+                file_identity = (file_stat.st_mtime_ns, file_stat.st_size)
                 module = sys.modules.get(module_key)
-                if module is None:
+                if module is None or getattr(module, "_file_identity", None) != file_identity:
+                    # Evict any stale module state for this key so a changed
+                    # plugin file is re-executed instead of silently reused.
+                    if module is not None:
+                        module = None
                     spec = importlib.util.spec_from_file_location(
                         module_key, str(file_path)
                     )
                     if spec is None or spec.loader is None:
                         continue
                     module = importlib.util.module_from_spec(spec)
+                    module._file_identity = file_identity  # type: ignore[attr-defined]
                     sys.modules[module_key] = module
                     created = True
                     spec.loader.exec_module(module)
@@ -613,13 +631,28 @@ class PluginManager:
                         and not obj.__name__.startswith("_")
                     ):
                         plugin_name = getattr(obj, "name", None) or obj.__name__.lower()
+                        prior_source = self._plugin_sources.get(plugin_name)
+                        prior_class = self._registry.get(plugin_name)
                         if plugin_name not in self._registry:
                             self.register_plugin(plugin_name, obj)
+                            self._plugin_sources[plugin_name] = file_path
+                            discovered.append(plugin_name)
+                        elif prior_source == file_path and prior_class is not obj:
+                            # Same plugin file was re-executed and produced a
+                            # new class object: replace the registration in
+                            # place so the registry tracks the current class.
+                            # Entries sourced from a different file (notably
+                            # builtins) are left untouched, preserving the
+                            # no-shadow contract.
+                            self._registry[plugin_name] = obj
                             discovered.append(plugin_name)
             except Exception as exc:
                 if created and sys.modules.get(module_key) is module:
                     del sys.modules[module_key]
-                logger.warning("Failed to load plugin from %s: %s", file_path, exc)
+                logger.warning(
+                    "plugin: load_failed file=%s reason=%s",
+                    file_path.name, type(exc).__name__,
+                )
 
         return discovered
 
