@@ -104,7 +104,6 @@ _ALLOWED_CHECK_KEYS = frozenset(
         "recall_depth_bound",
         "open_fds",
         "rss_kb",
-        "log_lines",
         "timestamps",
         "iterations",
         "degraded_periods",
@@ -205,6 +204,7 @@ _APPROVED_REASON_CODES = frozenset(
         "writer_quiesce_ack_required",
         "fault_strategy_ack_required",
         "soak_schedule_ack_required",
+        "resource_measurement_failed",
         "codex_desktop_ack_required",
         "hermes_smoke_ack_required",
         "approved_sha_required",
@@ -1511,16 +1511,14 @@ def _is_binary_db(path: Path) -> bool:
     return name.endswith((".db", ".sqlite", ".sqlite3", ".sha256", ".pre_e6_backup"))
 
 
-def _is_text_artifact(path: Path) -> bool:
-    return path.suffix in (".json", ".log", ".txt", ".md")
-
-
 def _self_scan(trial_root: Path) -> tuple[str, str]:
     """Scan the ``<trial_root>/reports/`` evidence tree: every dir must be
-    0700, every file 0600, text artifacts must not contain forbidden fragments
-    or internal error classes, and no entry may be a symlink. A missing reports
-    tree is empty evidence (ok); fail closed on a symlinked/non-dir root, any
-    symlink in the tree, or stat/read errors (R1, High 3)."""
+    0700, every file 0600, every regular artifact except database classes is
+    decoded as UTF-8 and must not contain forbidden fragments or internal
+    error classes, and no entry may be a symlink or other non-file/non-dir
+    class. A missing reports tree is empty evidence (ok); fail closed on a
+    symlinked/non-dir root, any unsupported entry in the tree, or stat/read
+    errors (R1, High 3)."""
     root = Path(trial_root) / "reports"
     # A missing reports/ tree is empty evidence (scan ok). Fail closed if the
     # root is a symlink, a non-directory, or has the wrong (non-0700) mode.
@@ -1546,7 +1544,7 @@ def _self_scan(trial_root: Path) -> tuple[str, str]:
         except OSError:
             return FAIL, "scan_read_error"
         if not path.is_file() and not path.is_dir():
-            continue
+            return FAIL, "scan_read_error"
         try:
             mode = stat.S_IMODE(path.stat().st_mode)
         except OSError:
@@ -1559,19 +1557,19 @@ def _self_scan(trial_root: Path) -> tuple[str, str]:
                 bad_modes.append("bad_mode")
         if not path.is_file():
             continue
-        if _is_binary_db(path) or not _is_text_artifact(path):
+        if _is_binary_db(path):
             continue
         try:
             text = path.read_text(errors="strict")
         except (OSError, UnicodeDecodeError):
             # Unreadable text artifact: fail closed.
             return FAIL, "scan_read_error"
-        low = text.lower()
+        folded = text.casefold()
         for frag in _FORBIDDEN_FRAGMENTS:
-            if frag in low:
+            if frag.casefold() in folded:
                 canary_hits.append("canary")
         for token in ("Traceback", "sqlite3.OperationalError", "PermissionError"):
-            if token in text:
+            if token.casefold() in folded:
                 canary_hits.append("internal_class")
 
     if bad_modes:
@@ -1616,19 +1614,18 @@ def _stage_g6(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _resource_snapshot() -> dict[str, int]:
+def _resource_snapshot() -> dict[str, int] | None:
     import resource
 
     rlim = resource.getrusage(resource.RUSAGE_SELF)
     rss_kb = int(getattr(rlim, "ru_maxrss", 0))
     if rss_kb > (1 << 30):
         rss_kb //= 1024
-    fd_count = 0
     try:
         fd_count = len(os.listdir("/proc/self/fd"))
     except OSError:
-        fd_count = 0
-    return {"open_fds": fd_count, "rss_kb": rss_kb, "log_lines": 0}
+        return None
+    return {"open_fds": fd_count, "rss_kb": rss_kb}
 
 
 def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
@@ -1697,6 +1694,14 @@ def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         elapsed = time.monotonic() - start_monotonic
         after = _resource_snapshot()
 
+        if before is None or after is None:
+            # No fabricated zero: an unmeasurable snapshot fails the budget.
+            checks["budgets"] = {
+                "verdict": FAIL,
+                "reason_code": "resource_measurement_failed",
+            }
+            return FAIL, "resource_measurement_failed", checks
+
         # Critical 5: fail on any degraded period.
         if degraded > 0:
             checks["soak"] = {
@@ -1734,7 +1739,6 @@ def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             "reason_code": "ok" if (fd_ok and rss_ok) else "budget_exceeded",
             "open_fds": after["open_fds"],
             "rss_kb": after["rss_kb"],
-            "log_lines": after["log_lines"],
         }
         checks["final_integrity"] = {
             "verdict": PASS if _integrity_ok(clone) else FAIL,

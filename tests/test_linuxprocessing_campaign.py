@@ -1149,6 +1149,39 @@ class TestG7RealSoak:
         # Must complete in well under a minute (no 72h loop).
         assert elapsed < 60.0
 
+    def test_g7_does_not_fabricate_fd_zero_on_measurement_error(self, monkeypatch):
+        monkeypatch.setattr(
+            lpc.os, "listdir", lambda _path: (_ for _ in ()).throw(OSError)
+        )
+        assert lpc._resource_snapshot() is None
+
+    def test_g7_fails_with_resource_measurement_failed(self, tmp_path, monkeypatch):
+        """An unavailable resource measurement must fail G7, not emit a zero."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        monkeypatch.setattr(lpc, "_resource_snapshot", lambda: None)
+        code, report_path = _run_stage(
+            "g7", trial, monkeypatch, "--soak-seconds", "0", "--ack-soak-schedule"
+        )
+        assert code == 1
+        report = _read_report(report_path)
+        assert report["reason_code"] == "resource_measurement_failed"
+        assert report["checks"]["budgets"] == {
+            "verdict": FAIL,
+            "reason_code": "resource_measurement_failed",
+        }
+
+    def test_g7_reports_no_fabricated_log_lines(self, tmp_path, monkeypatch):
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        code, report_path = _run_stage(
+            "g7", trial, monkeypatch, "--soak-seconds", "0", "--ack-soak-schedule"
+        )
+        assert code == 0
+        report = _read_report(report_path)
+        assert "log_lines" not in lpc._resource_snapshot()
+        assert "log_lines" not in report["checks"]["budgets"]
+
 
 # ===========================================================================
 # High 1: fault matrix exercised + all runs BOTH core and matrix
@@ -1327,6 +1360,36 @@ class TestSelfScan:
         # Every reason code the self-scan can return must be approved.
         for code in lpc._SELF_SCAN_REASON_CODES:
             assert code in lpc._APPROVED_REASON_CODES
+
+    def test_g6_rejects_unclassified_fifo(self, tmp_path):
+        reports = tmp_path / "reports"
+        reports.mkdir(mode=0o700)
+        os.mkfifo(reports / "evidence")
+        assert lpc._self_scan(tmp_path) == (FAIL, "scan_read_error")
+
+    def test_g6_scans_yaml_and_lowercase_error_tokens(self, tmp_path):
+        reports = tmp_path / "reports"
+        reports.mkdir(mode=0o700)
+        evidence = reports / "evidence.yaml"
+        evidence.write_text("traceback: leaked", encoding="utf-8")
+        os.chmod(evidence, 0o600)
+        assert lpc._self_scan(tmp_path) == (FAIL, "canary_content")
+
+    def test_g6_binary_artifact_fails_closed(self, tmp_path):
+        reports = tmp_path / "reports"
+        reports.mkdir(mode=0o700)
+        bad = reports / "blob.png"
+        bad.write_bytes(b"\xff\xfe\x00binary")
+        os.chmod(bad, 0o600)
+        assert lpc._self_scan(tmp_path) == (FAIL, "scan_read_error")
+
+    def test_g6_binary_db_class_is_skipped(self, tmp_path):
+        reports = tmp_path / "reports"
+        reports.mkdir(mode=0o700)
+        db = reports / "evidence.db"
+        db.write_bytes(b"\xff\xfe\x00binary")
+        os.chmod(db, 0o600)
+        assert lpc._self_scan(tmp_path) == (PASS, "ok")
 
 
 # ===========================================================================
