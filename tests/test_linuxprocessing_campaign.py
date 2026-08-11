@@ -1121,9 +1121,7 @@ class TestG8RealRollback:
         init_canonical(db)
 
         monkeypatch.setattr(campaign, "_canonical_content_hash", lambda _path: None)
-        code, report_path = _run_stage(
-            "g8", trial, monkeypatch, "--source-db", str(db)
-        )
+        code, report_path = _run_stage("g8", trial, monkeypatch, "--source-db", str(db))
         report = _read_report(report_path)
 
         assert code == 1
