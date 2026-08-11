@@ -875,6 +875,12 @@ def test_real_sqlite_vec_upsert_marks_receipt_ready(temp_db, monkeypatch):
     """When sqlite-vec is actually available, the ingest path writes to
     vec_working and the receipt reaches 'ready' on the live path -- not via
     a mock."""
+    for flag in (
+        "MNEMOSYNE_NO_EMBEDDINGS",
+        "MNEMOSYNE_SKIP_EMBEDDINGS",
+        "MNEMOSYNE_EMBEDDINGS_OFF",
+    ):
+        monkeypatch.delenv(flag, raising=False)
     conn = sqlite3.connect(":memory:")
     try:
         conn.enable_load_extension(True)
