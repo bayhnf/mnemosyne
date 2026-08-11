@@ -946,9 +946,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             db_path = getattr(self._beam, "db_path", None)
             if db_path:
                 self._audit = AuditLog(Path(db_path))
-                logger.debug("Audit log initialized: %s", db_path)
+                logger.debug("audit: initialized")
         except Exception as exc:
-            logger.debug("Audit log init skipped: %s", exc)
+            logger.debug("audit: initialization_failed exception=%s", type(exc).__name__)
 
     def _clear_provider_adapters(self) -> None:
         """Drop adapters that retain the Beam being replaced or closed."""
@@ -970,13 +970,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
         if self._audit is None:
+            logger.debug("audit: event_dropped reason=audit_unavailable")
             return
         kwargs.setdefault("profile", getattr(self, "_agent_identity", None) or "")
         kwargs.setdefault("session_id", self._session_id)
         try:
             self._audit.record(action, **kwargs)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "audit: event_dropped reason=audit_record_failed exception=%s",
+                type(exc).__name__,
+            )
 
     def _init_error_reason(self) -> str:
         """Return a human-readable failure reason for tool responses.
@@ -1374,8 +1378,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if self._audit is not None:
             try:
                 self._audit.close()
-            except Exception:
-                logger.debug("Mnemosyne: could not close prior audit log", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "audit: prior_close_failed exception=%s", type(exc).__name__
+                )
         self._memory = None
         self._audit = None
         self._beam = None
@@ -2755,8 +2761,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     bank=bank,
                     source_tool="mnemosyne_validate",
                 )
-        except Exception:
-            logger.debug("Mnemosyne audit event failed for validate", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "audit: validation_event_failed exception=%s", type(exc).__name__
+            )
 
         return json.dumps({
             "status": f"validation_{action}",
@@ -3526,8 +3534,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if self._audit is not None:
             try:
                 self._audit.close()
-            except Exception:
-                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
+            except Exception as exc:
+                logger.debug("audit: close_failed exception=%s", type(exc).__name__)
         self._audit = None
         self._beam = None
 

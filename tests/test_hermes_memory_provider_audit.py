@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,11 @@ MIRROR_PACKAGES = ("hermes_memory_provider", "mnemosyne_hermes")
 def _audit_module(package: str):
     root = INTEGRATION_SRC if package == "mnemosyne_hermes" else PROJECT_ROOT
     return _import_module(f"{package}.audit", root)
+
+
+def _provider_module(package: str):
+    root = INTEGRATION_SRC if package == "mnemosyne_hermes" else PROJECT_ROOT
+    return _import_module(package, root)
 
 
 def _all_log_fields(records) -> str:
@@ -49,6 +55,170 @@ def _provider(tmp_path: Path) -> MnemosyneMemoryProvider:
 
 def _call(provider: MnemosyneMemoryProvider, name: str, args: dict) -> dict:
     return json.loads(provider.handle_tool_call(name, args))
+
+
+class _FailingAudit:
+    def __init__(self, exception: Exception):
+        self._exception = exception
+
+    def record(self, *_args, **_kwargs) -> None:
+        raise self._exception
+
+    def close(self) -> None:
+        raise self._exception
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_provider_audit_init_success_is_content_free(package, caplog, tmp_path):
+    module = _provider_module(package)
+    provider = module.MnemosyneMemoryProvider()
+    path_canary = "SECRET-CANARY-r5-init-success-path"
+    provider._beam = SimpleNamespace(db_path=tmp_path / f"{path_canary}.db")
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+            provider._init_audit_log()
+
+        fields = _all_log_fields(caplog.records)
+        assert provider._audit.healthy is True
+        assert "audit: initialized" in fields
+        assert path_canary not in fields
+        assert all(record.exc_info is None for record in caplog.records)
+    finally:
+        if provider._audit is not None:
+            provider._audit.close()
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_provider_audit_init_failure_is_content_free(
+    package, monkeypatch, caplog, tmp_path
+):
+    module = _provider_module(package)
+    audit = _audit_module(package)
+    exception_canary = "SECRET-CANARY-r5-init-exception"
+    path_canary = "SECRET-CANARY-r5-init-failure-path"
+
+    class _FailingAuditLog:
+        def __init__(self, _db_path):
+            raise RuntimeError(exception_canary)
+
+    monkeypatch.setattr(audit, "AuditLog", _FailingAuditLog)
+    provider = module.MnemosyneMemoryProvider()
+    provider._beam = SimpleNamespace(db_path=tmp_path / f"{path_canary}.db")
+
+    with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+        provider._init_audit_log()
+
+    fields = _all_log_fields(caplog.records)
+    assert provider._audit is None
+    assert "audit: initialization_failed exception=RuntimeError" in fields
+    assert exception_canary not in fields
+    assert path_canary not in fields
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_provider_audit_unavailable_emits_static_drop_reason(package, caplog):
+    module = _provider_module(package)
+    provider = module.MnemosyneMemoryProvider()
+    memory_canary = "SECRET-CANARY-r5-memory"
+    provider._audit = None
+
+    with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+        provider._audit_event("remember", memory_id=memory_canary)
+
+    fields = _all_log_fields(caplog.records)
+    assert "audit: event_dropped reason=audit_unavailable" in fields
+    assert memory_canary not in fields
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_provider_audit_record_failure_is_static(package, caplog):
+    module = _provider_module(package)
+    provider = module.MnemosyneMemoryProvider()
+    exception_canary = "SECRET-CANARY-r5-exception"
+    provider._audit = _FailingAudit(RuntimeError(exception_canary))
+
+    with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+        provider._audit_event("remember")
+
+    fields = _all_log_fields(caplog.records)
+    assert "audit: event_dropped reason=audit_record_failed exception=RuntimeError" in fields
+    assert exception_canary not in fields
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_provider_validation_audit_failure_is_static_and_nonfatal(
+    package, caplog, tmp_path
+):
+    module = _provider_module(package)
+    provider = module.MnemosyneMemoryProvider()
+    provider._beam = BeamMemory(
+        session_id=f"audit-validation-{package}",
+        db_path=tmp_path / f"{package}.db",
+    )
+    provider._agent_identity = "audit-r5"
+    exception_canary = "SECRET-CANARY-r5-validation-exception"
+    validator_canary = "SECRET-CANARY-r5-validator"
+    memory_id = provider._beam.remember("audit validation memory", source="test")
+
+    def _fail_audit_event(*_args, **_kwargs):
+        raise RuntimeError(exception_canary)
+
+    provider._audit_event = _fail_audit_event
+    try:
+        with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+            response = json.loads(provider._handle_validate({
+                "memory_id": memory_id,
+                "action": "attest",
+                "validator": validator_canary,
+            }))
+
+        fields = _all_log_fields(caplog.records)
+        assert response["status"] == "validation_attest"
+        assert response["memory_id"] == memory_id
+        assert response["validator"] == validator_canary
+        assert "audit: validation_event_failed exception=RuntimeError" in fields
+        assert exception_canary not in fields
+        assert validator_canary not in fields
+        assert all(record.exc_info is None for record in caplog.records)
+    finally:
+        provider._beam.conn.close()
+
+
+def test_integration_reinitialize_audit_close_failure_is_static(caplog):
+    module = _provider_module("mnemosyne_hermes")
+    provider = module.MnemosyneMemoryProvider()
+    exception_canary = "SECRET-CANARY-r5-reinitialize-close"
+    provider._audit = _FailingAudit(RuntimeError(exception_canary))
+
+    with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+        provider.initialize("audit-r5", agent_context="subagent")
+
+    fields = _all_log_fields(caplog.records)
+    assert provider._audit is None
+    assert "audit: prior_close_failed exception=RuntimeError" in fields
+    assert exception_canary not in fields
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_integration_shutdown_audit_close_failure_is_static(caplog):
+    module = _provider_module("mnemosyne_hermes")
+    provider = module.MnemosyneMemoryProvider()
+    provider._agent_context = "subagent"
+    exception_canary = "SECRET-CANARY-r5-shutdown-close"
+    provider._audit = _FailingAudit(RuntimeError(exception_canary))
+
+    with caplog.at_level(logging.DEBUG, logger=module.logger.name):
+        provider.shutdown()
+
+    fields = _all_log_fields(caplog.records)
+    assert provider._audit is None
+    assert "audit: close_failed exception=RuntimeError" in fields
+    assert exception_canary not in fields
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.parametrize("package", MIRROR_PACKAGES)
