@@ -974,15 +974,23 @@ class TestG8RealRollback:
         # equivalence to the pristine snapshot by row counts, content hash,
         # and user_version; integrity_check ok; no sidecars.
         def _row_counts(path):
+            from mnemosyne.dr.recovery import _load_sqlite_vec
+
             conn = sqlite3.connect(str(path))
             try:
+                _load_sqlite_vec(conn)
                 rows = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
                     "AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
                 counts = {}
                 for (name,) in rows:
-                    counts[name] = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+                    try:
+                        counts[name] = conn.execute(
+                            f'SELECT COUNT(*) FROM "{name}"'
+                        ).fetchone()[0]
+                    except sqlite3.Error:
+                        counts[name] = -1
                 return counts
             finally:
                 conn.close()
