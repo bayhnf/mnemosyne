@@ -153,7 +153,10 @@ class SyncAdapter:
             try:
                 return Path(os.path.expanduser(path)).read_text().strip()
             except Exception as exc:
-                logger.warning("Sync key file %s unreadable: %s", path, exc)
+                logger.warning(
+                    "sync_adapter: key_file_unreadable exception=%s",
+                    type(exc).__name__,
+                )
                 return ""
         elif source == "keyring":
             try:
@@ -187,7 +190,6 @@ class SyncAdapter:
             encryption = None
             if self.encrypt_enabled and self.encryption_key:
                 encryption = SyncEncryption.from_config(key_source=self.encryption_key)
-                logger.info("Sync encryption enabled (key length: %d)", len(self.encryption_key))
             elif self.encrypt_enabled and not self.encryption_key:
                 logger.warning(
                     "Sync encryption enabled but no key configured. "
@@ -199,23 +201,21 @@ class SyncAdapter:
                 beam_instance=self._beam,
                 encryption=encryption,
             )
-            logger.info(
-                "SyncAdapter initialized: device=%s, remote=%s, encrypt=%s",
-                getattr(self._engine, "device_id", "?"),
-                self.remote or "(unconfigured)",
-                self.encrypt_enabled,
-            )
+            logger.info("sync_adapter: initialized")
 
         except Exception as exc:
-            self._error = str(exc)
-            logger.debug("SyncAdapter init failed: %s", exc)
+            self._error = "sync_engine_init_failed"
+            logger.debug(
+                "sync_adapter: engine_init_failed exception=%s",
+                type(exc).__name__,
+            )
 
     # --- Lifecycle ---------------------------------------------------------
 
     def start(self) -> bool:
         """Called after construction. Returns True if ready."""
         if self._engine is None:
-            logger.debug("SyncAdapter not started: %s", self._error or "no engine")
+            logger.debug("sync_adapter: not_started")
             return False
         return True
 
@@ -251,13 +251,12 @@ class SyncAdapter:
             elif tool_name == "mnemosyne_sync_status":
                 return self._handle_status()
             else:
-                return json.dumps({"status": "error", "error": f"Unknown tool: {tool_name}"})
+                return json.dumps({"status": "error", "error": "unknown_tool"})
         except Exception:
-            logger.debug("Sync tool %s failed", tool_name)
+            logger.debug("sync_adapter: tool_failed")
             return json.dumps({
                 "status": "error",
                 "error": "sync_tool_failed",
-                "tool": tool_name,
             })
 
     # --- Push --------------------------------------------------------------
@@ -388,12 +387,8 @@ class SyncAdapter:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            logger.debug("Sync HTTP %d from %s: %s", exc.code, url, exc.reason)
-            body = exc.read().decode("utf-8", errors="replace")
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError:
-                return {"status": "error", "error": f"HTTP {exc.code}: {exc.reason}"}
-        except Exception as exc:
-            logger.debug("Sync request failed: %s", exc)
-            return {"status": "error", "error": str(exc)}
+            logger.debug("sync_adapter: http_error")
+            return {"status": "error", "error": "sync_http_error", "http_status": exc.code}
+        except Exception:
+            logger.debug("sync_adapter: request_failed")
+            return {"status": "error", "error": "sync_request_failed"}
