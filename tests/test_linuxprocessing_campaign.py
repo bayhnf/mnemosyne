@@ -706,9 +706,13 @@ class TestG8RealRollback:
         report = _read_report(report_path)
         checks = report["checks"]
 
-        # The restore was invoked exactly once, on a fresh target under trial.
-        assert len(restore_calls) == 1
-        snapshot_path, restore_target = restore_calls[0]
+        # The disposable-target restore is invoked exactly once. (The clone
+        # may also be produced via restore_isolated_snapshot, so select the
+        # call whose target is the fresh restore_target.db rather than the
+        # rehearsal clone.)
+        disposable = [c for c in restore_calls if c[1].name == "restore_target.db"]
+        assert len(disposable) == 1
+        snapshot_path, restore_target = disposable[0]
         assert snapshot_path.exists()
         # Fresh target: it must now exist (restore created it) and be contained.
         assert restore_target.exists()
@@ -783,6 +787,41 @@ class TestG8RealRollback:
         bad_db.write_bytes(b"\x00" * 128)
         code, _ = _run_stage("g8", trial, monkeypatch, "--source-db", str(bad_db))
         assert code == 1
+
+    def test_g8_clone_preserves_committed_wal_frames(self, tmp_path, monkeypatch):
+        """G8's clone must reflect committed frames still living only in the
+        source -wal. Replacing the raw shutil.copy2+sidecar-delete path with
+        snap.create_isolated_snapshot+restore_isolated_snapshot preserves them.
+        """
+        import sqlite3
+
+        from mnemosyne.core.memory import init_db
+
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        source = trial / "source.db"
+        init_db(source)
+        writer = sqlite3.connect(str(source))
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE wal_witness (value TEXT NOT NULL)")
+            writer.execute("INSERT INTO wal_witness(value) VALUES ('committed-wal-frame')")
+            writer.commit()
+            assert Path(str(source) + "-wal").exists()
+
+            code, _ = _run_stage(
+                "g8", trial, monkeypatch, "--source-db", str(source)
+            )
+
+            assert code == 0
+            clone = trial / "g8" / "rehearsal.db"
+            with sqlite3.connect(str(clone)) as conn:
+                assert conn.execute(
+                    "SELECT value FROM wal_witness"
+                ).fetchone() == ("committed-wal-frame",)
+        finally:
+            writer.close()
 
 
 # ===========================================================================

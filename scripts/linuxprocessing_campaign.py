@@ -1877,11 +1877,21 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         work_dir.mkdir(exist_ok=True)
         os.chmod(work_dir, _DIR_MODE)
         clone = work_dir / "rehearsal.db"
-        shutil.copy2(source_db, clone)
-        os.chmod(clone, _FILE_MODE)
-        for side in (Path(str(clone) + "-wal"), Path(str(clone) + "-shm")):
-            if side.exists():
-                side.unlink()
+        # ponytail: ceiling = source DBs larger than available disk for a
+        # snapshot+restore round-trip; upgrade to streaming backup if that
+        # ever materializes. snapshot+restore (not shutil.copy2) is required
+        # so committed frames still living only in source -wal are reflected
+        # in the clone -- copy2 of the main file omits them.
+        source_snapshot_dir = work_dir / "source_snapshot"
+        try:
+            source_snapshot = snap.create_isolated_snapshot(source_db, source_snapshot_dir)
+            snap.restore_isolated_snapshot(
+                Path(source_snapshot["snapshot_path"]), clone
+            )
+        except Exception:
+            traceback.clear_frames(sys.exc_info()[2])
+            checks["restore"] = {"verdict": FAIL, "reason_code": "snapshot_failed"}
+            return FAIL, "snapshot_failed", checks
 
         # Initialize canonical_facts on the clone BEFORE snapshotting so the
         # pristine baseline includes the canonical schema and the restore
