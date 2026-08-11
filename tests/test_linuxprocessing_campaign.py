@@ -414,6 +414,49 @@ class TestReportProjection:
         # Recursively walk every nested key and verify it's allowed.
         _assert_recursive_allowlist(report)
 
+    def test_unapproved_top_level_reason_code_is_not_written(self, tmp_path):
+        report_path = tmp_path / "r.json"
+        report = {
+            "stage": "g0",
+            "verdict": PASS,
+            "reason_code": "not_approved",
+            "checks": {},
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:00:00Z",
+            "duration_ms": 1.0,
+        }
+        with pytest.raises(RuntimeError, match="reason code not approved"):
+            lpc.write_report(report_path, report)
+        assert not report_path.exists()
+
+    def test_unapproved_nested_reason_code_is_not_written(self, tmp_path):
+        report_path = tmp_path / "r.json"
+        report = {
+            "stage": "g0",
+            "verdict": PASS,
+            "reason_code": "ok",
+            "checks": {
+                "self_scan": {"verdict": PASS, "reason_code": "not_approved"}
+            },
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:00:00Z",
+            "duration_ms": 1.0,
+        }
+        with pytest.raises(RuntimeError, match="reason code not approved"):
+            lpc.write_report(report_path, report)
+        assert not report_path.exists()
+
+    def test_current_emitted_reason_codes_are_approved(self):
+        assert {
+            "g4_core_failed",
+            "not_exactly_once",
+            "retry_failed",
+            "race_not_exactly_one",
+            "dream_lifecycle_failed",
+            "g5_package_import_failed",
+            "g5_plugin_surface_failed",
+        } <= lpc._APPROVED_REASON_CODES
+
     def test_nested_path_like_string_rejected(self, tmp_path, monkeypatch):
         """A path-like string in a nested field must not be written."""
         trial = tmp_path / "trial"

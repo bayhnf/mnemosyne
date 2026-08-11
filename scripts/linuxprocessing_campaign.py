@@ -225,10 +225,15 @@ _APPROVED_REASON_CODES = frozenset(
         "content_not_reverted",
         "dream_undo_failed",
         "dream_undo_not_invoked",
+        "g4_core_failed",
         "g4_exactly_once_failed",
         "g4_crash_retry_failed",
         "g4_duplicate_race_failed",
         "g4_dream_lifecycle_failed",
+        "not_exactly_once",
+        "retry_failed",
+        "race_not_exactly_one",
+        "dream_lifecycle_failed",
         "fault_matrix_failed",
         "case_error",
         "dimension_bad",
@@ -244,6 +249,8 @@ _APPROVED_REASON_CODES = frozenset(
         "degraded_period",
         "package_import_failed",
         "plugin_surface_missing",
+        "g5_package_import_failed",
+        "g5_plugin_surface_failed",
         "python_version_mismatch",
         "dimension_mismatch",
     }
@@ -404,6 +411,20 @@ def _assert_recursive_schema(obj: Any, trail: str = "root") -> None:
             _assert_recursive_schema(item, f"{trail}[{i}]")
 
 
+def _assert_reason_codes_approved(obj: Any) -> None:
+    if isinstance(obj, dict):
+        if "reason_code" in obj and (
+            not isinstance(obj["reason_code"], str)
+            or obj["reason_code"] not in _APPROVED_REASON_CODES
+        ):
+            raise RuntimeError("reason code not approved; report not written")
+        for value in obj.values():
+            _assert_reason_codes_approved(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            _assert_reason_codes_approved(value)
+
+
 def _is_safe_token(value: Any) -> bool:
     """A token is safe if it's a short alphanumeric/underscore string with no
     path separators, shell metacharacters, or forbidden fragments."""
@@ -456,6 +477,7 @@ def write_report(report_path: Path, report: dict[str, Any]) -> None:
     _ensure_report_tree(report_path)
 
     _assert_recursive_schema(report)
+    _assert_reason_codes_approved(report)
     blob = json.dumps(report, sort_keys=True, separators=(",", ":"))
     _assert_content_free(blob)
 
