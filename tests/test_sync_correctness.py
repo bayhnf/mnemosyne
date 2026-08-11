@@ -1146,3 +1146,301 @@ def test_sync_with_drains_more_than_5000_opaque_events(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Task 4 (R4-A): truthful degraded embedding accounting
+# ---------------------------------------------------------------------------
+#
+# These tests pin the additive ``degraded_embeddings`` counter on push/pull
+# stats. The counter must increment exactly once per event that *attempted*
+# an embedding against an available backend but degraded (preparation threw,
+# the backend returned an empty/invalid vector, or a vector write/delete
+# failed silently). It stays zero when embeddings are intentionally off or
+# when there is no content to embed.
+
+
+@pytest.fixture
+def sync_engine(tmp_path):
+    """A standalone SyncEngine on a private DB for degraded-accounting tests."""
+    mem = Mnemosyne(db_path=tmp_path / "degraded.db")
+    return SyncEngine(mem, device_id="degraded-device", allow_unscoped_sync=True)
+
+
+def _hash_event(memory_id, operation, timestamp, payload, parent_event_ids, importance):
+    import hashlib
+
+    raw = (
+        f"{memory_id}|{operation}|{timestamp}|degraded-device|{payload}|"
+        f"{parent_event_ids}|{importance}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@pytest.fixture
+def create_event():
+    """Build a minimal CREATE event dict with a computed event_hash."""
+
+    def _make(content="safe", memory_id=None, operation="CREATE"):
+        import uuid
+
+        memory_id = memory_id or f"mem-{uuid.uuid4()}"
+        timestamp = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps({"content": content, "source": "test"})
+        parent_event_ids = "[]"
+        importance = 0.5
+        return {
+            "event_id": f"evt-{uuid.uuid4()}",
+            "memory_id": memory_id,
+            "operation": operation,
+            "timestamp": timestamp,
+            "device_id": "degraded-device",
+            "payload": payload,
+            "parent_event_ids": parent_event_ids,
+            "importance": importance,
+            "event_hash": _hash_event(
+                memory_id, operation, timestamp, payload, parent_event_ids, importance
+            ),
+        }
+
+    return _make
+
+
+def test_push_changes_counts_failed_embedding_preparation(
+    sync_engine, monkeypatch, create_event
+):
+    """Preparation raises -> memory row still accepted, but degraded count is 1."""
+    from mnemosyne.core import beam
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed",
+        lambda _: (_ for _ in ()).throw(RuntimeError("embed-canary")),
+    )
+    result = sync_engine.push_changes([create_event(content="safe")])
+    assert result["accepted"] == 1
+    assert result["degraded_embeddings"] == 1
+
+
+def test_push_changes_counts_empty_embedding_but_not_embeddings_off(
+    sync_engine, monkeypatch, create_event
+):
+    """Available backend returning no vectors degrades; turning it off does not."""
+    from mnemosyne.core import beam
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(beam._embeddings, "embed", lambda _: [])
+    assert (
+        sync_engine.push_changes([create_event(content="safe")])["degraded_embeddings"]
+        == 1
+    )
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: False)
+    assert (
+        sync_engine.push_changes([create_event(content="second")])["degraded_embeddings"]
+        == 0
+    )
+
+
+def test_push_changes_keeps_no_content_delete_at_zero(sync_engine, create_event):
+    """A valid DELETE with no content does not attempt or degrade embedding."""
+    result = sync_engine.push_changes([create_event(content=None, operation="DELETE")])
+    assert result["accepted"] == 1
+    assert result["degraded_embeddings"] == 0
+
+
+def test_push_changes_counts_vector_write_failure(
+    sync_engine, monkeypatch, create_event
+):
+    """Embedding prepared OK but storing it fails -> degraded count increments."""
+    from mnemosyne.core import beam
+    import numpy as np
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed",
+        lambda texts: np.zeros((1, beam._embeddings.EMBEDDING_DIM), dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        beam,
+        "_store_working_embedding",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("vec-store-canary")),
+    )
+    result = sync_engine.push_changes([create_event(content="safe")])
+    assert result["accepted"] == 1
+    assert result["degraded_embeddings"] == 1
+
+
+def test_push_changes_counts_swallowed_vec_working_upsert_failure(
+    sync_engine, monkeypatch, create_event
+):
+    """A vec_working failure remains nonfatal but is counted as degraded."""
+    from mnemosyne.core import beam
+    import numpy as np
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed",
+        lambda texts: np.zeros((1, beam._embeddings.EMBEDDING_DIM), dtype=np.float32),
+    )
+
+    def boom(*a, **k):
+        raise RuntimeError("vec-working-canary")
+
+    monkeypatch.setattr(beam, "_wm_vec_upsert", boom)
+    event = create_event(content="safe")
+    result = sync_engine.push_changes([event])
+
+    assert result["accepted"] == 1
+    assert result["degraded_embeddings"] == 1
+    assert sync_engine.conn.execute(
+        "SELECT 1 FROM memory_embeddings WHERE memory_id = ?", (event["memory_id"],)
+    ).fetchone()
+
+
+def test_push_changes_counts_vector_delete_failure_on_update(
+    sync_engine, monkeypatch, create_event
+):
+    """An UPDATE whose silent vec_delete fails counts the event as degraded."""
+    from mnemosyne.core import beam
+    import numpy as np
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed",
+        lambda texts: np.zeros((1, beam._embeddings.EMBEDDING_DIM), dtype=np.float32),
+    )
+
+    # Seed an existing row via a clean CREATE.
+    seed = create_event(content="seed")
+    seed_result = sync_engine.push_changes([seed])
+    assert seed_result["accepted"] == 1
+
+    # Force the vec_delete invoked during UPDATE to fail silently. The memory
+    # row update must still succeed (nonfatal), but the event is degraded.
+    def boom(*a, **k):
+        raise RuntimeError("vec-delete-canary")
+
+    monkeypatch.setattr(beam, "_wm_vec_delete", boom)
+
+    # Build a proper UPDATE event that sorts strictly after the seed CREATE.
+    import time
+
+    time.sleep(0.005)
+    update = create_event(content="updated", memory_id=seed["memory_id"], operation="UPDATE")
+    result = sync_engine.push_changes([update])
+    assert result["accepted"] == 1
+    assert result["degraded_embeddings"] >= 1
+
+
+def test_push_changes_counts_vector_delete_failure_on_delete(
+    sync_engine, monkeypatch, create_event
+):
+    """A DELETE whose silent vec_delete fails counts the event as degraded."""
+    from mnemosyne.core import beam
+    import numpy as np
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed",
+        lambda texts: np.zeros((1, beam._embeddings.EMBEDDING_DIM), dtype=np.float32),
+    )
+
+    seed = create_event(content="seed")
+    assert sync_engine.push_changes([seed])["accepted"] == 1
+
+    def boom(*a, **k):
+        raise RuntimeError("vec-delete-canary")
+
+    monkeypatch.setattr(beam, "_wm_vec_delete", boom)
+
+    import time
+
+    time.sleep(0.005)
+    delete = create_event(content="ignored", memory_id=seed["memory_id"], operation="DELETE")
+    result = sync_engine.push_changes([delete])
+    assert result["accepted"] == 1
+    assert result["degraded_embeddings"] == 1
+
+
+def test_sync_with_aggregates_degraded_embeddings_in_push_and_pull(
+    tmp_path, monkeypatch
+):
+    """Both push and pull result dicts sum degraded_embeddings across batches."""
+    import urllib.request
+
+    client_mem = Mnemosyne(db_path=tmp_path / "agg-client.db")
+    client_engine = SyncEngine(
+        client_mem, device_id="agg-client", allow_unscoped_sync=True
+    )
+    # Record one local mutation so push has exactly one event to send.
+    client_mem.remember("pushed content", source="test")
+    discovered = client_engine.discover_local_mutations()
+    push_event_id = discovered["events"][0]["event_id"]
+
+    pull_event = {
+        "event_id": "agg-pull-event",
+        "memory_id": "agg-pull-mem",
+        "operation": "CREATE",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "device_id": "remote",
+        "payload": json.dumps({"content": "pulled content", "source": "sync"}),
+        "parent_event_ids": "[]",
+        "importance": 0.5,
+        "event_hash": None,
+    }
+
+    call_count = {"n": 0}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # push response: one accepted, one degraded.
+                return json.dumps(
+                    {
+                        "accepted": 1,
+                        "duplicates": 0,
+                        "conflicts": 0,
+                        "errors": 0,
+                        "acknowledged_event_ids": [push_event_id],
+                        "degraded_embeddings": 1,
+                    }
+                ).encode()
+            # pull page 1: one event whose local apply will degrade.
+            return json.dumps(
+                {
+                    "events": [pull_event],
+                    "next_cursor": None,
+                    "has_more": False,
+                }
+            ).encode()
+
+    # Force the pulled event to degrade during local apply.
+    from mnemosyne.core import beam
+
+    monkeypatch.setattr(beam._embeddings, "available", lambda: True)
+    monkeypatch.setattr(
+        beam._embeddings,
+        "embed",
+        lambda texts: (_ for _ in ()).throw(RuntimeError("embed-canary")),
+    )
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: FakeResponse())
+
+    result = client_engine.sync_with("https://relay.invalid", mode="bidirectional")
+
+    assert not result["errors"]
+    assert result["push"]["degraded_embeddings"] == 1
+    assert result["pull"]["degraded_embeddings"] == 1

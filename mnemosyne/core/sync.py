@@ -1563,30 +1563,35 @@ class SyncEngine:
             (apply_state, event_id),
         )
 
-    def _prepare_embedding(self, payload: Optional[Dict[str, Any]]) -> Optional[Any]:
+    def _prepare_embedding(
+        self, payload: Optional[Dict[str, Any]]
+    ) -> Tuple[Optional[Any], bool]:
         """Compute derived vector state before opening the SQLite write transaction."""
         if not payload or not payload.get("content"):
-            return None
+            return None, False
         try:
             from mnemosyne.core.beam import _embeddings
 
             if not _embeddings.available():
-                return None
+                return None, False
             vectors = _embeddings.embed([str(payload["content"])])
-            return vectors[0] if vectors is not None and len(vectors) else None
+            if vectors is None or not len(vectors):
+                return None, True
+            return vectors[0], False
         except Exception as exc:
             logger.warning("sync embedding preparation failed: %s", exc)
-            return None
+            return None, True
 
     def _apply_memory_event(
         self,
         event: SyncEvent,
         payload: Optional[Dict[str, Any]],
         embedding: Optional[Any] = None,
-    ) -> None:
+    ) -> bool:
         """Materialize one event without committing the active transaction."""
+        vector_degraded = False
         if payload is None:  # blind relay: never materialize opaque operations
-            return
+            return vector_degraded
 
         if event.operation == "DELETE":
             if self.surface_only:
@@ -1606,7 +1611,7 @@ class SyncEngine:
 
                     _wm_vec_delete(self.conn, event.memory_id)
                 except Exception:
-                    pass
+                    vector_degraded = True
                 if self.surface_only:
                     self.conn.execute(
                         """DELETE FROM main.working_memory
@@ -1624,7 +1629,7 @@ class SyncEngine:
                     "DELETE FROM memory_embeddings WHERE memory_id = ?", (event.memory_id,)
                 )
             self._state_set(event.memory_id, "", "DELETE", event.event_id, event.timestamp)
-            return
+            return vector_degraded
 
         content = str(payload.get("content") or "")
         if not content:
@@ -1671,7 +1676,7 @@ class SyncEngine:
 
                 _wm_vec_delete(self.conn, event.memory_id)
             except Exception:
-                pass
+                vector_degraded = True
             present = {
                 key: value
                 for key, value in values.items()
@@ -1715,9 +1720,14 @@ class SyncEngine:
                 from mnemosyne.core.beam import _store_working_embedding
 
                 _store_working_embedding(
-                    self.conn, event.memory_id, embedding, commit_vec=False
+                    self.conn,
+                    event.memory_id,
+                    embedding,
+                    commit_vec=False,
+                    strict_vec=True,
                 )
             except Exception as exc:
+                vector_degraded = True
                 logger.warning("sync embedding storage failed for %s: %s", event.memory_id, exc)
 
         normalized_payload = self._working_payload(event.memory_id) or payload
@@ -1725,6 +1735,7 @@ class SyncEngine:
         self._state_set(
             event.memory_id, fingerprint, event.operation, event.event_id, event.timestamp
         )
+        return vector_degraded
 
     def push_changes(self, events: List[dict]) -> Dict[str, Any]:
         """Validate, order, deduplicate, and restart-safely apply events."""
@@ -1735,6 +1746,7 @@ class SyncEngine:
             "duplicates": 0,
             "conflicts": 0,
             "errors": 0,
+            "degraded_embeddings": 0,
             "details": [],
             "acknowledged_event_ids": [],
         }
@@ -1816,7 +1828,7 @@ class SyncEngine:
                 payload = self._decode_payload(event)
                 if payload is not None:
                     payload = self._sanitize_sync_payload(payload)
-                embedding = self._prepare_embedding(payload)
+                embedding, prep_degraded = self._prepare_embedding(payload)
                 if self.conn.in_transaction:
                     raise RuntimeError("sync apply requires a clean SQLite transaction")
                 self.conn.execute("BEGIN IMMEDIATE")
@@ -1846,10 +1858,14 @@ class SyncEngine:
 
                 if not retry_pending:
                     self._insert_incoming_event(event, "pending")
-                self._apply_memory_event(event, payload, embedding=embedding)
+                apply_degraded = self._apply_memory_event(
+                    event, payload, embedding=embedding
+                )
                 self._mark_event_state(event.event_id, "applied")
                 self.conn.commit()
                 stats["accepted"] += 1
+                if prep_degraded or apply_degraded:
+                    stats["degraded_embeddings"] += 1
                 stats["acknowledged_event_ids"].append(event.event_id)
             except KeyboardInterrupt:
                 self.conn.rollback()
@@ -1993,6 +2009,7 @@ class SyncEngine:
                 "duplicates": 0,
                 "conflicts": 0,
                 "errors": 0,
+                "degraded_embeddings": 0,
                 "batches": 0,
                 "discovered": {
                     key: discovered[key] for key in ("created", "updated", "deleted")
@@ -2030,7 +2047,13 @@ class SyncEngine:
                 if response is None:
                     break
                 push_total["batches"] += 1
-                for key in ("accepted", "duplicates", "conflicts", "errors"):
+                for key in (
+                    "accepted",
+                    "duplicates",
+                    "conflicts",
+                    "errors",
+                    "degraded_embeddings",
+                ):
                     push_total[key] += int(response.get(key, 0) or 0)
 
                 batch_ids = {event["event_id"] for event in batch}
@@ -2080,6 +2103,7 @@ class SyncEngine:
                 "duplicates": 0,
                 "conflicts": 0,
                 "errors": 0,
+                "degraded_embeddings": 0,
                 "batches": 0,
             }
             while True:
@@ -2112,7 +2136,13 @@ class SyncEngine:
                     applied = self.push_changes(authenticated_events)
                     pull_total["batches"] += 1
                     pull_total["events_fetched"] += len(events)
-                    for key in ("accepted", "duplicates", "conflicts", "errors"):
+                    for key in (
+                        "accepted",
+                        "duplicates",
+                        "conflicts",
+                        "errors",
+                        "degraded_embeddings",
+                    ):
                         pull_total[key] += int(applied.get(key, 0) or 0)
                     if applied.get("interrupted"):
                         result["interrupted"] = True
