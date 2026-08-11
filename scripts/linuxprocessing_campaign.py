@@ -812,34 +812,50 @@ def _artifact_manifest(db_path: Path) -> dict[str, tuple[bool, str]]:
     return result
 
 
-def _table_row_counts(db_path: Path) -> dict[str, int]:
-    counts: dict[str, int] = {}
+def _table_row_counts(db_path: Path) -> dict[str, int] | None:
+    """Row counts for every user table, or None when unavailable.
+
+    Uses mnemosyne.dr.recovery._load_sqlite_vec so vec0 virtual tables are
+    introspected (their COUNT(*) requires the extension); without it a vec0
+    table would be absent or report -1, which can hide divergent rows and
+    produce a false table-equivalence PASS. None propagates through
+    _tables_equivalent so an unreadable side fails closed rather than
+    comparing two empty dicts to True. The loader re-disables extension
+    loading before returning."""
     try:
         conn = sqlite3.connect(str(db_path))
         try:
+            from mnemosyne.dr.recovery import _load_sqlite_vec
+
+            _load_sqlite_vec(conn)
             rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
+            counts: dict[str, int] = {}
             for (name,) in rows:
-                try:
-                    n = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
-                except sqlite3.Error:
-                    n = -1
-                counts[name] = int(n)
+                counts[name] = int(
+                    conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
+                )
+            return counts
         finally:
             conn.close()
     except sqlite3.Error:
-        return {}
-    return counts
+        return None
 
 
 def _tables_equivalent(a: Path, b: Path) -> bool:
-    return _table_row_counts(a) == _table_row_counts(b)
+    left = _table_row_counts(a)
+    right = _table_row_counts(b)
+    return left is not None and right is not None and left == right
 
 
-def _canonical_content_hash(db_path: Path) -> str:
+def _canonical_content_hash(db_path: Path) -> str | None:
     """Hash of all canonical_facts rows (content-based, not count-based).
-    Used by G8 to prove Dream rollback reverted content (Critical 4)."""
+
+    Used by G8 to prove Dream rollback reverted content (Critical 4). Returns
+    None on sqlite3.Error so callers cannot compare two unavailable hashes to
+    a false PASS; _stage_g8 gates content proof on non-None."""
     try:
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
@@ -852,7 +868,7 @@ def _canonical_content_hash(db_path: Path) -> str:
         finally:
             conn.close()
     except sqlite3.Error:
-        return ""
+        return None
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -2170,10 +2186,15 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
             return FAIL, "dream_undo_failed", checks
 
         # Verify content reverted: post-undo canonical hash == baseline hash.
+        # All three hashes must be present; None (unreadable proof) fails
+        # closed so two unavailable values cannot compare equal to a PASS.
         post_undo_hash = _canonical_content_hash(clone)
         content_reverted = (
             applied_existed
             and undone_count >= 1
+            and baseline_hash is not None
+            and post_apply_hash is not None
+            and post_undo_hash is not None
             and post_undo_hash == baseline_hash
             and post_undo_hash != post_apply_hash
         )
@@ -2230,7 +2251,14 @@ def _stage_g8(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
         # Compare the restored target against the pristine snapshot: logical
         # table row counts, canonical-content hash, and user_version.
         tables_equiv = _tables_equivalent(snap_path, restore_target)
-        content_match = _canonical_content_hash(restore_target) == baseline_hash
+        # Fail closed: an unavailable canonical hash (None) cannot compare
+        # equal to another unavailable hash; require both sides present.
+        restore_hash = _canonical_content_hash(restore_target)
+        content_match = (
+            restore_hash is not None
+            and baseline_hash is not None
+            and restore_hash == baseline_hash
+        )
         uv_match = _user_version(snap_path) == _user_version(restore_target)
         target_integrity = _integrity_ok(restore_target)
         target_no_sidecars = not _has_sidecars(restore_target)

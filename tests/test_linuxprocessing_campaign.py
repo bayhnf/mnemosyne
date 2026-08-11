@@ -1075,6 +1075,64 @@ class TestG8RealRollback:
         finally:
             writer.close()
 
+    def test_g8_row_counts_read_vec0_with_the_safe_loader(self, tmp_path):
+        """Row-count introspection must use the shared sqlite_vec loader so
+        vec0 virtual tables are counted (not reported as -1). A vec0 count of
+        -1 would let a restore with missing vec0 rows compare equal to a
+        snapshot, producing a false table_equivalence PASS."""
+        import sqlite3
+
+        import pytest
+
+        from mnemosyne.dr.recovery import _load_sqlite_vec
+        from scripts import linuxprocessing_campaign as campaign
+
+        pytest.importorskip("sqlite_vec")
+        db = tmp_path / "vec.db"
+        conn = sqlite3.connect(db)
+        try:
+            _load_sqlite_vec(conn)
+            conn.execute(
+                "CREATE VIRTUAL TABLE vec_probe USING vec0(embedding float[3])"
+            )
+            conn.execute("INSERT INTO vec_probe(embedding) VALUES ('[1,2,3]')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        counts = campaign._table_row_counts(db)
+        assert counts is not None
+        assert counts["vec_probe"] == 1
+
+    def test_g8_content_proof_does_not_pass_when_hash_is_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        """When the canonical content hash cannot be computed for the restore
+        target, restore_content_match must FAIL with content_not_reverted
+        rather than comparing two unavailable values to a false PASS."""
+        from mnemosyne.core.canonical import init_canonical
+        from mnemosyne.core.memory import init_db
+        from scripts import linuxprocessing_campaign as campaign
+
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        db = trial / "seed.db"
+        init_db(db)
+        init_canonical(db)
+
+        monkeypatch.setattr(campaign, "_canonical_content_hash", lambda _path: None)
+        code, report_path = _run_stage(
+            "g8", trial, monkeypatch, "--source-db", str(db)
+        )
+        report = _read_report(report_path)
+
+        assert code == 1
+        assert report["checks"]["restore_content_match"]["verdict"] == FAIL
+        assert (
+            report["checks"]["restore_content_match"]["reason_code"]
+            == "content_not_reverted"
+        )
+
 
 # ===========================================================================
 # G8 strict SQLite cleanup (silent-error hardening)
