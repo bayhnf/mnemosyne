@@ -303,11 +303,12 @@ def test_sync_turn_atomic_no_first_side_persistence_on_failure(monkeypatch):
     rolls back the first event's insert.
     """
     import tempfile as _tf
+
     from mnemosyne.core import beam as beam_module
     from mnemosyne.core.beam import BeamMemory
     from mnemosyne.core.inhale import _memory_id_for_event
 
-    beam_module._embeddings.available = lambda: False
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
 
     db_path = Path(_tf.mkdtemp()) / "atom_fail.db"
     beam = BeamMemory(
@@ -401,7 +402,7 @@ def test_remember_turns_atomic_mixed_bad_first(monkeypatch):
     from mnemosyne.core.beam import BeamMemory
     from mnemosyne.core.inhale import TurnEvent, remember_turns_atomic
 
-    beam_module._embeddings.available = lambda: False
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
     db_path = Path(tempfile.mkdtemp()) / "c2_bad_first.db"
     beam = BeamMemory(
         session_id="sess", db_path=db_path,
@@ -450,7 +451,7 @@ def test_remember_turns_atomic_mixed_bad_second(monkeypatch):
     from mnemosyne.core.beam import BeamMemory
     from mnemosyne.core.inhale import TurnEvent, remember_turns_atomic
 
-    beam_module._embeddings.available = lambda: False
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
     db_path = Path(tempfile.mkdtemp()) / "c2_bad_second.db"
     beam = BeamMemory(
         session_id="sess", db_path=db_path,
