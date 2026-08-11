@@ -52,6 +52,10 @@ class AuditLog:
         self._conn: Optional[sqlite3.Connection] = None
         self._ensure_table()
 
+    @property
+    def healthy(self) -> bool:
+        return self._conn is not None
+
     def _ensure_table(self) -> None:
         try:
             self._conn = sqlite3.connect(str(self._db_path), timeout=5)
@@ -63,8 +67,8 @@ class AuditLog:
                 pass  # Column already exists
             self._conn.commit()
         except Exception as exc:
-            logger.warning("audit: failed to create table: %s", exc)
-            self._conn = None
+            self.close()
+            logger.warning("audit: failed to create table: %s", type(exc).__name__)
 
     def record(
         self,
@@ -103,7 +107,8 @@ class AuditLog:
             )
             self._conn.commit()
         except Exception as exc:
-            logger.debug("audit: failed to record event: %s", exc)
+            self.close()
+            logger.debug("audit: failed to record event: %s", type(exc).__name__)
 
     def query(self, limit: int = 50) -> list[Dict[str, Any]]:
         """Return recent events. For diagnostics/testing."""
@@ -130,7 +135,7 @@ class AuditLog:
             return 0
 
     def close(self) -> None:
-        if self._conn:
+        if self._conn is not None:
             try:
                 self._conn.close()
             except Exception:

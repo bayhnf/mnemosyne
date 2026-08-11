@@ -3,12 +3,36 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 from mnemosyne.core.beam import BeamMemory
 from hermes_memory_provider import MnemosyneMemoryProvider
 from hermes_memory_provider.audit import AuditLog
+from tests.test_hermes_provider_parity import (
+    INTEGRATION_SRC,
+    PROJECT_ROOT,
+    _import_module,
+)
+
+
+MIRROR_PACKAGES = ("hermes_memory_provider", "mnemosyne_hermes")
+
+
+def _audit_module(package: str):
+    root = INTEGRATION_SRC if package == "mnemosyne_hermes" else PROJECT_ROOT
+    return _import_module(f"{package}.audit", root)
+
+
+def _all_log_fields(records) -> str:
+    return "\n".join(
+        str(value)
+        for record in records
+        for value in (record.getMessage(), record.args, *vars(record).values())
+    )
 
 
 def _provider(tmp_path: Path) -> MnemosyneMemoryProvider:
@@ -25,6 +49,94 @@ def _provider(tmp_path: Path) -> MnemosyneMemoryProvider:
 
 def _call(provider: MnemosyneMemoryProvider, name: str, args: dict) -> dict:
     return json.loads(provider.handle_tool_call(name, args))
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_audit_log_health_and_init_failure_are_content_free(
+    package, monkeypatch, caplog, tmp_path
+):
+    audit = _audit_module(package)
+    exception_canary = "SECRET-CANARY-r5-init"
+    path_canary = "SECRET-CANARY-r5-path"
+
+    class _FailingInitConnection:
+        def __init__(self):
+            self.closed = False
+
+        def __bool__(self):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError(exception_canary)
+
+        def close(self):
+            self.closed = True
+
+    connection = _FailingInitConnection()
+    monkeypatch.setattr(
+        audit.sqlite3, "connect", lambda *_args, **_kwargs: connection
+    )
+
+    with caplog.at_level(logging.WARNING, logger=audit.logger.name):
+        log = audit.AuditLog(tmp_path / f"{path_canary}.db")
+
+    fields = _all_log_fields(caplog.records)
+    assert log.healthy is False
+    assert connection.closed is True
+    assert "audit: failed to create table" in fields
+    assert "RuntimeError" in fields
+    assert exception_canary not in fields
+    assert path_canary not in fields
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_audit_log_record_failure_is_unhealthy_and_content_free(
+    package, monkeypatch, caplog, tmp_path
+):
+    audit = _audit_module(package)
+    exception_canary = "SECRET-CANARY-r5-record"
+    path_canary = "SECRET-CANARY-r5-record-path"
+
+    class _FailingRecordConnection:
+        def __init__(self):
+            self.closed = False
+
+        def __bool__(self):
+            return False
+
+        def execute(self, _sql, parameters=None):
+            if parameters is not None:
+                raise RuntimeError(exception_canary)
+
+        def commit(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    connection = _FailingRecordConnection()
+    monkeypatch.setattr(
+        audit.sqlite3, "connect", lambda *_args, **_kwargs: connection
+    )
+    log = audit.AuditLog(tmp_path / f"{path_canary}.db")
+
+    with caplog.at_level(logging.DEBUG, logger=audit.logger.name):
+        log.record("remember")
+
+    fields = _all_log_fields(caplog.records)
+    assert log.healthy is False
+    assert connection.closed is True
+    assert "audit: failed to record event" in fields
+    assert "RuntimeError" in fields
+    assert exception_canary not in fields
+    assert path_canary not in fields
+
+
+@pytest.mark.parametrize("package", MIRROR_PACKAGES)
+def test_audit_log_health_is_true_for_successful_db(package, tmp_path):
+    log = _audit_module(package).AuditLog(tmp_path / "audit.db")
+    assert log.healthy is True
+    log.close()
 
 
 class TestAuditLogModule:
