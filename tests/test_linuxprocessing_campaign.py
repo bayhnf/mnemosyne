@@ -1962,6 +1962,7 @@ class TestG6CheckpointsAndScan:
         trial.mkdir()
         evidence = trial / "reports"
         evidence.mkdir()
+        evidence.chmod(0o700)
         (evidence / "canary.json").write_text("/home/canary", encoding="utf-8")
         os.chmod(evidence / "canary.json", 0o600)
         exit_code, report = _run_stage("g6", trial, monkeypatch, *_ack_all())
@@ -1984,6 +1985,7 @@ class TestG6CheckpointsAndScan:
         trial.mkdir()
         reports = trial / "reports"
         reports.mkdir()
+        reports.chmod(0o700)
         outside = trial / "outside.json"
         outside.write_text("safe", encoding="utf-8")
         os.chmod(outside, 0o600)
