@@ -1395,6 +1395,46 @@ class TestG7RealSoak:
 
 
 class TestFaultMatrixAndAll:
+    def test_direct_fault_matrix_writes_schema_valid_report(self, tmp_path, monkeypatch):
+        """Direct matrix mode must serialize its per-case containment evidence."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+
+        code, report_path = _run_stage(
+            "g4",
+            trial,
+            monkeypatch,
+            "--ack-fault-strategy",
+            "--fault-matrix",
+        )
+
+        assert code == 0
+        report = _read_report(report_path)
+        case = report["checks"]["fault_matrix"]["cases"]["lock"]
+        assert case["contained"] is True
+        assert case["no_partial_mutation"] is True
+        with pytest.raises(RuntimeError, match="fault case not on allowlist"):
+            lpc.write_report(
+                trial / "reports" / "invalid-case.json",
+                {
+                    **report,
+                    "checks": {
+                        "fault_matrix": {
+                            **report["checks"]["fault_matrix"],
+                            "cases": {
+                                **report["checks"]["fault_matrix"]["cases"],
+                                "unknown": {
+                                    "verdict": PASS,
+                                    "reason_code": "ok",
+                                    "contained": True,
+                                    "no_partial_mutation": True,
+                                },
+                            },
+                        }
+                    },
+                },
+            )
+
     def test_all_runs_both_core_lifecycle_and_fault_matrix(self, tmp_path, monkeypatch):
         """The `all` orchestrator must exercise BOTH the G4 core lifecycle
         AND the G4 fault matrix, not just one."""

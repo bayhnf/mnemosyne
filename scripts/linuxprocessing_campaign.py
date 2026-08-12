@@ -116,6 +116,8 @@ _ALLOWED_CHECK_KEYS = frozenset(
         "core_verdict",
         "matrix_verdict",
         "cases",
+        "contained",
+        "no_partial_mutation",
     }
 )
 
@@ -415,6 +417,9 @@ def _assert_recursive_schema(obj: Any, trail: str = "root") -> None:
                 # This is a check name; must be in the known check-names set.
                 if key not in _ALLOWED_CHECK_NAMES:
                     raise RuntimeError("unknown check name; report not written")
+            elif trail == "root.checks.fault_matrix.cases":
+                if key not in _FAULT_CASES:
+                    raise RuntimeError("fault case not on allowlist; report not written")
             elif trail.startswith("root.checks."):
                 # This is a field within a check; must be an allowed key.
                 if key not in _ALLOWED_CHECK_KEYS:
