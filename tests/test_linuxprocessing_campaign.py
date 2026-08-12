@@ -1278,6 +1278,23 @@ class TestG7RealSoak:
         # Real receipts: the number of stored events must match iterations.
         assert checks["monotonic_receipts"]["receipt_count"] >= 1
 
+    def test_g7_fails_closed_when_cap_hits_before_deadline(self, tmp_path, monkeypatch):
+        """A nonzero soak must FAIL with soak_duration_incomplete when the
+        iteration cap is reached before the monotonic deadline."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        monkeypatch.setattr(lpc.time, "monotonic", lambda: 0.0)
+        monkeypatch.setattr(lpc.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(lpc, "_SOAK_ITERATION_CAP", 1)
+        code, report_path = _run_stage(
+            "g7", trial, monkeypatch, "--soak-seconds", "2", "--ack-soak-schedule"
+        )
+        assert code == 1
+        report = _read_report(report_path)
+        assert report["reason_code"] == "soak_duration_incomplete"
+        assert report["checks"]["soak"]["reason_code"] == "soak_duration_incomplete"
+        assert "soak_duration_incomplete" in lpc._APPROVED_REASON_CODES
+
     def test_g7_fails_on_degraded_period(self, tmp_path, monkeypatch):
         """If a soak iteration fails (degraded), G7 must FAIL, not pass."""
         trial = tmp_path / "trial"
@@ -1889,6 +1906,23 @@ class TestG4CoreLifecycle:
         assert code == 0
         report = _read_report(report_path)
         assert report["checks"]["exactly_once"]["stored"] == 4
+
+    def test_g4_isolate_config_resets_available_after_crash_retry(self, tmp_path):
+        """Crash-retry leaves available=lambda: True; _g4_isolate_config must
+        reset it to False so inhale never hits the throwing embed hook."""
+        trial = tmp_path / "trial"
+        trial.mkdir()
+        from mnemosyne.core import beam as beam_module
+        from mnemosyne.core.beam import BeamMemory
+
+        with lpc._campaign_process_state():
+            lpc._g4_isolate_config(trial)
+            beam = BeamMemory(session_id="crash-reset-sess", db_path=trial / "crash.db")
+            lpc._run_crash_retry(beam)
+            # Leak precondition reproduced from the root cause.
+            assert beam_module._embeddings.available() is True
+            lpc._g4_isolate_config(trial)
+            assert beam_module._embeddings.available() is False
 
 
 # ===========================================================================

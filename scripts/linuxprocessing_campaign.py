@@ -71,6 +71,9 @@ EXIT_GATE = 2
 
 _DEFAULT_SOAK_SECONDS = 72 * 60 * 60
 
+_SOAK_ITERATION_CAP = 100000
+_SOAK_CADENCE_SECONDS = 5.0
+
 _STAGES = ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "all")
 _STAGE_NAMES = frozenset(_STAGES)
 _ALL_ORDER = ("g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8")
@@ -259,6 +262,7 @@ _APPROVED_REASON_CODES = frozenset(
         "budget_exceeded",
         "soak_failed",
         "degraded_period",
+        "soak_duration_incomplete",
         "package_import_failed",
         "plugin_surface_missing",
         "g5_package_import_failed",
@@ -965,6 +969,7 @@ def _g4_isolate_config(trial_root: Path) -> None:
     _emb.embed = lambda _texts: (_ for _ in ()).throw(
         AssertionError("offline lexical fallback only")
     )
+    _emb.available = lambda: False
 
 
 def _g4_event(i: int):
@@ -1743,9 +1748,20 @@ def _stage_g7(args: argparse.Namespace) -> tuple[str, str, dict[str, Any]]:
                 # Critical 5: degraded period is a FAILURE, not silently passed.
                 degraded += 1
             i += 1
-            # Safety cap to avoid runaway in case of a clock bug.
-            if i > 100000:
-                break
+            if soak_seconds > 0:
+                # Fail closed: reaching the cap before the deadline must never
+                # report PASS; the fixed cadence keeps the default soak inside
+                # the cap under normal operation.
+                if i >= _SOAK_ITERATION_CAP and time.monotonic() < deadline:
+                    checks["soak"] = {
+                        "verdict": FAIL,
+                        "reason_code": "soak_duration_incomplete",
+                        "iterations": i,
+                        "actual_duration_seconds": soak_seconds,
+                        "elapsed_seconds": round(time.monotonic() - start_monotonic, 3),
+                    }
+                    return FAIL, "soak_duration_incomplete", checks
+                time.sleep(_SOAK_CADENCE_SECONDS)
 
         elapsed = time.monotonic() - start_monotonic
         after = _resource_snapshot()
