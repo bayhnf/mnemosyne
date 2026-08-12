@@ -12,6 +12,9 @@ from unittest.mock import MagicMock, patch
 
 from hermes_memory_provider import MnemosyneMemoryProvider
 from mnemosyne.core.llm_backends import get_host_llm_backend
+# Eager import ensures the adapter module is cached before any cross-test
+# pollution from test_hermes_llm_adapter can interfere with mock.patch.
+from hermes_memory_provider import hermes_llm_adapter as _hlm_adapter  # noqa: F401
 
 
 class _RecallBeam:

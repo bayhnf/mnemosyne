@@ -176,7 +176,7 @@ def _isolate_config_and_offline(tmp_path, monkeypatch):
     """Module-wide isolation for EVERY Dream test.
 
     Points the central config at a throwaway data dir and resets the singleton
-    so no test ever touches /home/bell/.hermes/mnemosyne/config.yaml. Also pins
+    so no test ever touches a real user configuration file. Also pins
     SHMR's embedding path to the deterministic lexical fallback.
     """
     monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path))
