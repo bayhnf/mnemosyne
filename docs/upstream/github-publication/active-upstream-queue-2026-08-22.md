@@ -32,6 +32,12 @@ New verified findings indexed in #827:
 - **B15:** batch mutation errors expose raw exception text and traceback details.
 - **B16:** SHMR imports NumPy unconditionally despite the supported no-NumPy base-install contract.
 
+Maintainer triage converted these into focused child issues:
+
+- **#832** — public batch failure diagnostics (from B15; `needs-decision`).
+- **#833** — concurrent schema add-column initialization race (from B01; `needs-decision`).
+- **#834** — optional NumPy capability for SHMR imports (from B16; `needs-decision`).
+
 New proposals indexed in #828:
 
 - **E01:** instrumented provider-migration governance.
