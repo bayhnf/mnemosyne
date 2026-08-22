@@ -1,7 +1,7 @@
 # Active Upstream Bug and Improvement Queue
 
 **Refreshed:** 2026-08-22
-**Baseline:** upstream `main` @ `4c6b280`
+**Baseline:** upstream `main` @ `cbbfc2a` (findings B01/B15/B16 were reproduced on `4c6b280`; subsequent #823–#825 do not touch their paths)
 **Evidence policy:** reproduce in isolated fixtures first; publish only verified findings and tested solutions.
 
 ## Merged fix
@@ -20,6 +20,22 @@ Implemented solution:
 - UTF-8-only hygiene candidate JSON decoding, including invalid UTF-8, directory paths, and unexpected decoder failure containment.
 
 Final evidence: full upstream CI/CLA green; approved by `dplush`; merged as `4c6b280`.
+
+## Published trackers
+
+- Bugs and reliability: [#827](https://github.com/mnemosyne-oss/mnemosyne/issues/827)
+- Improvements and integrations: [#828](https://github.com/mnemosyne-oss/mnemosyne/issues/828)
+
+New verified findings indexed in #827:
+
+- **B01:** concurrent fresh-DB schema initialization race (`20/20` deterministic reproduction).
+- **B15:** batch mutation errors expose raw exception text and traceback details.
+- **B16:** SHMR imports NumPy unconditionally despite the supported no-NumPy base-install contract.
+
+New proposals indexed in #828:
+
+- **E01:** instrumented provider-migration governance.
+- **E02:** safe recall metadata projection for policy-aware consumers.
 
 ## Open fixes already published
 
@@ -69,7 +85,7 @@ Enhancements still requiring overlap/feasibility review:
 
 `#790 #789 #784 #766 #761 #732 #724 #715 #712 #695 #661 #651 #598 #586 #543 #514 #450 #449 #446 #403 #372 #370 #327 #326`
 
-Each must end as `verified`, `not reproduced`, `not feasible`, or `needs evidence`, with a solution/approach before aggregate issues are published.
+Each must end as `verified`, `not reproduced`, `not feasible`, or `needs evidence`. Add evidence to existing issues where applicable; do not duplicate them.
 
 ## Safety exclusions
 

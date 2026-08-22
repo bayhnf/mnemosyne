@@ -150,6 +150,12 @@ Do not open duplicate child issues for these existing areas:
 
 Always refresh live state before acting.
 
+Latest refresh after publication:
+
+- upstream `main`: `cbbfc2a` (PRs #823–#825 merged after #814; no overlap with B01/B15/B16 paths).
+- #827 and #828: open, only author comments, no maintainer reply yet.
+- #564: `AxDSan` approved inherited source timestamps (`timestamp=max(source timestamps)`, `created_at=now`) and requested sequencing after PR #563; this is owned by the existing reporter, not us.
+
 ## Local files
 
 Canonical package:
@@ -218,7 +224,7 @@ Labels were not applied because `bayhnf` lacks repository label permissions. Tit
 - GitHub issue/PR comments must be English.
 - Check `git status` before commit; do not include unrelated `docs/superpowers/`.
 
-## Local git state
+## Local git state at initial handoff
 
 The publication drafts and updated two-issue plan were modified/created locally but were not yet committed at handoff time. Before committing:
 
@@ -236,3 +242,5 @@ docs/upstream/github-publication/GLM-HANDOFF-2026-08-22.md
 ```
 
 Do not stage `docs/superpowers/`.
+
+Publication artifacts were subsequently committed as `fc0dd1f` (`docs: record upstream tracking issue publication`).

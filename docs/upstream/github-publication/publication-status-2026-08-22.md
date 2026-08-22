@@ -1,7 +1,7 @@
 # Upstream Publication Status
 
 **Refreshed:** 2026-08-22
-**Upstream baseline:** `mnemosyne-oss/mnemosyne` `main` @ `4c6b280` (`fix(cli): emit static error codes at failure boundaries (#814)`)
+**Upstream baseline:** `mnemosyne-oss/mnemosyne` `main` @ `cbbfc2a` (through merged PRs #823–#825)
 **Account:** `bayhnf`
 
 This is the current submission map. Live GitHub state was checked before writing it.
@@ -30,6 +30,13 @@ This is the current submission map. Live GitHub state was checked before writing
 |---:|---|
 | [#788](https://github.com/mnemosyne-oss/mnemosyne/pull/788) | Bundled scope split into focused PRs #814–#817 after maintainer feedback. |
 
+## Published tracking issues
+
+| Issue | Purpose | State |
+|---:|---|---|
+| [#827](https://github.com/mnemosyne-oss/mnemosyne/issues/827) | Deployment-informed correctness and reliability findings | Open; awaiting maintainer feedback |
+| [#828](https://github.com/mnemosyne-oss/mnemosyne/issues/828) | Deployment-informed lifecycle and integration improvements | Open; awaiting maintainer feedback |
+
 ## Not yet published
 
 - **S2** — Inhale ingest receipts and admission policy
@@ -48,7 +55,7 @@ This is the current submission map. Live GitHub state was checked before writing
 2. Re-audit #815 and #817 against current `main`, address review-bot findings only when still valid, and request maintainer review.
 3. Rebase conflicting #719, #721, and #774; refresh focused evidence.
 4. Refresh #720 against current `main`; do not modify it unless current tests or review require it.
-5. Continue the verified bug and enhancement queue in `active-upstream-queue-2026-08-22.md`.
+5. Keep #827/#828 as indexes; use focused PRs or existing official issues for implementation.
 
 ## Rules
 

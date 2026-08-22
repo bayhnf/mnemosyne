@@ -1,7 +1,7 @@
 # Two-Issue Upstream Submission Plan
 
 **Prepared:** 2026-08-20
-**Upstream baseline:** `7ec6f4c`
+**Upstream baseline at publication:** `4c6b280` (current main later advanced to `cbbfc2a` through unrelated #823–#825)
 **Policy:** audit and reproduce first; publish only verified findings. Do not touch the live Mnemosyne instance.
 
 ## Issue 1 — Bugs and verified failure classes
@@ -92,5 +92,9 @@ Complete the reproduction matrix for the remaining candidate upstream issues, th
 
 - Audit scope: complete.
 - Initial isolated trial: complete (378 passed, 1 skipped).
-- Remaining reproduction matrix: pending.
-- Issue publication: pending maintainer-safe evidence review.
+- Dedup corpus: complete (315 issues, 500 PRs).
+- New verified bugs: B01, B15, B16.
+- Published bug tracker: https://github.com/mnemosyne-oss/mnemosyne/issues/827
+- Published improvement tracker: https://github.com/mnemosyne-oss/mnemosyne/issues/828
+- Publication read-back/privacy/length checks: passed.
+- Maintainer feedback on trackers: pending.
