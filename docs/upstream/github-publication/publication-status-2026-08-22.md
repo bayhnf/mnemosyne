@@ -23,7 +23,7 @@ This is the current submission map. Live GitHub state was checked before writing
 | 5 | [#720](https://github.com/mnemosyne-oss/mnemosyne/pull/720) | `contrib/fix-remember-embed-warning` | Warning for skipped single-item embeddings | Mergeable | Earlier feedback addressed; current-head review still pending |
 | 6 | [#721](https://github.com/mnemosyne-oss/mnemosyne/pull/721) | `contrib/fix-shmr-local-llm` | Restore SHMR local-LLM path | Conflicting | No maintainer review yet |
 | 7 | [#774](https://github.com/mnemosyne-oss/mnemosyne/pull/774) | `contrib/migrate-dry-run` | Report-only migration dry run | Conflicting | No maintainer review yet |
-| 8 | [#829](https://github.com/mnemosyne-oss/mnemosyne/pull/829) | `contrib/recall-metadata-projection` | Opt-in allowlisted recall metadata projection | Mergeable; CI running | New focused enhancement PR |
+| 8 | [#829](https://github.com/mnemosyne-oss/mnemosyne/pull/829) | `contrib/recall-metadata-projection` | Opt-in allowlisted recall metadata projection | Mergeable; full CI/CLA/CodeRabbit green | Awaiting maintainer review |
 
 ## Superseded
 
