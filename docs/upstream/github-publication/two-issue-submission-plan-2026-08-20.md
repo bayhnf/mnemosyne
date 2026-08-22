@@ -44,6 +44,27 @@ This issue will consolidate proposed improvements and architecture-level enhance
 
 Enhancements need a concrete motivation, current behavior, proposed API/behavior, compatibility and rollback plan, focused proof-of-concept or tests where feasible, and explicit non-goals. No implementation PR is opened until maintainer feedback selects the smallest useful slice.
 
+## Provenance and public framing
+
+These findings came from our personally operated, customized Mnemosyne setup integrated with Hermes. We implemented and exercised changes across real write, recall, consolidation, recovery, scope, provider, and lifecycle flows. That broader operational coverage exposed failure modes and improvement opportunities that are easy to miss in isolated happy-path use.
+
+The private deployment is the discovery source, not the sole proof. Before publication, every bug must be reproduced against current upstream code in an isolated fixture, and every enhancement must have sanitized evidence, an example, expected impact, compatibility notes, and a concrete implementation approach. The public issues must not include private memory content, credentials, hostnames, IP addresses, absolute private paths, or live operational identifiers/counts.
+
+Recommended wording for both issues:
+
+> These findings came from a Mnemosyne setup that we personally operate and have extended for a real Hermes integration. Running the system across real lifecycle and failure paths exposed the items below. We are not presenting private deployment observations as upstream proof: confirmed bugs are independently reproduced against current upstream code with sanitized fixtures, and proposed improvements include sanitized evidence, examples, expected impact, compatibility considerations, and an implementation approach.
+
+Each finding must show the evidence chain explicitly:
+
+1. **Discovery source** — which real workflow in our customized setup exposed it.
+2. **Sanitized deployment signal** — content-free symptom, gate result, or canary outcome.
+3. **Independent upstream reproduction** — current upstream SHA plus minimal isolated fixture and observed output.
+4. **Root cause** — exact shared boundary or code path, not only the symptom.
+5. **Suggested solution** — smallest safe fix, compatibility/rollback notes, and acceptance tests.
+6. **Implementation status** — local workaround/deployed improvement, upstream PR, existing official issue, or proposal only.
+
+If an item has not passed step 3, label it `NEEDS_REPRODUCTION`; do not present it as a confirmed upstream bug.
+
 ## Planned maintainer workflow
 
 1. Publish one English bug issue and one English improvements issue after the candidate list is audited.
