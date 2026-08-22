@@ -154,6 +154,7 @@ Latest refresh after publication:
 
 - upstream `main`: `cbbfc2a` (PRs #823–#825 merged after #814; no overlap with B01/B15/B16 paths).
 - #827 and #828: open, only author comments, no maintainer reply yet.
+- #829: open focused E02 PR (`contrib/recall-metadata-projection`), mergeable; docs/lint/build/CLA green and test matrix running.
 - #564: `AxDSan` approved inherited source timestamps (`timestamp=max(source timestamps)`, `created_at=now`) and requested sequencing after PR #563; this is owned by the existing reporter, not us.
 
 ## Local files

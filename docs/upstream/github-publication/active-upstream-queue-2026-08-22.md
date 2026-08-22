@@ -37,6 +37,8 @@ New proposals indexed in #828:
 - **E01:** instrumented provider-migration governance.
 - **E02:** safe recall metadata projection for policy-aware consumers.
 
+E02 implementation PR: [#829](https://github.com/mnemosyne-oss/mnemosyne/pull/829). The final design uses `recall(..., metadata_keys=[...])` after scoped recall filtering; it does not expose an arbitrary-ID public hydrator.
+
 ## Open fixes already published
 
 | Finding | PR | Solution approach | State |

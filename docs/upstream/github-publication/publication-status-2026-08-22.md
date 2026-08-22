@@ -23,6 +23,7 @@ This is the current submission map. Live GitHub state was checked before writing
 | 5 | [#720](https://github.com/mnemosyne-oss/mnemosyne/pull/720) | `contrib/fix-remember-embed-warning` | Warning for skipped single-item embeddings | Mergeable | Earlier feedback addressed; current-head review still pending |
 | 6 | [#721](https://github.com/mnemosyne-oss/mnemosyne/pull/721) | `contrib/fix-shmr-local-llm` | Restore SHMR local-LLM path | Conflicting | No maintainer review yet |
 | 7 | [#774](https://github.com/mnemosyne-oss/mnemosyne/pull/774) | `contrib/migrate-dry-run` | Report-only migration dry run | Conflicting | No maintainer review yet |
+| 8 | [#829](https://github.com/mnemosyne-oss/mnemosyne/pull/829) | `contrib/recall-metadata-projection` | Opt-in allowlisted recall metadata projection | Mergeable; CI running | New focused enhancement PR |
 
 ## Superseded
 
@@ -55,7 +56,7 @@ This is the current submission map. Live GitHub state was checked before writing
 2. Re-audit #815 and #817 against current `main`, address review-bot findings only when still valid, and request maintainer review.
 3. Rebase conflicting #719, #721, and #774; refresh focused evidence.
 4. Refresh #720 against current `main`; do not modify it unless current tests or review require it.
-5. Keep #827/#828 as indexes; use focused PRs or existing official issues for implementation.
+5. Review #829 as the first focused enhancement PR; keep #827/#828 as indexes.
 
 ## Rules
 
