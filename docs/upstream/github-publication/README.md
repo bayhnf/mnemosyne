@@ -43,7 +43,9 @@ databases acquire the schema without a migration step.
 | File | Purpose |
 |---|---|
 | [README.md](README.md) | This index. Read first. |
-| [redundancy-matrix.md](redundancy-matrix.md) | Overlap of this branch with open upstream issues/PRs, with a precise "addresses / adjacent / does not address" verdict per issue. |
+| [publication-status-2026-08-22.md](publication-status-2026-08-22.md) | Current live PR, review, merge, and next-action status. |
+| [active-upstream-queue-2026-08-22.md](active-upstream-queue-2026-08-22.md) | Current merged fixes, open PRs, verified bugs/solutions, improvements, and pending reproduction queue. |
+| [redundancy-matrix.md](redundancy-matrix.md) | Historical overlap analysis; recheck live issue state before citing it. |
 | [verified-bugs.md](verified-bugs.md) | Bugs the branch fixes, stated conservatively with the exact failure class. Each fix is scoped to what the code actually prevents. |
 | [feature-roadmap.md](feature-roadmap.md) | Dependency-ordered PR slicing plan. The on-host trial harness is explicitly **excluded** from every slice. |
 | [privacy-and-evidence.md](privacy-and-evidence.md) | Content-free surface contract, security posture, and a conservative statement of test/evidence status (historical only). |
