@@ -156,6 +156,7 @@ Latest refresh after publication:
 - #827 and #828: open, only author comments, no maintainer reply yet.
 - #829: open focused E02 PR (`contrib/recall-metadata-projection`), head `c2ecacf`; mergeable; full Python 3.10–3.13 CI, docs, lint, build, CLA, and CodeRabbit green; awaiting maintainer review.
 - dplush triaged #827 into child issues: #832 (B15), #833 (B01), and #834 (B16). All are open with `needs-decision`; implementation must wait for each contract decision.
+- Contract proposals were posted on #832/#833/#834. Do not open PRs for them until a maintainer confirms the contract. When approved, submit only one accepted item first so other contributors can take the rest.
 - #564: `AxDSan` approved inherited source timestamps (`timestamp=max(source timestamps)`, `created_at=now`) and requested sequencing after PR #563; this is owned by the existing reporter, not us.
 
 ## Local files

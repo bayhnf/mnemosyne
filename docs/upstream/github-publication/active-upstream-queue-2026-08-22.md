@@ -38,6 +38,8 @@ Maintainer triage converted these into focused child issues:
 - **#833** — concurrent schema add-column initialization race (from B01; `needs-decision`).
 - **#834** — optional NumPy capability for SHMR imports (from B16; `needs-decision`).
 
+Contract proposals were posted on #832, #833, and #834. Implementation starts only after maintainer confirmation of each contract.
+
 New proposals indexed in #828:
 
 - **E01:** instrumented provider-migration governance.
