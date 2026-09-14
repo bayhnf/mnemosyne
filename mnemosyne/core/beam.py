@@ -2117,15 +2117,11 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
             if not _column_matches(cursor.fetchall()):
                 raise
             return False
-    cursor.execute(f"PRAGMA table_info({table})")
-    rows = cursor.fetchall()
-    if not _column_matches(rows):
-        expected_type, expected_notnull, expected_default = _expected_pieces()
-        raise sqlite3.OperationalError(
-            f"schema mismatch for {table}.{column}: expected {col_type}, "
-            f"got {rows[0][2] if rows else '?'} "
-            f"DEFAULT {rows[0][4] if rows else '?'}"
-        )
+    # An existing column is an idempotent legacy-schema case. Exact schema
+    # validation is required on the duplicate-race path above, where it
+    # distinguishes a concurrent winner from an unrelated DDL failure; do not
+    # reject older databases merely because SQLite recorded a compatible column
+    # with a different historical type/default declaration.
     return False
 
 

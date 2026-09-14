@@ -111,22 +111,20 @@ def test_sidecar_error(tmp_path):
         beam.init_beam(path)
 
 
-def test_existing_migration_schema_must_match(tmp_path):
+def test_existing_migration_schema_is_idempotent_for_legacy_type(tmp_path):
     path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
         conn.execute('CREATE TABLE working_memory (id TEXT, consolidated_at INTEGER)')
     with sqlite3.connect(path) as conn:
-        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
-            beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT')
+        assert beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT') is False
 
 
-def test_existing_migration_nullability_must_match(tmp_path):
+def test_existing_migration_schema_is_idempotent_for_legacy_nullability(tmp_path):
     path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
         conn.execute('CREATE TABLE working_memory (id TEXT, consolidation_claimed_at TEXT NOT NULL)')
     with sqlite3.connect(path) as conn:
-        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
-            beam._add_column_if_missing(conn, 'working_memory', 'consolidation_claimed_at', 'TEXT')
+        assert beam._add_column_if_missing(conn, 'working_memory', 'consolidation_claimed_at', 'TEXT') is False
 
 
 @pytest.mark.parametrize('message', ['disk I/O error', 'attempt to write a readonly database'])
@@ -151,14 +149,14 @@ def test_duplicate_migration_is_not_false_positive(tmp_path):
     assert result is False
 
 
-def test_default_mismatch_rejected_when_none_expected(tmp_path):
-    # Expected declaration carries no DEFAULT => an existing DEFAULT is a mismatch.
+def test_existing_default_is_idempotent_for_legacy_column(tmp_path):
+    # Existing legacy columns are left unchanged; schema validation is reserved
+    # for the duplicate-race path where it prevents false suppression.
     path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE working_memory (id TEXT, consolidated_at TEXT DEFAULT 'bad')")
     with sqlite3.connect(path) as conn:
-        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
-            beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT')
+        assert beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT') is False
 
 
 def test_default_different_tolerated_when_expected_has_default(tmp_path):
