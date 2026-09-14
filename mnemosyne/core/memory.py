@@ -378,8 +378,8 @@ class Mnemosyne:
         else:
             self.db_path = _default_db_path()
 
-        self.conn = _get_connection(self.db_path)
         init_db(self.db_path)
+        self.conn = _get_connection(self.db_path)
 
         # Phase 8: Streaming + Patterns + Plugins (lazy init)
         self._stream = None

@@ -1295,41 +1295,20 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_source ON episodic_memory(source)")
 
     # --- Tiered degradation migration (v2.3) ---
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN tier INTEGER DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN degraded_at TEXT")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "episodic_memory", "tier", "INTEGER DEFAULT 1")
+    _add_column_if_missing(conn, "episodic_memory", "degraded_at", "TEXT")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_em_tier ON episodic_memory(tier)")
 
     # --- Veracity migration (v2.4) ---
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN veracity TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN veracity TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "working_memory", "veracity", "TEXT DEFAULT 'unknown'")
+    _add_column_if_missing(conn, "episodic_memory", "veracity", "TEXT DEFAULT 'unknown'")
 
     # --- Typed memory migration (Phase 1) ---
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN memory_type TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN memory_type TEXT DEFAULT 'unknown'")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "working_memory", "memory_type", "TEXT DEFAULT 'unknown'")
+    _add_column_if_missing(conn, "episodic_memory", "memory_type", "TEXT DEFAULT 'unknown'")
 
     # --- Binary vector migration (Phase 2) ---
-    try:
-        cursor.execute("ALTER TABLE episodic_memory ADD COLUMN binary_vector BLOB")
-    except sqlite3.OperationalError:
-        pass
+    _add_column_if_missing(conn, "episodic_memory", "binary_vector", "BLOB")
 
     # --- E3 additive sleep migration ---
     # Working memories that sleep() has consolidated into an episodic
@@ -1435,10 +1414,7 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
         "parent_event_ids": "parent_event_ids TEXT DEFAULT '[]'",
         "expiry": "expiry TEXT",
     }.items():
-        try:
-            cursor.execute(f"ALTER TABLE memory_events ADD COLUMN {ddl}")
-        except sqlite3.OperationalError:
-            pass
+        _add_column_if_missing(conn, "memory_events", col, ddl.split(" ", 1)[1])
 
     # Detect supported vector type
     effective_vec_type = _detect_vec_type(conn)
@@ -2097,7 +2073,15 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
     cursor.execute(f"PRAGMA table_info({table})")
     existing = {row[1] for row in cursor.fetchall()}
     if column not in existing:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        except sqlite3.OperationalError as exc:
+            if str(exc).lower() != f"duplicate column name: {column}".lower():
+                raise
+            cursor.execute(f"PRAGMA table_info({table})")
+            matches = [row for row in cursor.fetchall() if row[1] == column]
+            if len(matches) != 1 or matches[0][2].upper() != col_type.split()[0].upper():
+                raise
         conn.commit()
 
 

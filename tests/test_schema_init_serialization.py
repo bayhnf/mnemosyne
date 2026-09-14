@@ -76,6 +76,34 @@ def test_errors_propagate(tmp_path, monkeypatch, message):
         beam.init_beam(tmp_path / 'failure.db')
 
 
+def test_constructor_locks_first_connection(tmp_path, monkeypatch):
+    import contextlib
+    from mnemosyne.core import memory
+    active = False
+    observations = []
+    original_lock = beam._schema_init_lock
+    original_get = memory._get_connection
+
+    @contextlib.contextmanager
+    def marked(path):
+        nonlocal active
+        with original_lock(path) as canonical:
+            active = True
+            try:
+                yield canonical
+            finally:
+                active = False
+
+    def get(path):
+        observations.append(active)
+        return original_get(path)
+
+    monkeypatch.setattr(beam, '_schema_init_lock', marked)
+    monkeypatch.setattr(memory, '_get_connection', get)
+    memory.Mnemosyne(db_path=tmp_path / 'constructor.db')
+    assert observations[0] is True
+
+
 def test_sidecar_error(tmp_path):
     path = tmp_path / 'failure.db'
     Path(str(path) + '.init.lock').mkdir()
