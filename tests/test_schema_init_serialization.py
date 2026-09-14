@@ -109,3 +109,43 @@ def test_sidecar_error(tmp_path):
     Path(str(path) + '.init.lock').mkdir()
     with pytest.raises(IsADirectoryError):
         beam.init_beam(path)
+
+
+def test_existing_migration_schema_must_match(tmp_path):
+    path = tmp_path / 'schema.db'
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE working_memory (id TEXT, consolidated_at INTEGER)')
+    with sqlite3.connect(path) as conn:
+        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
+            beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT')
+
+
+def test_existing_migration_nullability_must_match(tmp_path):
+    path = tmp_path / 'schema.db'
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE working_memory (id TEXT, consolidation_claimed_at TEXT NOT NULL)')
+    with sqlite3.connect(path) as conn:
+        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
+            beam._add_column_if_missing(conn, 'working_memory', 'consolidation_claimed_at', 'TEXT')
+
+
+@pytest.mark.parametrize('message', ['disk I/O error', 'attempt to write a readonly database'])
+def test_migration_ddl_errors_propagate(tmp_path, monkeypatch, message):
+    original = beam._add_column_if_missing
+
+    def fail(conn, table, column, col_type):
+        if column == 'consolidated_at':
+            raise sqlite3.OperationalError(message)
+        return original(conn, table, column, col_type)
+
+    monkeypatch.setattr(beam, '_add_column_if_missing', fail)
+    with pytest.raises(sqlite3.OperationalError, match=message):
+        beam.init_beam(tmp_path / 'ddl.db')
+
+
+def test_duplicate_migration_is_not_false_positive(tmp_path):
+    path = tmp_path / 'schema.db'
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE working_memory (id TEXT, consolidated_at TEXT)')
+    result = beam._add_column_if_missing(sqlite3.connect(path), 'working_memory', 'consolidated_at', 'TEXT')
+    assert result is False

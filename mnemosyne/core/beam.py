@@ -1321,16 +1321,9 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     # (introduced in 2.5 by the heal-quality pipeline) records when a
     # summary row was finalized; this column records when a SOURCE row
     # was marked done by sleep. Same concept, different angle.
-    _e3_column_added = False
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN consolidated_at TEXT")
-        _e3_column_added = True
-    except sqlite3.OperationalError as exc:
-        # Only swallow "duplicate column" -- every other OperationalError
-        # (database locked, disk I/O, readonly, missing table) must
-        # surface so callers don't proceed with a broken schema.
-        if "duplicate column" not in str(exc).lower():
-            raise
+    _e3_column_added = _add_column_if_missing(
+        conn, "working_memory", "consolidated_at", "TEXT"
+    )
 
     if _e3_column_added:
         # Pre-E3 backfill: existing rows are treated as already-consolidated.
@@ -1347,11 +1340,9 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
             (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),),
         )
 
-    try:
-        cursor.execute("ALTER TABLE working_memory ADD COLUMN consolidation_claimed_at TEXT")
-    except sqlite3.OperationalError as exc:
-        if "duplicate column" not in str(exc).lower():
-            raise
+    _add_column_if_missing(
+        conn, "working_memory", "consolidation_claimed_at", "TEXT"
+    )
 
     # Partial index for the sleep eligibility predicate. Sleep scans
     # WHERE session_id = ? AND timestamp < ? AND consolidated_at IS NULL
@@ -1398,14 +1389,8 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_timestamp ON memory_events(timestamp)")
-    try:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
-    except sqlite3.OperationalError:
-        pass  # Column may not exist in older schema
-    try:
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
-    except sqlite3.OperationalError:
-        pass  # Column may not exist in older schema
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_memory_id ON memory_events(memory_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_me_device_id ON memory_events(device_id)")
 
     # Memory events ALTER TABLE migrations (safe add columns for existing DBs)
     for col, ddl in {
@@ -1872,7 +1857,9 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
                 )
             """)
         except (sqlite3.OperationalError, RuntimeError):
-            pass  # sqlite-vec not available
+            if getattr(conn, "_mnemosyne_vec_loaded", False):
+                raise
+            # sqlite-vec is optional; absence is the only tolerated failure.
 
     # --- Temporal architecture migration ---
     _add_column_if_missing(conn, "working_memory", "event_date", "TEXT DEFAULT NULL")
@@ -2068,21 +2055,29 @@ def _sanitize_utf8(text: str) -> str:
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str):
-    """Safely add a column if it doesn't already exist (SQLite migration helper)."""
+    """Add a column, then verify type/default when it already exists."""
     cursor = conn.cursor()
     cursor.execute(f"PRAGMA table_info({table})")
     existing = {row[1] for row in cursor.fetchall()}
     if column not in existing:
-        try:
-            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        except sqlite3.OperationalError as exc:
-            if str(exc).lower() != f"duplicate column name: {column}".lower():
-                raise
-            cursor.execute(f"PRAGMA table_info({table})")
-            matches = [row for row in cursor.fetchall() if row[1] == column]
-            if len(matches) != 1 or matches[0][2].upper() != col_type.split()[0].upper():
-                raise
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
         conn.commit()
+        return True
+    cursor.execute(f"PRAGMA table_info({table})")
+    row = next(row for row in cursor.fetchall() if row[1] == column)
+    expected_type, _, expected_default = col_type.partition(" DEFAULT ")
+    actual_default = row[4].strip() if row[4] is not None else None
+    expected_notnull = " NOT NULL" in expected_type.upper()
+    expected_type = expected_type.replace(" NOT NULL", "")
+    if (row[2].upper() != expected_type.strip().upper()
+        or bool(row[3]) != expected_notnull or (
+        expected_default.strip() and actual_default != expected_default.strip()
+    )):
+        raise sqlite3.OperationalError(
+            f"schema mismatch for {table}.{column}: expected {col_type}, "
+            f"got {row[2]} DEFAULT {row[4]}"
+        )
+    return False
 
 
 @dataclass(frozen=True)
