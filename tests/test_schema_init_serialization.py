@@ -111,20 +111,22 @@ def test_sidecar_error(tmp_path):
         beam.init_beam(path)
 
 
-def test_existing_migration_schema_is_idempotent_for_legacy_type(tmp_path):
+def test_existing_migration_schema_type_must_match(tmp_path):
     path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
         conn.execute('CREATE TABLE working_memory (id TEXT, consolidated_at INTEGER)')
     with sqlite3.connect(path) as conn:
-        assert beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT') is False
+        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
+            beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT')
 
 
-def test_existing_migration_schema_is_idempotent_for_legacy_nullability(tmp_path):
+def test_existing_migration_schema_nullability_must_match(tmp_path):
     path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
         conn.execute('CREATE TABLE working_memory (id TEXT, consolidation_claimed_at TEXT NOT NULL)')
     with sqlite3.connect(path) as conn:
-        assert beam._add_column_if_missing(conn, 'working_memory', 'consolidation_claimed_at', 'TEXT') is False
+        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
+            beam._add_column_if_missing(conn, 'working_memory', 'consolidation_claimed_at', 'TEXT')
 
 
 @pytest.mark.parametrize('message', ['disk I/O error', 'attempt to write a readonly database'])
@@ -149,14 +151,13 @@ def test_duplicate_migration_is_not_false_positive(tmp_path):
     assert result is False
 
 
-def test_existing_default_is_idempotent_for_legacy_column(tmp_path):
-    # Existing legacy columns are left unchanged; schema validation is reserved
-    # for the duplicate-race path where it prevents false suppression.
+def test_existing_default_must_match_when_not_requested(tmp_path):
     path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE working_memory (id TEXT, consolidated_at TEXT DEFAULT 'bad')")
     with sqlite3.connect(path) as conn:
-        assert beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT') is False
+        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
+            beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT')
 
 
 def test_default_different_tolerated_when_expected_has_default(tmp_path):
@@ -189,7 +190,7 @@ def test_default_exact_match_accepted(tmp_path):
     assert result is False
 
 
-def _make_race_conn(path, wrong_dup=False):
+def _make_race_conn(path, wrong_dup=False, winner_ddl='ALTER TABLE target ADD COLUMN added TEXT'):
     real = sqlite3.connect(path)
     real.execute('CREATE TABLE target (id INTEGER PRIMARY KEY)')
     real.commit()
@@ -202,7 +203,7 @@ def _make_race_conn(path, wrong_dup=False):
                 if wrong_dup:
                     raise sqlite3.OperationalError('duplicate column name: unrelated_column')
                 # Winner: actually add the column, then report the duplicate.
-                self._cursor.execute('ALTER TABLE target ADD COLUMN added TEXT')
+                self._cursor.execute(winner_ddl)
                 raise sqlite3.OperationalError('duplicate column name: added')
             return self._cursor.execute(sql, params)
         def fetchall(self):
@@ -233,4 +234,70 @@ def test_duplicate_race_wrong_column_not_suppressed(tmp_path):
     conn = _make_race_conn(tmp_path / 'race.db', wrong_dup=True)
     with pytest.raises(sqlite3.OperationalError, match='duplicate column name'):
         beam._add_column_if_missing(conn, 'target', 'added', 'TEXT')
+    conn.close()
+
+
+def test_duplicate_race_wrong_default_not_suppressed(tmp_path):
+    # A duplicate for the requested column still fails when the winner used a
+    # different default than the requested declaration.
+    conn = _make_race_conn(
+        tmp_path / 'race.db',
+        winner_ddl="ALTER TABLE target ADD COLUMN added TEXT DEFAULT 'wrong'",
+    )
+    with pytest.raises(sqlite3.OperationalError, match='duplicate column name'):
+        beam._add_column_if_missing(conn, 'target', 'added', "TEXT DEFAULT 'expected'")
+    conn.close()
+
+
+def test_duplicate_race_missing_default_not_suppressed(tmp_path):
+    # A requested default must also be present on a concurrent winner.
+    conn = _make_race_conn(
+        tmp_path / 'race.db',
+        winner_ddl='ALTER TABLE target ADD COLUMN added TEXT',
+    )
+    with pytest.raises(sqlite3.OperationalError, match='duplicate column name'):
+        beam._add_column_if_missing(conn, 'target', 'added', "TEXT DEFAULT 'expected'")
+    conn.close()
+
+
+def test_unloadable_sqlite_vec_skips_vec_tables(tmp_path, monkeypatch):
+    # The Python package may be installed even when this connection could not
+    # load its extension; schema init must keep the optional-vector fallback.
+    path = tmp_path / 'unloadable.db'
+    conn = sqlite3.connect(path)
+    monkeypatch.setattr(beam, '_SQLITE_VEC_AVAILABLE', True)
+    monkeypatch.setattr(beam, '_detect_vec_type', lambda _conn: 'float32')
+    monkeypatch.setattr(beam, '_get_connection', lambda _path: conn)
+    beam._init_beam_locked(path)
+    names = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert 'vec_episodes' not in names
+    assert 'vec_working' not in names
+    assert 'vec_facts' not in names
+    conn.close()
+
+
+def test_loaded_sqlite_vec_ddl_errors_propagate(tmp_path, monkeypatch):
+    path = tmp_path / 'vector-failure.db'
+    class FaultCursor(sqlite3.Cursor):
+        def execute(self, sql, parameters=()):
+            if 'CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0' in ' '.join(str(sql).split()):
+                raise sqlite3.OperationalError('disk I/O error')
+            return super().execute(sql, parameters)
+
+    class LoadedConnection(sqlite3.Connection):
+        def cursor(self, *args, **kwargs):
+            kwargs['factory'] = FaultCursor
+            return super().cursor(*args, **kwargs)
+
+    conn = sqlite3.connect(path, factory=LoadedConnection)
+    conn._mnemosyne_vec_loaded = True
+    monkeypatch.setattr(beam, '_SQLITE_VEC_AVAILABLE', True)
+    monkeypatch.setattr(beam, '_detect_vec_type', lambda _conn: 'float32')
+    monkeypatch.setattr(beam, '_get_connection', lambda _path: conn)
+    with pytest.raises(sqlite3.OperationalError, match='disk I/O error'):
+        beam._init_beam_locked(path)
     conn.close()

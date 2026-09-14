@@ -1423,7 +1423,7 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     vec_dim_mismatch = any(dim != EMBEDDING_DIM for _, dim in stored_dims)
     if vec_dim_mismatch:
         logger.error(_dim_mismatch_message(stored_dims, EMBEDDING_DIM))
-    if _SQLITE_VEC_AVAILABLE:
+    if _SQLITE_VEC_AVAILABLE and getattr(conn, "_mnemosyne_vec_loaded", False):
         if not vec_dim_mismatch:
             try:
                 _ep_exists_before = conn.execute(
@@ -1845,7 +1845,9 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
     # sqlite-vec VIRTUAL TABLES block).
-    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
+    if (_SQLITE_VEC_AVAILABLE
+            and getattr(conn, "_mnemosyne_vec_loaded", False)
+            and not vec_dim_mismatch):
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
@@ -2068,32 +2070,25 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
         expected_type = expected_type.replace(" NOT NULL", "").strip()
         return expected_type, expected_notnull, expected_default.strip()
 
-    def _column_matches(rows):
+    def _column_matches(rows, strict_default=False):
         matches = [r for r in rows if len(r) >= 5 and r[1] == column]
         if len(matches) != 1:
             return False
         row = matches[0]
         expected_type, expected_notnull, expected_default = _expected_pieces()
-        actual_type = row[2].upper()
-        expected_type = expected_type.upper()
-        # Legacy schemas stored timestamp values as TEXT; SQLite accepts both
-        # declarations for these columns, so preserve startup compatibility.
+        actual_type = row[2].strip().upper()
+        expected_type = expected_type.strip().upper()
+        # SQLite stores legacy timestamp columns as TEXT in some databases.
         if actual_type != expected_type and {actual_type, expected_type} != {"TEXT", "TIMESTAMP"}:
             return False
         if bool(row[3]) != expected_notnull:
             return False
-        # Default handling is intentionally asymmetric to keep startup idempotent:
-        # - an expected declaration WITHOUT a DEFAULT rejects an existing column
-        #   that carries one (the expected schema clearly states no default);
-        # - an expected declaration WITH a DEFAULT tolerates an existing
-        #   column that has a different (or no) default, because a column that
-        #   already exists is valid as-is — enforcing an exact default here
-        #   would break pre-existing/legacy databases and cannot be applied
-        #   without a table rebuild (out of scope). Type and nullability above
-        #   remain the hard checks.
-        if not expected_default and row[4] is not None:
-            return False
-        return True
+        actual_default = row[4].strip() if row[4] is not None else None
+        if expected_default:
+            # Existing columns may retain a historical default. A concurrent
+            # winner must match the requested declaration exactly.
+            return not strict_default or actual_default == expected_default
+        return actual_default is None
 
     cursor.execute(f"PRAGMA table_info({table})")
     rows = cursor.fetchall()
@@ -2114,14 +2109,18 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
             ):
                 raise
             cursor.execute(f"PRAGMA table_info({table})")
-            if not _column_matches(cursor.fetchall()):
+            if not _column_matches(cursor.fetchall(), strict_default=True):
                 raise
             return False
-    # An existing column is an idempotent legacy-schema case. Exact schema
-    # validation is required on the duplicate-race path above, where it
-    # distinguishes a concurrent winner from an unrelated DDL failure; do not
-    # reject older databases merely because SQLite recorded a compatible column
-    # with a different historical type/default declaration.
+    cursor.execute(f"PRAGMA table_info({table})")
+    rows = cursor.fetchall()
+    if not _column_matches(rows):
+        actual = next((r for r in rows if len(r) >= 2 and r[1] == column), None)
+        raise sqlite3.OperationalError(
+            f"schema mismatch for {table}.{column}: expected {col_type}, "
+            f"got {actual[2] if actual and len(actual) >= 3 else '?'} "
+            f"DEFAULT {actual[4] if actual and len(actual) >= 5 else '?'}"
+        )
     return False
 
 
