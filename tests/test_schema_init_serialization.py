@@ -149,3 +149,77 @@ def test_duplicate_migration_is_not_false_positive(tmp_path):
         conn.execute('CREATE TABLE working_memory (id TEXT, consolidated_at TEXT)')
     result = beam._add_column_if_missing(sqlite3.connect(path), 'working_memory', 'consolidated_at', 'TEXT')
     assert result is False
+
+
+def test_default_mismatch_rejected_when_none_expected(tmp_path):
+    # Expected declaration carries no DEFAULT => an existing DEFAULT is a mismatch.
+    path = tmp_path / 'schema.db'
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE working_memory (id TEXT, consolidated_at TEXT DEFAULT 'bad')")
+    with sqlite3.connect(path) as conn:
+        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
+            beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT')
+
+
+def test_default_mismatch_rejected_when_different(tmp_path):
+    path = tmp_path / 'schema.db'
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE t (id TEXT, c TEXT DEFAULT 'a')")
+    with sqlite3.connect(path) as conn:
+        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
+            beam._add_column_if_missing(conn, 't', 'c', "TEXT DEFAULT 'b'")
+
+
+def test_default_exact_match_accepted(tmp_path):
+    path = tmp_path / 'schema.db'
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE t (id TEXT, c TEXT DEFAULT 'x')")
+    result = beam._add_column_if_missing(sqlite3.connect(path), 't', 'c', "TEXT DEFAULT 'x'")
+    assert result is False
+
+
+def _make_race_conn(path, wrong_dup=False):
+    real = sqlite3.connect(path)
+    real.execute('CREATE TABLE target (id INTEGER PRIMARY KEY)')
+    real.commit()
+
+    class RaceCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+        def execute(self, sql, params=()):
+            if sql.startswith('ALTER TABLE target ADD COLUMN added'):
+                if wrong_dup:
+                    raise sqlite3.OperationalError('duplicate column name: unrelated_column')
+                # Winner: actually add the column, then report the duplicate.
+                self._cursor.execute('ALTER TABLE target ADD COLUMN added TEXT')
+                raise sqlite3.OperationalError('duplicate column name: added')
+            return self._cursor.execute(sql, params)
+        def fetchall(self):
+            return self._cursor.fetchall()
+
+    class RaceConnection:
+        def cursor(self):
+            return RaceCursor(real.cursor())
+        def commit(self):
+            return real.commit()
+        def close(self):
+            return real.close()
+
+    return RaceConnection()
+
+
+def test_duplicate_race_suppressed_after_verify(tmp_path):
+    # F2: ALTER races with a concurrent winner that adds the column between our
+    # read and write; the duplicate must be verified and suppressed, not raised.
+    conn = _make_race_conn(tmp_path / 'race.db', wrong_dup=False)
+    result = beam._add_column_if_missing(conn, 'target', 'added', 'TEXT')
+    assert result is False
+    conn.close()
+
+
+def test_duplicate_race_wrong_column_not_suppressed(tmp_path):
+    # E3: a duplicate reported for an unrelated column must NOT be suppressed.
+    conn = _make_race_conn(tmp_path / 'race.db', wrong_dup=True)
+    with pytest.raises(sqlite3.OperationalError, match='duplicate column name'):
+        beam._add_column_if_missing(conn, 'target', 'added', 'TEXT')
+    conn.close()

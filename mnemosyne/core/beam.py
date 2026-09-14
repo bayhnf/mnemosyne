@@ -1446,18 +1446,14 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
                     # Pre-existing (upgraded) stores stay unmarked and
                     # route conservatively until reindex_vectors().
                     _mark_vec_store_norm_bit(conn)
-            except sqlite3.OperationalError as e:
-                if getattr(conn, "_mnemosyne_vec_loaded", False):
-                    logger.warning(
-                        "sqlite-vec loaded but vec table creation failed: %s. "
-                        "This may indicate a version mismatch.", e,
-                    )
-                else:
-                    logger.warning(
-                        "sqlite-vec tables not created: extension not loaded. "
-                        "Vector search will be unavailable. Install sqlite-vec "
-                        "and ensure your Python build supports load_extension()."
-                    )
+            except sqlite3.OperationalError:
+                # We only reach here when _SQLITE_VEC_AVAILABLE is True (the
+                # capability is expected to work). A CREATE VIRTUAL TABLE /
+                # CREATE failure here is a real DDL error (disk I/O, readonly,
+                # lock, version mismatch) and must propagate, not be silently
+                # swallowed. Optional-capability absence is handled by the
+                # _SQLITE_VEC_AVAILABLE guard skipping this block entirely.
+                raise
 
     # --- FTS5 VIRTUAL TABLE for episodic ---
     cursor.execute("""
@@ -1857,9 +1853,11 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
                 )
             """)
         except (sqlite3.OperationalError, RuntimeError):
-            if getattr(conn, "_mnemosyne_vec_loaded", False):
-                raise
-            # sqlite-vec is optional; absence is the only tolerated failure.
+            # Reached only when _SQLITE_VEC_AVAILABLE is True. Any failure
+            # creating the facts vector table is a real DDL error and must
+            # propagate; optional-capability absence is handled by the guard
+            # above, not by swallowing failures here.
+            raise
 
     # --- Temporal architecture migration ---
     _add_column_if_missing(conn, "working_memory", "event_date", "TEXT DEFAULT NULL")
@@ -2055,27 +2053,71 @@ def _sanitize_utf8(text: str) -> str:
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str):
-    """Add a column, then verify type/default when it already exists."""
+    """Add a column, then verify type/default when it already exists.
+
+    Tolerates a concurrent winner: if ALTER raises 'duplicate column name'
+    for the exact requested column because another initializer created it
+    between our read and write, reread the schema and verify it matches the
+    expected declaration exactly before suppressing.
+    """
     cursor = conn.cursor()
-    cursor.execute(f"PRAGMA table_info({table})")
-    existing = {row[1] for row in cursor.fetchall()}
-    if column not in existing:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-        conn.commit()
+
+    def _expected_pieces():
+        expected_type, _, expected_default = col_type.partition(" DEFAULT ")
+        expected_notnull = " NOT NULL" in expected_type.upper()
+        expected_type = expected_type.replace(" NOT NULL", "").strip()
+        return expected_type, expected_notnull, expected_default.strip()
+
+    def _column_matches(rows):
+        matches = [r for r in rows if len(r) >= 5 and r[1] == column]
+        if len(matches) != 1:
+            return False
+        row = matches[0]
+        expected_type, expected_notnull, expected_default = _expected_pieces()
+        if row[2].upper() != expected_type.upper():
+            return False
+        if bool(row[3]) != expected_notnull:
+            return False
+        # Exact default: an expected declaration with no DEFAULT requires the
+        # existing column to have none either; otherwise it must match exactly.
+        actual_default = row[4].strip() if row[4] is not None else None
+        if expected_default:
+            if actual_default != expected_default:
+                return False
+        elif row[4] is not None:
+            return False
         return True
+
     cursor.execute(f"PRAGMA table_info({table})")
-    row = next(row for row in cursor.fetchall() if row[1] == column)
-    expected_type, _, expected_default = col_type.partition(" DEFAULT ")
-    actual_default = row[4].strip() if row[4] is not None else None
-    expected_notnull = " NOT NULL" in expected_type.upper()
-    expected_type = expected_type.replace(" NOT NULL", "")
-    if (row[2].upper() != expected_type.strip().upper()
-        or bool(row[3]) != expected_notnull or (
-        expected_default.strip() and actual_default != expected_default.strip()
-    )):
+    rows = cursor.fetchall()
+    cols = {r[1] for r in rows}
+    if column not in cols:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            conn.commit()
+            return True
+        except sqlite3.OperationalError as e:
+            msg = str(e)
+            # Suppress ONLY the duplicate-column result for this exact column,
+            # and only after post-error re-verification confirms the column now
+            # exists with the expected schema.
+            if (
+                column not in msg
+                or "duplicate column" not in msg.lower()
+            ):
+                raise
+            cursor.execute(f"PRAGMA table_info({table})")
+            if not _column_matches(cursor.fetchall()):
+                raise
+            return False
+    cursor.execute(f"PRAGMA table_info({table})")
+    rows = cursor.fetchall()
+    if not _column_matches(rows):
+        expected_type, expected_notnull, expected_default = _expected_pieces()
         raise sqlite3.OperationalError(
             f"schema mismatch for {table}.{column}: expected {col_type}, "
-            f"got {row[2]} DEFAULT {row[4]}"
+            f"got {rows[0][2] if rows else '?'} "
+            f"DEFAULT {rows[0][4] if rows else '?'}"
         )
     return False
 
