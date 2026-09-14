@@ -2078,13 +2078,16 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
             return False
         if bool(row[3]) != expected_notnull:
             return False
-        # Exact default: an expected declaration with no DEFAULT requires the
-        # existing column to have none either; otherwise it must match exactly.
-        actual_default = row[4].strip() if row[4] is not None else None
-        if expected_default:
-            if actual_default != expected_default:
-                return False
-        elif row[4] is not None:
+        # Default handling is intentionally asymmetric to keep startup idempotent:
+        # - an expected declaration WITHOUT a DEFAULT rejects an existing column
+        #   that carries one (the expected schema clearly states no default);
+        # - an expected declaration WITH a DEFAULT tolerates an existing
+        #   column that has a different (or no) default, because a column that
+        #   already exists is valid as-is — enforcing an exact default here
+        #   would break pre-existing/legacy databases and cannot be applied
+        #   without a table rebuild (out of scope). Type and nullability above
+        #   remain the hard checks.
+        if not expected_default and row[4] is not None:
             return False
         return True
 

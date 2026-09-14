@@ -161,13 +161,26 @@ def test_default_mismatch_rejected_when_none_expected(tmp_path):
             beam._add_column_if_missing(conn, 'working_memory', 'consolidated_at', 'TEXT')
 
 
-def test_default_mismatch_rejected_when_different(tmp_path):
+def test_default_different_tolerated_when_expected_has_default(tmp_path):
+    # Idempotent startup: an existing column with a different default (or none)
+    # is valid as-is when the expected declaration carries a DEFAULT — enforcing
+    # an exact default here would break pre-existing/legacy databases.
     path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE t (id TEXT, c TEXT DEFAULT 'a')")
+    result = beam._add_column_if_missing(sqlite3.connect(path), 't', 'c', "TEXT DEFAULT 'b'")
+    assert result is False
+
+
+def test_default_none_tolerated_when_expected_has_default(tmp_path):
+    # Regression for CI: working_memory.veracity exists without a default in
+    # doctor-bank-routing DBs; expected TEXT DEFAULT 'unknown' must not make
+    # startup fail.
+    path = tmp_path / 'schema.db'
     with sqlite3.connect(path) as conn:
-        with pytest.raises(sqlite3.OperationalError, match='schema mismatch'):
-            beam._add_column_if_missing(conn, 't', 'c', "TEXT DEFAULT 'b'")
+        conn.execute('CREATE TABLE working_memory (id TEXT, veracity TEXT)')
+    result = beam._add_column_if_missing(sqlite3.connect(path), 'working_memory', 'veracity', "TEXT DEFAULT 'unknown'")
+    assert result is False
 
 
 def test_default_exact_match_accepted(tmp_path):
