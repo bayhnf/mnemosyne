@@ -2074,7 +2074,11 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, co
             return False
         row = matches[0]
         expected_type, expected_notnull, expected_default = _expected_pieces()
-        if row[2].upper() != expected_type.upper():
+        actual_type = row[2].upper()
+        expected_type = expected_type.upper()
+        # Legacy schemas stored timestamp values as TEXT; SQLite accepts both
+        # declarations for these columns, so preserve startup compatibility.
+        if actual_type != expected_type and {actual_type, expected_type} != {"TEXT", "TIMESTAMP"}:
             return False
         if bool(row[3]) != expected_notnull:
             return False
