@@ -1021,7 +1021,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
     `_deferred_commits`. Connection is otherwise identical to a
     plain sqlite3.Connection.
     """
-    path = Path(db_path) if db_path else _default_db_path()
+    path = (Path(db_path) if db_path else _default_db_path()).expanduser().resolve()
     needs_reconnect = (
         not hasattr(_thread_local, 'conn')
         or _thread_local.conn is None
@@ -1211,8 +1211,48 @@ class BeamInitResult:
     stored_dims: Tuple[Tuple[str, int], ...] = ()
 
 
+_schema_locks = {}
+_schema_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _schema_init_lock(path):
+    """Serialize schema initialization across threads and local processes."""
+    path = Path(path).expanduser().resolve()
+    with _schema_locks_guard:
+        lock = _schema_locks.setdefault(str(path), threading.RLock())
+    with lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the sidecar inode: unlinking it would split concurrent lockers.
+        with open(str(path) + '.init.lock', 'a+b') as handle:
+            if os.name == 'nt':
+                import msvcrt
+                handle.seek(0, 2)
+                if handle.tell() == 0:
+                    handle.write(b'\0')
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield path
+            finally:
+                if os.name == 'nt':
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def init_beam(db_path: Path = None) -> BeamInitResult:
-    """Initialize BEAM schema and return its vector-index status."""
+    """Initialize BEAM under one canonical-path thread/process boundary."""
+    with _schema_init_lock(db_path if db_path is not None else _default_db_path()) as path:
+        return _init_beam_locked(path)
+
+
+def _init_beam_locked(db_path: Path) -> BeamInitResult:
     conn = _get_connection(db_path)
     cursor = conn.cursor()
 
@@ -4924,8 +4964,9 @@ class BeamMemory:
         self._extraction_client = None  # Lazy-loaded ExtractionClient
         self._extraction_buffer = []  # Buffer for batch extraction
         self._event_emitter = event_emitter  # Streaming event callback
-        self.conn = _get_connection(self.db_path)
+        self.db_path = self.db_path.expanduser().resolve()
         self.init_result = init_beam(self.db_path)
+        self.conn = _get_connection(self.db_path)
 
         # E6: ensure schema split + auto-migrate legacy TripleStore rows
         # to AnnotationStore. Honors MNEMOSYNE_AUTO_MIGRATE=0 for operators
