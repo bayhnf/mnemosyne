@@ -1423,7 +1423,7 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     vec_dim_mismatch = any(dim != EMBEDDING_DIM for _, dim in stored_dims)
     if vec_dim_mismatch:
         logger.error(_dim_mismatch_message(stored_dims, EMBEDDING_DIM))
-    if _SQLITE_VEC_AVAILABLE and getattr(conn, "_mnemosyne_vec_loaded", False):
+    if _SQLITE_VEC_AVAILABLE:
         if not vec_dim_mismatch:
             try:
                 _ep_exists_before = conn.execute(
@@ -1446,14 +1446,12 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
                     # Pre-existing (upgraded) stores stay unmarked and
                     # route conservatively until reindex_vectors().
                     _mark_vec_store_norm_bit(conn)
-            except sqlite3.OperationalError:
-                # We only reach here when _SQLITE_VEC_AVAILABLE is True (the
-                # capability is expected to work). A CREATE VIRTUAL TABLE /
-                # CREATE failure here is a real DDL error (disk I/O, readonly,
-                # lock, version mismatch) and must propagate, not be silently
-                # swallowed. Optional-capability absence is handled by the
-                # _SQLITE_VEC_AVAILABLE guard skipping this block entirely.
-                raise
+            except sqlite3.OperationalError as exc:
+                # Only the explicit missing-module capability error may degrade;
+                # disk I/O, readonly, lock, and other DDL failures propagate.
+                if "no such module: vec0" not in str(exc).lower():
+                    raise
+                logger.warning("sqlite-vec tables unavailable: vec0 module is not loaded")
 
     # --- FTS5 VIRTUAL TABLE for episodic ---
     cursor.execute("""
@@ -1845,21 +1843,18 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     # Vector table for facts (sqlite-vec). Skipped on a dimension mismatch for the
     # same reason as vec_episodes / vec_working above (see the guard in the
     # sqlite-vec VIRTUAL TABLES block).
-    if (_SQLITE_VEC_AVAILABLE
-            and getattr(conn, "_mnemosyne_vec_loaded", False)
-            and not vec_dim_mismatch):
+    if _SQLITE_VEC_AVAILABLE and not vec_dim_mismatch:
         try:
             cursor.execute(f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
                     embedding {effective_vec_type}[{EMBEDDING_DIM}]
                 )
             """)
-        except (sqlite3.OperationalError, RuntimeError):
-            # Reached only when _SQLITE_VEC_AVAILABLE is True. Any failure
-            # creating the facts vector table is a real DDL error and must
-            # propagate; optional-capability absence is handled by the guard
-            # above, not by swallowing failures here.
-            raise
+        except (sqlite3.OperationalError, RuntimeError) as exc:
+            # Only an explicitly unavailable vec0 module may degrade here.
+            if "no such module: vec0" not in str(exc).lower():
+                raise
+            logger.warning("sqlite-vec facts table unavailable: vec0 module is not loaded")
 
     # --- Temporal architecture migration ---
     _add_column_if_missing(conn, "working_memory", "event_date", "TEXT DEFAULT NULL")
