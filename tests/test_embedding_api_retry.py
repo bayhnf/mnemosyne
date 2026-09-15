@@ -11,6 +11,17 @@ import pytest
 from mnemosyne.core import embeddings
 
 
+@pytest.fixture(autouse=True)
+def _uncredentialed_embedding_client(monkeypatch):
+    """These tests drive `_embed_api` against plain-http endpoints; the client
+    refuses credentialed non-HTTPS URLs, so blank the key regardless of the
+    developer shell. Tests that need a key set it themselves AFTER this (on an
+    https:// URL)."""
+    monkeypatch.delenv("MNEMOSYNE_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(embeddings, "_OPENAI_API_KEY", "")
+
+
 class Response:
     def __init__(self, payload):
         self.body = io.BytesIO(json.dumps(payload).encode())

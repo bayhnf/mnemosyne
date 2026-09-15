@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Ensure mnemosyne core is importable from this directory
 # MUST be before any `from mnemosyne.*` imports
@@ -757,11 +757,16 @@ VALIDATE_SCHEMA = {
                 "description": "Optional reason or evidence for this validation.",
                 "default": "",
             },
+            "store": {
+                "type": "string",
+                "enum": ["private", "surface"],
+                "description": "Which store holds the memory: 'private' (this profile's own memory) or 'surface' (the shared cross-agent surface). Default 'private'.",
+                "default": "private",
+            },
             "bank": {
                 "type": "string",
                 "enum": ["private", "surface"],
-                "description": "Which bank holds the memory. Default 'private'.",
-                "default": "private",
+                "description": "Deprecated alias for 'store'. Accepted until 5.0; pass 'store' instead.",
             },
         },
         "required": ["memory_id", "action"],
@@ -1388,6 +1393,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._memory: Optional[Any] = None
         self._beam: Optional[Any] = None
         self._surface_beam: Optional[Any] = None
+        self._sync_adapter: Optional[Any] = None
+        # Coordinates only the shared-surface Beam and adapters that retain it.
+        # Adapter construction stays outside this lock; publication validates
+        # the generation so provider reinitialization can win without caching a
+        # stale adapter.
+        self._surface_adapter_lock = threading.RLock()
+        self._surface_generation = 0
         self._shared_surface_bank = "surface"
         self._shared_surface_path: Optional[Path] = None
         # When true, mnemosyne_recall merges shared-surface results into the
@@ -1409,6 +1421,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._agent_context = "primary"
         self._turn_count = 0
         self._sync_turn_lock = threading.Lock()
+        # Optional compression-boundary suppression; default off, fail open
+        # until a callback is observed. No live-context/checkpoint guarantee.
+        from ._verbatim_compat import make_verbatim_ledger
+        self._verbatim_ledger = make_verbatim_ledger()
+        self._active_session_id = ""
         # Serialize all Beam/SQLite access between the main thread and the
         # auto_sleep daemon thread.  Without this, concurrent connections to
         # the same WAL database can trigger a NULL-pointer SEGV in
@@ -1511,6 +1528,32 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Audit log initialized: %s", db_path)
         except Exception as exc:
             logger.debug("Audit log init skipped: %s", exc)
+
+    def _clear_sync_adapter(self) -> None:
+        """Drop the sync adapter that retains the surface Beam being replaced."""
+        adapter = getattr(self, "_sync_adapter", None)
+        self._sync_adapter = None
+        if adapter is None:
+            return
+        try:
+            adapter.shutdown()
+        except Exception:
+            logger.debug("Mnemosyne: could not close sync adapter", exc_info=True)
+
+    def _ensure_surface_adapter_lock(self):
+        """Return the surface lifecycle lock, including for __new__ tests."""
+        try:
+            return self._surface_adapter_lock
+        except AttributeError:
+            return self.__dict__.setdefault(
+                "_surface_adapter_lock", threading.RLock()
+            )
+
+    def _invalidate_surface_locked(self) -> None:
+        """Invalidate adapters and their Beam as one lifecycle transition."""
+        self._clear_sync_adapter()
+        self._surface_beam = None
+        self._surface_generation = getattr(self, "_surface_generation", 0) + 1
 
     def _audit_event(self, action: str, **kwargs) -> None:
         """Record an audit event. Never raises, never blocks."""
@@ -1895,6 +1938,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Mnemosyne beam for this session."""
+        with self._ensure_surface_adapter_lock():
+            self._initialize_locked(session_id, **kwargs)
+
+    def _initialize_locked(self, session_id: str, **kwargs) -> None:
+        """Rebuild provider state while the surface lifecycle lock is held."""
         # C27: clear stale state from any prior init attempt so a re-init
         # returns the provider to a clean slate. _beam reset is critical
         # for the primary->skip-context re-init case (codex review finding
@@ -1903,6 +1951,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # _beam active, causing system_prompt_block() to report "Active"
         # and handle_tool_call() to silently write into the wrong session.
         # _init_error reset complements this for the failure-recovery case.
+        self._invalidate_surface_locked()
         if self._memory is not None:
             try:
                 self._memory.close()
@@ -1910,13 +1959,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 logger.debug("Mnemosyne: could not close prior wrapper", exc_info=True)
         self._memory = None
         self._beam = None
-        self._surface_beam = None
         self._init_error = None
 
         self._agent_context = kwargs.get("agent_context", "primary")
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
+
+        # Re-init rebinds the verbatim ledger: entries recorded under a
+        # previous session must never leak their exclusion into the new one.
+        _prev_active = getattr(self, "_active_session_id", "") or ""
+        self._active_session_id = str(session_id or "").strip()
+        if _prev_active and _prev_active != self._active_session_id:
+            self._verbatim_ledger.reset_session(_prev_active)
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
         self._apply_provider_config(kwargs)
@@ -2254,8 +2309,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # sessions) should never bypass session scoping.
             if author_id:
                 recall_kwargs["author_id"] = author_id
+            # Revocable provider-owned capture proofs; explicit tools do not
+            # pass this optimization to recall.
+            _ledger_key = str(session_id or "").strip() or getattr(
+                self, "_active_session_id", ""
+            ) or ""
+            if _ledger_key and self._verbatim_ledger.enabled:
+                _echo_snapshot = self._verbatim_ledger.snapshot_for(_ledger_key)
+                if _echo_snapshot:
+                    recall_kwargs["exclude_captures"] = _echo_snapshot
             with self._ensure_beam_access_lock():
                 results = self._beam.recall(**recall_kwargs)
+                snapshot = recall_kwargs.get("exclude_captures")
+                if snapshot is not None and not snapshot.generation.valid:
+                    recall_kwargs.pop("exclude_captures", None)
+                    results = self._beam.recall(**recall_kwargs)
             if not results:
                 return ""
             # Filter out low-relevance results to prevent context pollution.
@@ -2350,10 +2418,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """Bound error detail without including user/assistant content."""
         return f"{type(exc).__name__}: <redacted>"
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages=None) -> None:
         """Persist the turn to Mnemosyne episodic memory."""
         if not self._beam or self._agent_context in self._skip_contexts:
             return
+        ledger_session_id = str(session_id or "").strip()
+        ledger = getattr(self, "_verbatim_ledger", None)
+        active_session = getattr(self, "_active_session_id", "")
+        ticket = (ledger.begin(ledger_session_id, messages)
+                  if ledger and active_session == ledger_session_id else None)
         started = time.perf_counter()
         self._ensure_sync_turn_telemetry()
         with self._sync_turn_lock:
@@ -2369,11 +2442,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         try:
             with self._ensure_beam_access_lock():
+                ledger_session_id = str(session_id or "").strip()
+                if ledger_session_id and not getattr(self, "_active_session_id", ""):
+                    self._active_session_id = ledger_session_id
                 if "user" in self._sync_roles and user_content and len(user_content) > 5 and not self._should_filter(user_content):
                     user_limit = _sync_turn_user_limit()
                     uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    self._beam.remember(
-                        content=f"[USER] {uc}",
+                    stored_user = f"[USER] {uc}"
+                    capture = ledger.capture if ledger else None
+                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, user_content, **kw)) if capture else self._beam.remember
+                    remember(
+                        content=stored_user,
                         source="conversation",
                         importance=0.5,
                         scope=self._default_scope,
@@ -2383,8 +2462,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10 and not self._should_filter(assistant_content):
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    self._beam.remember(
-                        content=f"[ASSISTANT] {ac}",
+                    stored_assistant = f"[ASSISTANT] {ac}"
+                    capture = ledger.capture if ledger else None
+                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, assistant_content, **kw)) if capture else self._beam.remember
+                    remember(
+                        content=stored_assistant,
                         source="conversation",
                         importance=0.15,
                         scope=self._default_scope,
@@ -2424,6 +2506,45 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     snapshot["pending_queue_length"],
                 )
 
+    def on_pre_compress(self, messages, **kwargs):
+        """Release all exclusions before ANY compression attempt.
+
+        Best-effort v1 bookkeeping, not issue #872 durable checkpoints or v2.
+        A no-op, retained tail or failure deliberately permits extra echo.
+        """
+        del kwargs
+        ledger = getattr(self, "_verbatim_ledger", None)
+        session_key = getattr(self, "_active_session_id", "") or ""
+        if ledger is not None:
+            ledger.release(session_key, messages)
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """Track session rotation for the verbatim ledger.
+
+        Reset/rewound drops the session's context: clear the ledger for
+        both the previous and the new session key so stale verbatim entries
+        never suppress recall after the host rewinds.
+        """
+        del parent_session_id, kwargs
+        ledger = getattr(self, "_verbatim_ledger", None)
+        previous = getattr(self, "_active_session_id", "") or ""
+        self._active_session_id = str(new_session_id or "").strip()
+        if ledger is None or not ledger.enabled:
+            return
+        if reset or rewound:
+            if previous:
+                ledger.reset_session(previous)
+            if self._active_session_id:
+                ledger.reset_session(self._active_session_id)
+
     # Identity-significant expressions the user may voice about themselves or
     # their relationship to their work. When a match is found, the memory is
     # saved with source="identity" and higher importance so it survives
@@ -2462,7 +2583,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             if working > self._auto_sleep_threshold:
                 # Cheap eligibility check: are there any unconsolidated
                 # working memories old enough to consolidate?
-                cutoff = (datetime.now() - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).isoformat()
+                cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=WORKING_MEMORY_TTL_HOURS // 2)).strftime("%Y-%m-%d %H:%M:%S")
                 eligible = self._beam._count_unconsolidated_before(cutoff)
                 if eligible == 0:
                     return
@@ -2609,12 +2730,32 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_sync_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         try:
-            adapter = getattr(self, "_sync_adapter", None)
-            if adapter is None:
-                from hermes_memory_provider.sync_adapter import SyncAdapter
-                adapter = SyncAdapter(self._beam, {})
-                self._sync_adapter = adapter
-            return adapter.handle_tool_call(tool_name, args)
+            from hermes_memory_provider.sync_adapter import SyncAdapter
+
+            while True:
+                with self._ensure_surface_adapter_lock():
+                    adapter = getattr(self, "_sync_adapter", None)
+                    if adapter is not None:
+                        return adapter.handle_tool_call(tool_name, args)
+                    self._ensure_surface_beam_locked()
+                    surface_beam = self._surface_beam
+                    generation = getattr(self, "_surface_generation", 0)
+
+                candidate = SyncAdapter(surface_beam, {})
+                with self._ensure_surface_adapter_lock():
+                    if (
+                        generation != getattr(self, "_surface_generation", 0)
+                        or self._surface_beam is not surface_beam
+                    ):
+                        candidate.shutdown()
+                        continue
+                    adapter = getattr(self, "_sync_adapter", None)
+                    if adapter is None:
+                        adapter = candidate
+                        self._sync_adapter = adapter
+                    else:
+                        candidate.shutdown()
+                    return adapter.handle_tool_call(tool_name, args)
         except Exception as exc:
             return json.dumps({
                 "status": "error",
@@ -2836,6 +2977,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return f"{label}: {content}"
 
     def _ensure_surface_beam(self) -> None:
+        with self._ensure_surface_adapter_lock():
+            self._ensure_surface_beam_locked()
+
+    def _ensure_surface_beam_locked(self) -> None:
         if self._surface_beam is not None:
             return
         BeamMemory = _get_beam_class()
@@ -2987,7 +3132,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         """
         memory_id = args.get("memory_id", "")
         action = args.get("action", "")
-        bank = args.get("bank", "private")
+        store = args.get("store")
+        deprecated_alias = False
+        if store is None:
+            # Pre-4.0 callers carried the selector in ``bank``. Honour it, say so.
+            store = args.get("bank", "private")
+            deprecated_alias = "bank" in args
+        bank = store
         validator = args.get("validator") or self._agent_identity or "unknown"
         new_content = args.get("new_content", "")
         note = args.get("note", "")
@@ -2996,13 +3147,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         if action not in ("attest", "update", "invalidate", "delete"):
             return json.dumps({"error": f"unknown action: {action}"})
-        if bank not in ("private", "surface"):
-            return json.dumps({"error": f"unknown bank: {bank}"})
+        if store not in ("private", "surface"):
+            return json.dumps({"error": f"unknown store: {store}"})
         if action == "update" and not new_content:
             return json.dumps({"error": "new_content is required for action='update'"})
 
         # Pick the right beam (private vs surface)
-        if bank == "surface":
+        if store == "surface":
             err = self._require_surface_beam()
             if err:
                 return json.dumps({"error": err})
@@ -3023,52 +3174,105 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({
                 "error": "memory_not_found",
                 "memory_id": memory_id,
+                "store": store,
                 "bank": bank,
             })
+
+        if action == "delete":
+            # Align the destructive path with BeamMemory.forget_working: a caller
+            # may only delete a memory its own session can see, honouring the
+            # configured cross-session setting. Resolved before the cascade so a
+            # foreign private id is memory_not_found rather than a partially
+            # applied delete (#930).
+            from mnemosyne.core.beam import (
+                _cross_session_enabled,
+                _session_scope_filter,
+                _session_scope_params,
+            )
+            cross_session = _cross_session_enabled()
+            scope_sql = _session_scope_filter(cross_session=cross_session)
+            scope_params = _session_scope_params(
+                target_beam.session_id, cross_session=cross_session
+            )
+            visible = conn.execute(
+                f"SELECT 1 FROM working_memory WHERE id = ? AND {scope_sql}",
+                (memory_id, *scope_params),
+            ).fetchone()
+            if visible is None:
+                return json.dumps({
+                    "error": "memory_not_found",
+                    "memory_id": memory_id,
+                    "store": store,
+                "bank": bank,
+                })
 
         author_id = existing[1]
         prev_content = existing[2]
 
         # Apply the action atomically
         try:
-            if action == "delete":
-                conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
-            elif action == "update":
-                conn.execute(
-                    "UPDATE working_memory SET content = ?, validator = ?, "
-                    "validated_at = CURRENT_TIMESTAMP, "
-                    "validation_count = COALESCE(validation_count, 0) + 1 "
-                    "WHERE id = ?",
-                    (new_content, validator, memory_id),
-                )
-            elif action == "invalidate":
-                conn.execute(
-                    "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, "
-                    "validator = ?, validated_at = CURRENT_TIMESTAMP, "
-                    "validation_count = COALESCE(validation_count, 0) + 1 "
-                    "WHERE id = ?",
-                    (validator, memory_id),
-                )
-            else:  # attest
-                conn.execute(
-                    "UPDATE working_memory SET validator = ?, "
-                    "validated_at = CURRENT_TIMESTAMP, "
-                    "validation_count = COALESCE(validation_count, 0) + 1 "
-                    "WHERE id = ?",
-                    (validator, memory_id),
-                )
+            # Roll the whole cascade back on any failure, including the
+            # validation-log insert below. Without the guard the deletes stayed
+            # pending on this long-lived connection after a failed call, and a
+            # later unrelated commit made them permanent (#904).
+            from mnemosyne.core.beam import _guarded_transaction, _wm_vec_available
+            with _guarded_transaction(conn):
+                if action == "delete":
+                    # Cascade the memory's support rows before the parent row, so a
+                    # delete cannot leave orphaned annotations, embeddings, vector
+                    # rows or gists behind (#904).
+                    conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+                    conn.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+                    row = conn.execute(
+                        "SELECT rowid FROM working_memory WHERE id = ?", (memory_id,)
+                    ).fetchone()
+                    if row is not None and _wm_vec_available(conn):
+                        conn.execute("DELETE FROM vec_working WHERE rowid = ?", (row[0],))
+                    gists_table = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                    ).fetchone()
+                    if gists_table is not None:
+                        conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+                    conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
+                elif action == "update":
+                    conn.execute(
+                        "UPDATE working_memory SET content = ?, validator = ?, "
+                        "validated_at = CURRENT_TIMESTAMP, "
+                        "validation_count = COALESCE(validation_count, 0) + 1 "
+                        "WHERE id = ?",
+                        (new_content, validator, memory_id),
+                    )
+                elif action == "invalidate":
+                    conn.execute(
+                        "UPDATE working_memory SET valid_until = CURRENT_TIMESTAMP, "
+                        "validator = ?, validated_at = CURRENT_TIMESTAMP, "
+                        "validation_count = COALESCE(validation_count, 0) + 1 "
+                        "WHERE id = ?",
+                        (validator, memory_id),
+                    )
+                else:  # attest
+                    conn.execute(
+                        "UPDATE working_memory SET validator = ?, "
+                        "validated_at = CURRENT_TIMESTAMP, "
+                        "validation_count = COALESCE(validation_count, 0) + 1 "
+                        "WHERE id = ?",
+                        (validator, memory_id),
+                    )
 
-            # Append to ring buffer (trigger trims to last 3 per memory_id)
-            conn.execute(
-                "INSERT INTO memory_validations "
-                "(memory_id, validator, action, new_content, note) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (memory_id, validator, action,
-                 new_content if action == "update" else None,
-                 note or None),
-            )
-            conn.commit()
+                # Append to ring buffer (trigger trims to last 3 per memory_id)
+                conn.execute(
+                    "INSERT INTO memory_validations "
+                    "(memory_id, validator, action, new_content, note) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (memory_id, validator, action,
+                     new_content if action == "update" else None,
+                     note or None),
+                )
         except Exception as exc:
+            # The guard above has already rolled the mutation back; log before
+            # failing soft so a schema or database fault in the cascade leaves a
+            # Hermes-side trace rather than only a JSON error string.
+            logger.exception("Mnemosyne: validate %s failed for %s", action, memory_id)
             return json.dumps({
                 "error": "validation_failed",
                 "reason": str(exc),
@@ -3087,14 +3291,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         except Exception:
             logger.debug("Mnemosyne audit event failed for validate", exc_info=True)
 
-        return json.dumps({
+        result = {
             "status": f"validation_{action}",
             "memory_id": memory_id,
-            "bank": bank,
+            "store": store,
+                "bank": bank,
             "validator": validator,
             "author_id": author_id,
             "previous_content": prev_content[:200] if prev_content else None,
-        })
+        }
+        if deprecated_alias:
+            result["deprecated"] = (
+                "bank='private'|'surface' is a deprecated alias for store; "
+                "pass store=... instead. The alias is removed in 5.0."
+            )
+        return json.dumps(result)
 
     def _handle_get(self, args: Dict[str, Any]) -> str:
         memory_id = args.get("memory_id", "")
@@ -3789,6 +4000,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 unregister_hermes_host_llm()
             except Exception as exc:
                 logger.debug("Mnemosyne could not unregister Hermes auxiliary LLM backend: %s", exc)
+        with self._ensure_surface_adapter_lock():
+            self._invalidate_surface_locked()
         if self._memory is not None:
             try:
                 self._memory.close()

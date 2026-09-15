@@ -124,6 +124,77 @@ def _provider_for_config(module, hermes_home: Path):
     return provider
 
 
+class _FailingBatchBeam:
+    conn = None
+
+    def remember(self, **_kwargs):
+        raise RuntimeError("/private/provider/path\ncanary")
+
+
+def test_batch_execution_failure_payload_matches_across_providers(provider_modules):
+    payloads = []
+    for module in provider_modules.values():
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = _FailingBatchBeam()
+        payloads.append(json.loads(provider._handle_batch({
+            "operations": [{"action": "remember", "content": "x"}],
+        })))
+
+    expected = {
+        "status": "error",
+        "error": "batch_failed",
+        "failed_index": 0,
+        "action": "remember",
+    }
+    assert payloads == [expected, expected]
+    assert "/private/provider/path" not in json.dumps(payloads)
+
+
+def test_batch_unknown_action_payload_matches_across_providers(
+    tmp_path, provider_modules
+):
+    canary = "<script>private-action</script>"
+    arguments = {
+        "operations": [
+            {"action": "remember", "content": "must not write"},
+            {
+                "action": canary,
+                "content": "complete unsupported operation",
+                "memory_id": "private-id",
+                "importance": 0.5,
+            },
+        ],
+    }
+    payloads = []
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"batch-unknown-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+        payloads.append(json.loads(provider.handle_tool_call(
+            "mnemosyne_batch", arguments
+        )))
+        row_count = provider._beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE content = ?",
+            ("must not write",),
+        ).fetchone()[0]
+        assert row_count == 0
+        provider._beam.conn.close()
+
+    expected = {
+        "status": "error",
+        "error": "batch_validation_failed",
+        "failed_index": 1,
+        "action": None,
+    }
+    assert payloads == [expected, expected]
+    assert canary not in json.dumps(payloads)
+
+
 def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 
@@ -402,14 +473,42 @@ def test_tool_whitelist_null_without_yaml_exposes_all_tools(
             _filtered_schemas(module, PROVIDER_TOOL_NAMES)
         )
         assert provider.has_tool("mnemosyne_remember") is True
-        assert json.loads(
-            provider.handle_tool_call("mnemosyne_remember", {"content": "x"})
-        ) == {
-            "status": "memory_unavailable",
-            "tool": "mnemosyne_remember",
-            "reason": "Mnemosyne not initialized",
-            "error": "Mnemosyne unavailable: Mnemosyne not initialized",
-        }
+
+
+def test_uninitialized_primary_tool_call_diverges_by_provider(
+    tmp_path, monkeypatch, provider_modules
+):
+    """Intentional divergence: only mnemosyne_hermes lazy-inits on first tool call.
+
+    The previous shared-loop assertion required memory_unavailable from both
+    providers. hermes_memory_provider still returns that uninitialized response.
+    mnemosyne_hermes lazy-initializes on a primary-context tool call when Hermes
+    never called initialize(), so it must not return memory_unavailable.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+    root = _provider_for_config(provider_modules["hermes_memory_provider"], tmp_path)
+    assert json.loads(
+        root.handle_tool_call("mnemosyne_remember", {"content": "x"})
+    ) == {
+        "status": "memory_unavailable",
+        "tool": "mnemosyne_remember",
+        "reason": "Mnemosyne not initialized",
+        "error": "Mnemosyne unavailable: Mnemosyne not initialized",
+    }
+
+    packaged = _provider_for_config(provider_modules["mnemosyne_hermes"], tmp_path)
+    try:
+        result = json.loads(
+            packaged.handle_tool_call("mnemosyne_remember", {"content": "x"})
+        )
+        assert result.get("status") != "memory_unavailable", result
+        assert "not initialized" not in str(result).lower()
+        assert result.get("status") == "stored"
+        assert result.get("memory_id")
+    finally:
+        packaged.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -1027,9 +1126,10 @@ def test_sync_adapter_schema_and_lifecycle_surface_match(sync_modules):
 
 
 class _FakeSyncEngine:
-    def __init__(self, beam_instance, encryption=None):
+    def __init__(self, beam_instance, encryption=None, **kwargs):
         self.beam_instance = beam_instance
         self.encryption = encryption
+        self.kwargs = kwargs
         self.device_id = "fake-device"
 
 
@@ -1048,6 +1148,19 @@ class _UnexpectedBeam:
         self.kwargs = kwargs
 
 
+class _FakeSurfaceConnection:
+    def execute(self, _sql, _params=()):
+        return self
+
+    def fetchone(self):
+        return (0, 0)
+
+
+class _FakeSurfaceBeam:
+    session_id = "hermes_shared_surface"
+    conn = _FakeSurfaceConnection()
+
+
 def _install_fake_sync_modules(monkeypatch):
     import types
 
@@ -1063,11 +1176,375 @@ def _install_fake_sync_modules(monkeypatch):
 def test_sync_adapter_uses_provider_beam_for_both_surfaces(monkeypatch, sync_modules):
     _install_fake_sync_modules(monkeypatch)
 
-    provider_beam = object()
+    provider_beam = _FakeSurfaceBeam()
     for module in sync_modules.values():
         adapter = module.SyncAdapter(provider_beam, {})
         assert adapter.is_ready is True
         assert adapter._engine.beam_instance is provider_beam
+        assert adapter._engine.kwargs == {
+            "surface_only": True,
+            "surface_id": "shared-surface-v1",
+            "initialize_surface": True,
+            "claim_existing_surface": False,
+        }
+
+
+def test_provider_sync_tools_bind_to_shared_surface(
+    monkeypatch, provider_modules
+):
+    for name, module in provider_modules.items():
+        private_beam = object()
+        surface_beam = object()
+        observed = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                observed.append(beam)
+
+            def handle_tool_call(self, tool_name, args):
+                return json.dumps({"tool": tool_name, "args": args})
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = private_beam
+        provider._surface_beam = surface_beam
+        if name == "hermes_memory_provider":
+            provider._sync_adapter = None
+        else:
+            provider._provider_sync_adapter = None
+
+        result = json.loads(
+            provider._handle_sync_tool("mnemosyne_sync_status", {})
+        )
+
+        assert result["tool"] == "mnemosyne_sync_status"
+        assert observed == [surface_beam]
+
+
+def test_standalone_sync_handler_binds_provider_shared_surface(
+    monkeypatch, provider_modules
+):
+    module = provider_modules["mnemosyne_hermes"]
+    surface_beam = object()
+    observed = []
+
+    class _Provider:
+        _surface_beam = surface_beam
+        _surface_generation = 0
+        _surface_adapter_lock = threading.RLock()
+
+        def _ensure_surface_adapter_lock(self):
+            return self._surface_adapter_lock
+
+        def _ensure_surface_beam_locked(self):
+            return None
+
+    class _Adapter:
+        def __init__(self, beam):
+            observed.append(beam)
+
+        def handle_tool_call(self, tool_name, args):
+            return json.dumps({"tool": tool_name, "args": args})
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(
+        sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module
+    )
+    monkeypatch.setattr(module, "_provider", _Provider())
+    monkeypatch.setattr(module, "_sync_adapter", None)
+
+    result = json.loads(module._get_sync_handler("mnemosyne_sync_status")({}))
+
+    assert result["tool"] == "mnemosyne_sync_status"
+    assert observed == [surface_beam]
+
+
+def test_reinitialize_rebinds_provider_sync_adapter_to_new_surface(
+    monkeypatch, provider_modules
+):
+    for name, module in provider_modules.items():
+        surface_a = object()
+        surface_b = object()
+        constructed = []
+        handled = []
+        shutdown = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                self.beam = beam
+                constructed.append(beam)
+
+            def handle_tool_call(self, _tool_name, _args):
+                handled.append(self.beam)
+                return "ok"
+
+            def shutdown(self):
+                shutdown.append(self.beam)
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider()
+        provider._surface_beam = surface_a
+
+        assert provider._handle_sync_tool("mnemosyne_sync_status", {}) == "ok"
+        provider.initialize("replacement", agent_context="subagent")
+        provider._surface_beam = surface_b
+        assert provider._handle_sync_tool("mnemosyne_sync_status", {}) == "ok"
+
+        assert constructed == [surface_a, surface_b]
+        assert handled == [surface_a, surface_b]
+        assert shutdown == [surface_a]
+
+        provider.shutdown()
+        assert shutdown == [surface_a, surface_b]
+        assert provider._surface_beam is None
+
+
+def test_reinitialize_rebinds_standalone_sync_handler_to_new_surface(
+    monkeypatch, provider_modules
+):
+    module = provider_modules["mnemosyne_hermes"]
+    surface_a = object()
+    surface_b = object()
+    constructed = []
+    handled = []
+    shutdown = []
+
+    class _Adapter:
+        def __init__(self, beam):
+            self.beam = beam
+            constructed.append(beam)
+
+        def handle_tool_call(self, _tool_name, _args):
+            handled.append(self.beam)
+            return "ok"
+
+        def shutdown(self):
+            shutdown.append(self.beam)
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module)
+    provider = module.MnemosyneMemoryProvider()
+    monkeypatch.setattr(module, "_provider", provider)
+    monkeypatch.setattr(module, "_sync_adapter", None)
+    provider._surface_beam = surface_a
+    handler = module._get_sync_handler("mnemosyne_sync_status")
+
+    assert handler({}) == "ok"
+    provider.initialize("replacement", agent_context="subagent")
+    provider._surface_beam = surface_b
+    assert handler({}) == "ok"
+
+    assert constructed == [surface_a, surface_b]
+    assert handled == [surface_a, surface_b]
+    assert shutdown == [surface_a]
+
+    provider.shutdown()
+    assert shutdown == [surface_a, surface_b]
+    assert module._sync_adapter is None
+    assert provider._surface_beam is None
+
+
+def test_provider_sync_construction_race_retries_current_surface(
+    monkeypatch, provider_modules
+):
+    for name, module in provider_modules.items():
+        surface_a = object()
+        surface_b = object()
+        construction_started = threading.Event()
+        release_construction = threading.Event()
+        constructed = []
+        handled = []
+        shutdown = []
+        result = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                self.beam = beam
+                constructed.append(beam)
+                if beam is surface_a:
+                    construction_started.set()
+                    assert release_construction.wait(5)
+
+            def handle_tool_call(self, _tool_name, _args):
+                handled.append(self.beam)
+                return "ok"
+
+            def shutdown(self):
+                shutdown.append(self.beam)
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider()
+        provider._surface_beam = surface_a
+
+        worker = threading.Thread(
+            target=lambda: result.append(
+                provider._handle_sync_tool("mnemosyne_sync_status", {})
+            )
+        )
+        worker.start()
+        assert construction_started.wait(5)
+
+        provider.initialize("replacement", agent_context="subagent")
+        with provider._ensure_surface_adapter_lock():
+            provider._surface_beam = surface_b
+        release_construction.set()
+        worker.join(5)
+
+        assert not worker.is_alive()
+        assert result == ["ok"]
+        assert constructed == [surface_a, surface_b]
+        assert handled == [surface_b]
+        assert shutdown == [surface_a]
+        cache_name = (
+            "_sync_adapter"
+            if name == "hermes_memory_provider"
+            else "_provider_sync_adapter"
+        )
+        assert getattr(provider, cache_name).beam is surface_b
+
+        provider.shutdown()
+        assert shutdown == [surface_a, surface_b]
+
+
+def test_standalone_sync_construction_race_retries_current_surface(
+    monkeypatch, provider_modules
+):
+    module = provider_modules["mnemosyne_hermes"]
+    surface_a = object()
+    surface_b = object()
+    construction_started = threading.Event()
+    release_construction = threading.Event()
+    constructed = []
+    handled = []
+    shutdown = []
+    result = []
+
+    class _Adapter:
+        def __init__(self, beam):
+            self.beam = beam
+            constructed.append(beam)
+            if beam is surface_a:
+                construction_started.set()
+                assert release_construction.wait(5)
+
+        def handle_tool_call(self, _tool_name, _args):
+            handled.append(self.beam)
+            return "ok"
+
+        def shutdown(self):
+            shutdown.append(self.beam)
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module)
+    provider = module.MnemosyneMemoryProvider()
+    monkeypatch.setattr(module, "_provider", provider)
+    monkeypatch.setattr(module, "_sync_adapter", None)
+    provider._surface_beam = surface_a
+    handler = module._get_sync_handler("mnemosyne_sync_status")
+
+    worker = threading.Thread(target=lambda: result.append(handler({})))
+    worker.start()
+    assert construction_started.wait(5)
+
+    provider.initialize("replacement", agent_context="subagent")
+    with provider._ensure_surface_adapter_lock():
+        provider._surface_beam = surface_b
+    release_construction.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert result == ["ok"]
+    assert constructed == [surface_a, surface_b]
+    assert handled == [surface_b]
+    assert shutdown == [surface_a]
+    assert module._sync_adapter.beam is surface_b
+
+    provider.shutdown()
+    assert shutdown == [surface_a, surface_b]
+    assert module._sync_adapter is None
+
+
+@pytest.mark.parametrize("invalidation", ["generation", "provider"])
+def test_standalone_sync_construction_retry_exhaustion_is_fail_soft(
+    monkeypatch, provider_modules, invalidation
+):
+    module = provider_modules["mnemosyne_hermes"]
+    max_attempts = module._SYNC_ADAPTER_MAX_ATTEMPTS
+    construction_started = [threading.Event() for _ in range(max_attempts)]
+    release_construction = [threading.Event() for _ in range(max_attempts)]
+    constructed = []
+    shutdown = []
+    result = []
+
+    class _Provider:
+        def __init__(self, surface):
+            self._surface_beam = surface
+            self._surface_generation = 0
+            self._surface_adapter_lock = threading.RLock()
+
+        def _ensure_surface_adapter_lock(self):
+            return self._surface_adapter_lock
+
+        def _ensure_surface_beam_locked(self):
+            return None
+
+    class _Adapter:
+        def __init__(self, beam):
+            self.beam = beam
+            attempt = len(constructed)
+            constructed.append(beam)
+            if attempt >= max_attempts:
+                raise AssertionError("retry limit was exceeded")
+            construction_started[attempt].set()
+            assert release_construction[attempt].wait(5)
+
+        def handle_tool_call(self, _tool_name, _args):
+            raise AssertionError("an invalidated adapter must not handle the call")
+
+        def shutdown(self):
+            shutdown.append(self.beam)
+
+    fake_sync_module = types.ModuleType("mnemosyne_hermes.sync_adapter")
+    setattr(fake_sync_module, "SyncAdapter", _Adapter)
+    monkeypatch.setitem(sys.modules, "mnemosyne_hermes.sync_adapter", fake_sync_module)
+    provider = _Provider(object())
+    monkeypatch.setattr(module, "_provider", provider)
+    monkeypatch.setattr(module, "_sync_adapter", None)
+    handler = module._get_sync_handler("mnemosyne_sync_status")
+
+    worker = threading.Thread(target=lambda: result.append(handler({})))
+    worker.start()
+    for attempt in range(max_attempts):
+        assert construction_started[attempt].wait(5)
+        current_provider = module._provider
+        with current_provider._ensure_surface_adapter_lock():
+            if invalidation == "generation":
+                current_provider._surface_generation += 1
+                current_provider._surface_beam = object()
+            else:
+                module._provider = _Provider(object())
+        release_construction[attempt].set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert json.loads(result[0]) == {
+        "status": "error",
+        "error": "Sync adapter unavailable. Install mnemosyne-memory[sync].",
+    }
+    assert len(constructed) == max_attempts
+    assert shutdown == constructed
+    assert module._sync_adapter is None
 
 
 def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
@@ -1078,7 +1555,9 @@ def test_sync_adapter_config_resolution_matches(monkeypatch, sync_modules):
 
     observed = {}
     for name, module in sync_modules.items():
-        adapter = module.SyncAdapter(object(), {"encrypt": True, "key": "encoded-key"})
+        adapter = module.SyncAdapter(
+            _FakeSurfaceBeam(), {"encrypt": True, "key": "encoded-key"}
+        )
         observed[name] = {
             "remote": adapter.remote,
             "encryption_key_source": adapter._engine.encryption.key_source,
@@ -1108,10 +1587,10 @@ def test_sync_adapter_key_source_file_preserves_path_case(tmp_path, sync_modules
 class _ToolEngine:
     device_id = "device-1"
 
-    def __init__(self, *, local_next_cursor: str | None = "local-cursor"):
-        self.meta = {"last_sync_cursor": "cursor-previous"}
+    def __init__(self, *, pull_cursor: str | None = "local-cursor"):
+        self.meta = {}
         self.conn = self
-        self.local_next_cursor = local_next_cursor
+        self.pull_cursor = pull_cursor
 
     def _meta_get(self, key):
         return self.meta.get(key)
@@ -1119,12 +1598,24 @@ class _ToolEngine:
     def _meta_set(self, key, value):
         self.meta[key] = value
 
-    def pull_changes(self, since_cursor=None, limit=500):
-        return {"events": [{"id": "e1"}], "next_cursor": self.local_next_cursor}
-
-    def push_changes(self, events):
-        self.pushed_events = events
-        return {"accepted": 2, "duplicates": 1, "conflicts": 1}
+    def sync_with(self, remote, mode="bidirectional", api_key=None):
+        phase = {
+            "accepted": 2,
+            "duplicates": 1,
+            "conflicts": 1,
+            "events_fetched": 2,
+            "batches": 1,
+        }
+        if mode == "pull" and self.pull_cursor is not None:
+            self._meta_set(
+                f"last_pull_cursor_{remote.rstrip('/')}", self.pull_cursor
+            )
+        return {
+            "remote": remote.rstrip("/"),
+            "push": phase if mode == "push" else None,
+            "pull": phase if mode == "pull" else None,
+            "errors": [],
+        }
 
     def execute(self, _sql):
         return self
@@ -1136,29 +1627,16 @@ class _ToolEngine:
 def _adapter_with_tool_engine(
     module,
     *,
-    next_cursor: str | None = "remote-cursor",
-    local_next_cursor: str | None = "local-cursor",
+    pull_cursor: str | None = "remote-cursor",
 ):
     adapter = module.SyncAdapter.__new__(module.SyncAdapter)
-    adapter._engine = _ToolEngine(local_next_cursor=local_next_cursor)
+    adapter._engine = _ToolEngine(pull_cursor=pull_cursor)
     adapter._error = None
     adapter.remote = "https://sync.example"
     adapter.encrypt_enabled = False
     adapter.mode = "bidirectional"
     adapter.auth_token = ""
 
-    def fake_post(_path, _payload):
-        return {
-            "status": "ok",
-            "accepted": 2,
-            "duplicates": 1,
-            "conflicts": 1,
-            "events": [{"id": "remote-1"}, {"id": "remote-2"}],
-            "next_cursor": next_cursor,
-        }
-
-    adapter._http_post = fake_post
-    adapter._post = fake_post
     return adapter
 
 
@@ -1179,7 +1657,7 @@ def test_sync_adapter_tool_results_match(sync_modules):
         "pushed": 2,
         "duplicates": 1,
         "conflicts": 1,
-        "next_cursor": "remote-cursor",
+        "next_cursor": "",
     }
     assert observed["hermes_memory_provider"]["pull"] == {
         "status": "ok",
@@ -1193,7 +1671,7 @@ def test_sync_adapter_tool_results_match(sync_modules):
 def test_sync_adapter_push_tolerates_null_next_cursor(sync_modules):
     observed = {}
     for name, module in sync_modules.items():
-        adapter = _adapter_with_tool_engine(module, next_cursor=None, local_next_cursor=None)
+        adapter = _adapter_with_tool_engine(module, pull_cursor=None)
         observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_push", {}))
 
     assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]
@@ -1210,7 +1688,7 @@ def test_sync_adapter_push_tolerates_null_next_cursor(sync_modules):
 def test_sync_adapter_pull_tolerates_null_next_cursor(sync_modules):
     observed = {}
     for name, module in sync_modules.items():
-        adapter = _adapter_with_tool_engine(module, next_cursor=None)
+        adapter = _adapter_with_tool_engine(module, pull_cursor=None)
         observed[name] = json.loads(adapter.handle_tool_call("mnemosyne_sync_pull", {}))
 
     assert observed["mnemosyne_hermes"] == observed["hermes_memory_provider"]

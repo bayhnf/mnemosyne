@@ -13,6 +13,7 @@ All imports are guarded — this module loads safely even if mcp is not installe
 
 from typing import TYPE_CHECKING, Dict, Any, List, TypeAlias
 import json
+import logging
 import math  # noqa: F401
 import os
 import sqlite3
@@ -29,7 +30,13 @@ except ImportError:
     CallToolResult = None
     ErrorData = None
 
-from mnemosyne.core.beam import BeamMemory, _guarded_transaction
+from mnemosyne.core.beam import (
+    BeamMemory,
+    _cross_session_enabled,
+    _guarded_transaction,
+    _session_scope_filter,
+    _session_scope_params,
+)
 
 from mnemosyne.tool_schemas import ALL_TOOL_SCHEMAS
 from mnemosyne.batch_tool import (
@@ -39,6 +46,8 @@ from mnemosyne.batch_tool import (
     dry_run_batch,
     validate_batch_operations,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from mnemosyne.core.memory import Mnemosyne
@@ -326,8 +335,11 @@ def _handle_batch(arguments: Dict[str, Any]) -> Dict[str, Any]:
         audit_event=lambda name, **kwargs: audit_events.append({"event": name, **kwargs}),
     )
     if result.get("status") == "ok":
-        adapter.replay_wrapper_events()
-    result["bank"] = bank
+        try:
+            adapter.replay_wrapper_events()
+        except Exception:
+            logger.error("mnemosyne_batch wrapper replay failed")
+        result["bank"] = bank
     if audit_events:
         result["audit_events"] = audit_events
     return result
@@ -520,11 +532,34 @@ def _handle_invalidate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "invalidated", "memory_id": memory_id}
 
 
+def _resolve_validate_target(arguments: Dict[str, Any]):
+    """Resolve (store, bank, deprecated_alias) for ``mnemosyne_validate``.
+
+    ``store`` selects ``private`` (the caller's own memory) or ``surface`` (the
+    shared cross-agent surface). ``bank`` is the tenant bank and only applies
+    to the private store. Before 4.0 the tool carried the store selector in
+    ``bank``; those two literal values are still honoured there as an alias
+    when ``store`` is not given, so an existing caller keeps working, and the
+    response says so. Any other ``bank`` value is a tenant bank.
+    """
+    store = arguments.get("store")
+    raw_bank = arguments.get("bank")
+    deprecated = False
+    if store is None and raw_bank in ("private", "surface"):
+        store, raw_bank, deprecated = raw_bank, None, True
+    if store is None:
+        store = "private"
+    bank = raw_bank or os.environ.get("MNEMOSYNE_MCP_BANK") or "default"
+    if store == "surface":
+        bank = None
+    return store, bank, deprecated
+
+
 def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_validate tool call."""
     memory_id = arguments.get("memory_id", "")
     action = arguments.get("action", "")
-    bank = arguments.get("bank", "private")
+    store, bank, deprecated_alias = _resolve_validate_target(arguments)
     validator = arguments.get("validator") or os.environ.get("MNEMOSYNE_AUTHOR_ID") or "mcp"
     new_content = arguments.get("new_content", "")
     note = arguments.get("note", "")
@@ -533,15 +568,15 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": "memory_id is required"}
     if action not in ("attest", "update", "invalidate", "delete"):
         return {"error": f"unknown action: {action}"}
-    if bank not in ("private", "surface"):
-        return {"error": f"unknown bank: {bank}"}
+    if store not in ("private", "surface"):
+        return {"error": f"unknown store: {store}"}
     if action == "update" and not new_content:
         return {"error": "new_content is required for action='update'"}
 
-    if bank == "surface":
+    if store == "surface":
         target_beam = _create_surface_instance()
     else:
-        mem = _create_instance()
+        mem = _create_instance(bank=bank)
         target_beam = mem.beam
 
     conn = target_beam.conn
@@ -550,7 +585,24 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         (memory_id,),
     ).fetchone()
     if not existing:
-        return {"error": "memory_not_found", "memory_id": memory_id, "bank": bank}
+        return {"error": "memory_not_found", "memory_id": memory_id, "store": store, "bank": bank}
+
+    if action == "delete":
+        # Align the destructive path with BeamMemory.forget_working: a caller may
+        # only delete a memory its own session can see, honouring the configured
+        # cross-session setting. Resolved before the cascade so a foreign private
+        # id is memory_not_found rather than a partially applied delete (#930).
+        cross_session = _cross_session_enabled()
+        scope_sql = _session_scope_filter(cross_session=cross_session)
+        scope_params = _session_scope_params(
+            target_beam.session_id, cross_session=cross_session
+        )
+        visible = conn.execute(
+            f"SELECT 1 FROM working_memory WHERE id = ? AND {scope_sql}",
+            (memory_id, *scope_params),
+        ).fetchone()
+        if visible is None:
+            return {"error": "memory_not_found", "memory_id": memory_id, "store": store, "bank": bank}
 
     author_id = existing[1]
     prev_content = existing[2]
@@ -569,6 +621,11 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
                     except sqlite3.OperationalError as vec_err:
                         if "no such table" not in str(vec_err).lower():
                             raise
+                gists_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+                ).fetchone()
+                if gists_table is not None:
+                    conn.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
                 conn.execute("DELETE FROM working_memory WHERE id = ?", (memory_id,))
             elif action == "update":
                 conn.execute(
@@ -605,14 +662,21 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         return {"error": "validation_failed", "reason": str(exc), "memory_id": memory_id}
 
-    return {
+    result = {
         "status": f"validation_{action}",
         "memory_id": memory_id,
+        "store": store,
         "bank": bank,
         "validator": validator,
         "author_id": author_id,
         "previous_content": prev_content[:200] if prev_content else None,
     }
+    if deprecated_alias:
+        result["deprecated"] = (
+            "bank='private'|'surface' is a deprecated alias for store; pass "
+            "store=... instead. The alias is removed in 5.0."
+        )
+    return result
 
 
 def _handle_get(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -954,19 +1018,33 @@ def _handle_import(arguments: Dict[str, Any]) -> Dict[str, Any]:
 def _handle_diagnose(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Handle mnemosyne_diagnose tool call."""
     from mnemosyne.diagnose import run_diagnostics
+
+    # ``run_diagnostics`` has always accepted a bank; this handler never passed
+    # one, so a caller diagnosing tenant_a was silently told about the default
+    # bank instead. Resolved without ``_resolve_bank`` on purpose: that helper
+    # collapses "unspecified" to the literal "default", while run_diagnostics
+    # distinguishes None (the profile-root DB) from a named bank. Passing
+    # "default" where None was meant would change which database an existing
+    # caller diagnoses, so unspecified stays None.
+    bank = arguments.get("bank") or os.environ.get("MNEMOSYNE_MCP_BANK") or None
+
     result = run_diagnostics(
         repair_vec_working=bool(arguments.get("repair_vec_working", False)),
         dry_run=bool(arguments.get("dry_run", False)),
+        bank=bank,
     )
     db_path = None
     try:
-        mem = _create_instance()
+        mem = _create_instance(bank=bank or "default")
         if hasattr(mem, "beam") and hasattr(mem.beam, "db_path"):
             db_path = str(mem.beam.db_path)
     except Exception:
         pass
     if db_path:
         result["active_provider_db_path"] = db_path
+    # Name the bank that was inspected so the report cannot be read as covering
+    # a bank the caller did not ask about.
+    result["bank"] = bank
     return _serialize(result)
 
 

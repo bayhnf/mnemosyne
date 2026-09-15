@@ -325,6 +325,32 @@ def _safe_api_endpoint(url: str) -> str:
         return "<invalid-url>"
 
 
+class _EmbeddingPolicyError(ValueError):
+    """A configuration/transport-policy refusal (credentialed cleartext
+    endpoint, credentialed redirect). Raised OUTSIDE the retry-and-degrade
+    machinery: unlike transient transport failures these must surface to the
+    caller instead of degrading to keyword-only recall."""
+
+
+class _CredentialedNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects for key-bearing embedding requests.
+
+    urllib forwards the original request headers, Authorization included,
+    verbatim to the redirect target (verified against a local 302 hop), so a
+    credentialed request must never follow one: the target can be a cleartext
+    http:// URL or an unrelated https:// authority, and either leaks the
+    credential. Fail loud and let the operator point the env var at the final
+    endpoint URL instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise _EmbeddingPolicyError(
+            f"Refusing to follow redirect to {newurl!r} for a credentialed "
+            "embedding request: urllib would forward Authorization to the "
+            "redirect target. Point MNEMOSYNE_EMBEDDING_API_URL at the "
+            "final endpoint URL."
+        )
+
+
 def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     """Embed texts via OpenAI-compatible API (OpenRouter or custom endpoint)."""
     global _API_CALL_COUNT
@@ -333,6 +359,16 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
     is_custom = "openrouter.ai" not in base_url
     if not is_custom and not _OPENAI_API_KEY:
         return None
+    if _OPENAI_API_KEY and not base_url.startswith("https://"):
+        # Fail loud before any request: sending Authorization (and the text
+        # being embedded) over cleartext http:// leaks both on the wire.
+        raise _EmbeddingPolicyError(
+            f"Refusing to send embedding credentials over non-HTTPS endpoint "
+            f"{base_url!r}: point MNEMOSYNE_EMBEDDING_API_URL at an https:// "
+            "URL, or unset MNEMOSYNE_EMBEDDING_API_KEY / OPENAI_API_KEY to "
+            "embed without credentials (for example a local endpoint that "
+            "needs no key)."
+        )
 
     url = f"{base_url.rstrip('/')}/embeddings"
     payload = json.dumps({
@@ -360,11 +396,26 @@ def _embed_api(texts: List[str]) -> Optional[np.ndarray]:
             cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
             if cert_file:
                 ctx.load_verify_locations(cert_file)
-            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            if _OPENAI_API_KEY:
+                # Credentialed: refuse redirects (Authorization would be
+                # forwarded to the target); uncredentialed requests keep
+                # the default redirect behavior.
+                opener = urllib.request.build_opener(
+                    _CredentialedNoRedirect,
+                    urllib.request.HTTPSHandler(context=ctx),
+                )
+                resp_ctx = opener.open(req, timeout=30)
+            else:
+                resp_ctx = urllib.request.urlopen(req, timeout=30, context=ctx)
+            with resp_ctx as resp:
                 data = json.loads(resp.read())
             embeddings = [item["embedding"] for item in data["data"]]
             _API_CALL_COUNT += 1
             return np.array(embeddings, dtype=np.float32)
+        except _EmbeddingPolicyError:
+            # Policy refusals (credentialed redirect) propagate; the generic
+            # handler below would otherwise degrade them to keyword-only.
+            raise
         except urllib.error.HTTPError as exc:
             # Retry rate limits and transient server failures, but surface
             # permanent client/authentication failures to callers as the
