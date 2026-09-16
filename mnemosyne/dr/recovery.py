@@ -67,6 +67,14 @@ def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> Path:
     raise RuntimeError(f"Could not allocate a unique backup filename in {backup_dir}")
 
 
+def _file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _unique_staged_path(db_path: Path) -> Path:
     """A staged-restore path unique per invocation, so concurrent restores to
     the same target cannot clobber each other's staging file."""
@@ -108,14 +116,16 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = _allocate_unique_backup_path(backup_dir, timestamp)
+    meta_path = backup_path.with_suffix(".gz.json")
 
-    # Use sqlite3 online backup API instead of shutil.copyfileobj.
+    try:
+        # Use sqlite3 online backup API instead of shutil.copyfileobj.
     # sqlite3.backup() is lock-aware (acquires read-lock), includes
     # uncommitted WAL frames, and is atomic — it won't produce a torn
     # file if a checkpoint runs partway through. The old copyfileobj
     # approach only copied the .db file, missed .db-wal frames, and
     # could produce corrupted backups under concurrent write load.
-    src = sqlite3.connect(str(db_path))
+        src = sqlite3.connect(str(db_path))
     # Load sqlite-vec on BOTH connections involved in the backup.
     # Without this, src.backup(dst) fails with "no such module: vec0"
     # when copying vec0 virtual tables, AND dst.iterdump() (used to
@@ -123,31 +133,31 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     # way when introspecting the destination's vec0 schema.
     # Uses the module-level helper, which always re-disables extension
     # loading afterward so no connection leaks an enabled state (I-1).
-    _load_sqlite_vec(src)
-    dst = sqlite3.connect(":memory:")
-    _load_sqlite_vec(dst)
-    src.backup(dst)
-    src.close()
+        _load_sqlite_vec(src)
+        dst = sqlite3.connect(":memory:")
+        _load_sqlite_vec(dst)
+        src.backup(dst)
+        src.close()
 
     # Serialize the in-memory backup → gzip → disk
-    buf = io.BytesIO()
-    for line in dst.iterdump():
-        buf.write((line + "\n").encode("utf-8"))
-    dst.close()
+        buf = io.BytesIO()
+        for line in dst.iterdump():
+            buf.write((line + "\n").encode("utf-8"))
+        dst.close()
 
-    dump_bytes = buf.getvalue()
-    with gzip.open(backup_path, "wb") as f_out:
-        f_out.write(dump_bytes)
+        dump_bytes = buf.getvalue()
+        with gzip.open(backup_path, "wb") as f_out:
+            f_out.write(dump_bytes)
 
     # Calculate checksums. ``dump_checksum`` covers the decompressed SQL dump
     # payload so restore can detect corruption that survives gzip decompression
     # (the older file-level checksums only covered the compressed container).
-    db_checksum = hashlib.sha256(db_path.read_bytes()).hexdigest()[:16]
-    backup_checksum = hashlib.sha256(backup_path.read_bytes()).hexdigest()[:16]
-    dump_checksum = hashlib.sha256(dump_bytes).hexdigest()
+        db_checksum = _file_sha256(db_path)[:16]
+        backup_checksum = _file_sha256(backup_path)[:16]
+        dump_checksum = hashlib.sha256(dump_bytes).hexdigest()
 
     # Create metadata
-    metadata = {
+        metadata = {
         "timestamp": timestamp,
         "original_size": db_path.stat().st_size,
         "backup_size": backup_path.stat().st_size,
@@ -158,15 +168,21 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     }
 
     # Save metadata
-    meta_path = backup_path.with_suffix(".gz.json")
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
-    return {
-        "backup_path": str(backup_path),
-        "metadata_path": str(meta_path),
-        **metadata,
-    }
+        return {
+            "backup_path": str(backup_path),
+            "metadata_path": str(meta_path),
+            **metadata,
+        }
+    except BaseException:
+        for stale in (backup_path, meta_path):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
@@ -182,17 +198,18 @@ def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
     (notably restore_backup's executescript of backup-provided SQL) must never
     run with extension loading left enabled. See security-privacy-audit-6a I-1.
     """
-    conn.enable_load_extension(True)
     try:
+        conn.enable_load_extension(True)
         import sqlite_vec
 
         sqlite_vec.load(conn)
-    except (ImportError, sqlite3.OperationalError):
+    except (ImportError, AttributeError, sqlite3.NotSupportedError, sqlite3.OperationalError):
         pass  # optional extra; absence/breakage just means no vec0 tables
     finally:
-        # Always restore the default (extensions disabled) so untrusted SQL
-        # executed later on this connection cannot invoke load_extension.
-        conn.enable_load_extension(False)
+        try:
+            conn.enable_load_extension(False)
+        except (AttributeError, sqlite3.NotSupportedError, sqlite3.OperationalError):
+            pass
 
 
 def _reject_active_sidecars(db_path: Path) -> None:
@@ -353,7 +370,7 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
     with gzip.open(backup_path, "rb") as f_in:
         dump_bytes = f_in.read()
 
-    backup_checksum = hashlib.sha256(backup_path.read_bytes()).hexdigest()[:16]
+    backup_checksum = _file_sha256(backup_path)[:16]
     dump_checksum = hashlib.sha256(dump_bytes).hexdigest()
 
     expected_backup = metadata.get("backup_checksum")
@@ -390,6 +407,13 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
         # --- 4. Rebuild into the staged DB and validate ------------------
         tmp_db = sqlite3.connect(str(staged_path))
         _load_sqlite_vec(tmp_db)
+        tmp_db.set_authorizer(
+            lambda action, *_args: (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_ATTACH
+                else sqlite3.SQLITE_OK
+            )
+        )
         try:
             tmp_db.executescript(dump_bytes.decode("utf-8"))
             integrity = tmp_db.execute("PRAGMA integrity_check").fetchone()[0]
@@ -479,11 +503,11 @@ def emergency_restore(backup_dir: Path = None, db_path: Path = None) -> Dict:
         raise FileNotFoundError("No backups found in " + str(backup_dir))
 
     # Try each backup until one works
-    for backup in backups:
+    for attempt, backup in enumerate(backups, start=1):
         try:
             result = restore_backup(backup, db_path)
             if result["integrity_check"]:
-                return {"restored": True, "backup_used": str(backup), "attempts": 1}
+                return {"restored": True, "backup_used": str(backup), "attempts": attempt}
         except Exception:
             continue
 
@@ -497,7 +521,6 @@ def verify_integrity(db_path: Path = None) -> bool:
     Returns:
         True if database is valid, False otherwise
     """
-    import sqlite3
 
     _, _, default_db = get_default_paths()
     db_path = db_path or default_db
@@ -506,16 +529,9 @@ def verify_integrity(db_path: Path = None) -> bool:
         return False
 
     try:
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.cursor()
-
-        # Run PRAGMA integrity_check
-        cursor.execute("PRAGMA integrity_check")
-        result = cursor.fetchone()
-
-        conn.close()
-
-        return result[0] == "ok"
+        with sqlite3.connect(str(db_path)) as conn:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
+            return result[0] == "ok"
     except Exception:
         return False
 
@@ -544,8 +560,11 @@ def list_backups(backup_dir: Path = None) -> List[Dict]:
         }
 
         if meta_file.exists():
-            with open(meta_file) as f:
-                info["metadata"] = json.load(f)
+            try:
+                with open(meta_file) as f:
+                    info["metadata"] = json.load(f)
+            except json.JSONDecodeError:
+                continue
 
         backups.append(info)
 
@@ -565,17 +584,26 @@ def rotate_backups(backup_dir: Path = None, keep: int = 10) -> Dict:
     _, default_backup_dir, _ = get_default_paths()
     backup_dir = backup_dir or default_backup_dir
 
+    if not isinstance(keep, int) or keep < 0:
+        raise ValueError("keep must be a non-negative integer")
+
     backups = sorted(backup_dir.glob("mnemosyne_backup_*.db.gz"))
 
-    to_delete = backups[:-keep] if len(backups) > keep else []
+    to_delete = backups if keep == 0 else (backups[:-keep] if len(backups) > keep else [])
     deleted = []
 
     for backup in to_delete:
         # Delete backup and metadata
-        backup.unlink()
+        try:
+            backup.unlink()
+        except FileNotFoundError:
+            continue
         meta = backup.with_suffix(".gz.json")
         if meta.exists():
-            meta.unlink()
+            try:
+                meta.unlink()
+            except FileNotFoundError:
+                pass
         deleted.append(backup.name)
 
     return {
@@ -600,9 +628,10 @@ def health_check() -> Dict:
     db_valid = verify_integrity(db_path) if db_exists else False
 
     # Check backups
-    backups = (
-        list(backup_dir.glob("mnemosyne_backup_*.db.gz")) if backup_dir.exists() else []
-    )
+    backups = sorted(
+        backup_dir.glob("mnemosyne_backup_*.db.gz"),
+        key=lambda path: path.stat().st_mtime,
+    ) if backup_dir.exists() else []
 
     return {
         "database": {
@@ -638,7 +667,10 @@ if __name__ == "__main__":
         result = create_backup()
         print(json.dumps(result, indent=2))
 
-    elif cmd == "restore" and len(sys.argv) > 2:
+    elif cmd == "restore":
+        if len(sys.argv) <= 2:
+            print("restore requires a backup path")
+            sys.exit(2)
         result = restore_backup(Path(sys.argv[2]))
         print(json.dumps(result, indent=2))
 
