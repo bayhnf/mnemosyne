@@ -62,10 +62,10 @@ all = ["ctransformers>=0.2.27", "llama-cpp-python>=0.2.0", "huggingface-hub>=0.2
 dev = ["pytest>=7.0", "pytest-timeout>=2.1", "build", "twine", "ruff==0.15.22"]
 
 [project.urls]
-Homepage = "https://github.com/AxDSan/mnemosyne"
-Repository = "https://github.com/AxDSan/mnemosyne"
-Issues = "https://github.com/AxDSan/mnemosyne/issues"
-Documentation = "https://github.com/AxDSan/mnemosyne/blob/main/docs/README.md"
+Homepage = "https://github.com/mnemosyne-oss/mnemosyne"
+Repository = "https://github.com/mnemosyne-oss/mnemosyne"
+Issues = "https://github.com/mnemosyne-oss/mnemosyne/issues"
+Documentation = "https://github.com/mnemosyne-oss/mnemosyne/blob/main/docs/README.md"
 
 [project.scripts]
 mnemosyne-install = "mnemosyne.install:install"
