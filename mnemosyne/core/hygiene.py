@@ -669,6 +669,7 @@ def clean_noise(
     try:
         _ensure_hygiene_log_table(conn)
         cursor = conn.cursor()
+        cursor.execute("BEGIN")
         now = datetime.now().isoformat()
 
         for c in candidates:
