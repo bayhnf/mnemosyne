@@ -45,25 +45,51 @@ def get_default_paths():
     return data_dir, backup_dir, db_path
 
 
-def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> Path:
-    """Atomically allocate a unique backup filename.
+def _allocate_unique_backup_path(backup_dir: Path, timestamp: str) -> tuple[Path, Path, Path]:
+    """Atomically allocate a unique backup filename and private staging paths.
 
-    Uses ``O_CREAT | O_EXCL`` so two concurrent backups can never both select
-    and write the same name (a check-then-create sequence races). Retries with
-    a short random suffix until an exclusive create succeeds.
+    Uses ``O_CREAT | O_EXCL`` on a hidden reservation file and private staging
+    paths so in-progress backups are never visible to ``rotate_backups()``,
+    ``list_backups()``, or other glob consumers until fully published.
     """
     import secrets
 
     suffix = ""
     for _ in range(64):
         name = f"mnemosyne_backup_{timestamp}{suffix}.db.gz"
-        candidate = backup_dir / name
+        final_path = backup_dir / name
+        reservation = backup_dir / f".{name}.reserve"
+        staged_path = backup_dir / f".{name}.staging-{os.getpid()}-{secrets.token_hex(4)}"
+
+        if final_path.exists():
+            suffix = "_" + secrets.token_hex(3)
+            continue
+
         try:
-            fd = os.open(str(candidate), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            fd = os.open(str(reservation), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
             os.close(fd)
-            return candidate
         except FileExistsError:
             suffix = "_" + secrets.token_hex(3)
+            continue
+
+        if final_path.exists():
+            try:
+                reservation.unlink()
+            except OSError:
+                pass
+            suffix = "_" + secrets.token_hex(3)
+            continue
+
+        try:
+            fd = os.open(str(staged_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            os.close(fd)
+            return final_path, staged_path, reservation
+        except BaseException:
+            try:
+                reservation.unlink()
+            except OSError:
+                pass
+            raise
     raise RuntimeError(f"Could not allocate a unique backup filename in {backup_dir}")
 
 
@@ -115,61 +141,74 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = _allocate_unique_backup_path(backup_dir, timestamp)
+    backup_path, staged_backup_path, reservation_path = _allocate_unique_backup_path(
+        backup_dir, timestamp
+    )
     meta_path = backup_path.with_suffix(".gz.json")
+    staged_meta_path = staged_backup_path.with_suffix(".gz.json")
 
     try:
         # Use sqlite3 online backup API instead of shutil.copyfileobj.
-    # sqlite3.backup() is lock-aware (acquires read-lock), includes
-    # uncommitted WAL frames, and is atomic — it won't produce a torn
-    # file if a checkpoint runs partway through. The old copyfileobj
-    # approach only copied the .db file, missed .db-wal frames, and
-    # could produce corrupted backups under concurrent write load.
+        # sqlite3.backup() is lock-aware (acquires read-lock), includes
+        # uncommitted WAL frames, and is atomic — it won't produce a torn
+        # file if a checkpoint runs partway through. The old copyfileobj
+        # approach only copied the .db file, missed .db-wal frames, and
+        # could produce corrupted backups under concurrent write load.
         src = sqlite3.connect(str(db_path))
-    # Load sqlite-vec on BOTH connections involved in the backup.
-    # Without this, src.backup(dst) fails with "no such module: vec0"
-    # when copying vec0 virtual tables, AND dst.iterdump() (used to
-    # serialize the in-memory backup to gzipped SQL) fails the same
-    # way when introspecting the destination's vec0 schema.
-    # Uses the module-level helper, which always re-disables extension
-    # loading afterward so no connection leaks an enabled state (I-1).
+        # Load sqlite-vec on BOTH connections involved in the backup.
+        # Without this, src.backup(dst) fails with "no such module: vec0"
+        # when copying vec0 virtual tables, AND dst.iterdump() (used to
+        # serialize the in-memory backup to gzipped SQL) fails the same
+        # way when introspecting the destination's vec0 schema.
+        # Uses the module-level helper, which always re-disables extension
+        # loading afterward so no connection leaks an enabled state (I-1).
         _load_sqlite_vec(src)
         dst = sqlite3.connect(":memory:")
         _load_sqlite_vec(dst)
         src.backup(dst)
         src.close()
 
-    # Serialize the in-memory backup → gzip → disk
+        # Serialize the in-memory backup → gzip → disk
         buf = io.BytesIO()
         for line in dst.iterdump():
             buf.write((line + "\n").encode("utf-8"))
         dst.close()
 
         dump_bytes = buf.getvalue()
-        with gzip.open(backup_path, "wb") as f_out:
+        with gzip.open(staged_backup_path, "wb") as f_out:
             f_out.write(dump_bytes)
 
-    # Calculate checksums. ``dump_checksum`` covers the decompressed SQL dump
-    # payload so restore can detect corruption that survives gzip decompression
-    # (the older file-level checksums only covered the compressed container).
+        # Calculate checksums. ``dump_checksum`` covers the decompressed SQL dump
+        # payload so restore can detect corruption that survives gzip decompression
+        # (the older file-level checksums only covered the compressed container).
         db_checksum = _file_sha256(db_path)[:16]
-        backup_checksum = _file_sha256(backup_path)[:16]
+        backup_checksum = _file_sha256(staged_backup_path)[:16]
         dump_checksum = hashlib.sha256(dump_bytes).hexdigest()
 
-    # Create metadata
+        # Create metadata
         metadata = {
-        "timestamp": timestamp,
-        "original_size": db_path.stat().st_size,
-        "backup_size": backup_path.stat().st_size,
-        "db_checksum": db_checksum,
-        "backup_checksum": backup_checksum,
-        "dump_checksum": dump_checksum,
-        "compressed": True,
-    }
+            "timestamp": timestamp,
+            "original_size": db_path.stat().st_size,
+            "backup_size": staged_backup_path.stat().st_size,
+            "db_checksum": db_checksum,
+            "backup_checksum": backup_checksum,
+            "dump_checksum": dump_checksum,
+            "compressed": True,
+        }
 
-    # Save metadata
-        with open(meta_path, "w") as f:
+        # Save metadata to staging path then publish both atomically
+        with open(staged_meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
+
+        _fsync_path(staged_backup_path)
+        _fsync_path(staged_meta_path)
+        os.replace(staged_meta_path, meta_path)
+        os.replace(staged_backup_path, backup_path)
+        try:
+            reservation_path.unlink()
+        except OSError:
+            pass
+        _fsync_dir(backup_dir)
 
         return {
             "backup_path": str(backup_path),
@@ -177,7 +216,7 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
             **metadata,
         }
     except BaseException:
-        for stale in (backup_path, meta_path):
+        for stale in (staged_backup_path, staged_meta_path, reservation_path):
             try:
                 stale.unlink()
             except OSError:
@@ -438,20 +477,15 @@ def restore_backup(backup_path: Path, db_path: Path = None) -> Dict:
         _fsync_path(staged_path)
 
         # --- 5. Preserve original, atomic replace -------------------------
-        # ponytail: rename changes SQLite's locked inode; re-acquire the native
-        # lock immediately after replace. A zero-window design needs an in-place
-        # restore or a separately governed sentinel lock.
         if preserved_existed:
             shutil.copy2(db_path, preserved_path)
         os.replace(staged_path, db_path)
         staged_path = None  # consumed by replace
-        # The old-inode lock no longer covers the path; release it and
-        # re-acquire on the replacement inode BEFORE any fsync or verify, so
-        # the vulnerable interval is just the release+acquire syscall pair.
+        # Acquire writer lock on the replacement inode BEFORE releasing the
+        # old-inode lock, ensuring no window where both inodes are unlocked.
+        new_lock = _reacquire_writer_lock(db_path)
         lock_conn = _release_writer_lock(lock_conn)
-        lock_conn = _reacquire_writer_lock(db_path)
-        # Dir fsync persists the rename; dir fd is a different inode, safe
-        # under the held file lock. The staged bytes were fsynced pre-replace.
+        lock_conn = new_lock
         _fsync_dir(db_path.parent)
 
         # --- 6. Post-replace integrity check; restore original on failure

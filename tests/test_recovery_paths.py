@@ -496,6 +496,38 @@ class TestBackupAndStagingRaces:
 
         assert fsynced_dirs, "parent directory was not fsynced after replace"
 
+    def test_backup_staging_files_not_visible_to_rotation_race(
+        self, tmp_path, monkeypatch
+    ):
+        """rotate_backups runs while create_backup is writing staged files.
+        Because in-progress backup artifacts use private staging names,
+        rotation must not delete or disrupt the in-flight backup."""
+        db_path = tmp_path / "src.db"
+        bdir = tmp_path / "bk"
+        _make_db_simple(db_path)
+
+        prior_backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+        assert Path(prior_backup["backup_path"]).exists()
+
+        rotation_ran = _threading.Event()
+        real_fsync = recovery._fsync_path
+
+        def slow_fsync(path):
+            if ".staging-" in str(path) and not rotation_ran.is_set():
+                rotation_ran.set()
+                recovery.rotate_backups(bdir, keep=0)
+            return real_fsync(path)
+
+        monkeypatch.setattr(recovery, "_fsync_path", slow_fsync)
+
+        new_backup = recovery.create_backup(db_path=db_path, backup_dir=bdir)
+
+        assert rotation_ran.is_set()
+        assert not Path(prior_backup["backup_path"]).exists()
+        assert Path(new_backup["backup_path"]).exists()
+        assert Path(new_backup["backup_path"]).stat().st_size > 0
+        assert Path(new_backup["metadata_path"]).exists()
+
     def test_staged_file_cleaned_up_on_failure(self, tmp_path):
         db_path = tmp_path / "src.db"
         bdir = tmp_path / "bk"
@@ -859,6 +891,54 @@ def test_competing_writer_cannot_enter_post_replace_rollback_window(
         if proc.is_alive():
             proc.terminate()
             proc.join(timeout=5)
+
+
+def test_competing_writer_cannot_enter_during_inode_replacement_handoff(
+    tmp_path, monkeypatch
+):
+    """A competing writer attempting BEGIN IMMEDIATE during the inode handoff
+    (after os.replace, while the old-inode lock is released and new-inode lock is
+    acquired) must be blocked because the replacement inode lock is held."""
+    backup, target = _backup_and_target(tmp_path)
+
+    handoff_entered = _threading.Event()
+    competitor_result = {"entered": False, "err": None}
+
+    real_release = recovery._release_writer_lock
+
+    def gated_release(conn):
+        handoff_entered.set()
+        import time
+
+        time.sleep(0.1)
+        return real_release(conn)
+
+    monkeypatch.setattr(recovery, "_release_writer_lock", gated_release)
+
+    def compete():
+        handoff_entered.wait(timeout=10)
+        try:
+            conn = sqlite3.connect(str(target), timeout=0)
+            conn.execute("PRAGMA busy_timeout=0")
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO t VALUES (9999, 'competitor')")
+            conn.commit()
+            conn.close()
+            competitor_result["entered"] = True
+        except sqlite3.OperationalError as exc:
+            competitor_result["err"] = str(exc)
+
+    comp_thread = _threading.Thread(target=compete)
+    comp_thread.start()
+
+    recovery.restore_backup(Path(backup["backup_path"]), target)
+    comp_thread.join(timeout=5)
+
+    assert competitor_result["entered"] is False
+    assert (
+        competitor_result["err"] is not None
+        and "locked" in competitor_result["err"].lower()
+    )
 
 
 def test_restore_backup_post_replace_reacquire_failure_is_visible_and_valid(
