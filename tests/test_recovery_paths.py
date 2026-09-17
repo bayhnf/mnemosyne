@@ -902,15 +902,18 @@ def test_competing_writer_cannot_enter_during_inode_replacement_handoff(
     backup, target = _backup_and_target(tmp_path)
 
     handoff_entered = _threading.Event()
+    competitor_done = _threading.Event()
     competitor_result = {"entered": False, "err": None}
+    release_calls = 0
 
     real_release = recovery._release_writer_lock
 
     def gated_release(conn):
-        handoff_entered.set()
-        import time
-
-        time.sleep(0.1)
+        nonlocal release_calls
+        release_calls += 1
+        if release_calls == 1:
+            handoff_entered.set()
+            competitor_done.wait(timeout=10)
         return real_release(conn)
 
     monkeypatch.setattr(recovery, "_release_writer_lock", gated_release)
@@ -927,6 +930,8 @@ def test_competing_writer_cannot_enter_during_inode_replacement_handoff(
             competitor_result["entered"] = True
         except sqlite3.OperationalError as exc:
             competitor_result["err"] = str(exc)
+        finally:
+            competitor_done.set()
 
     comp_thread = _threading.Thread(target=compete)
     comp_thread.start()

@@ -4,6 +4,7 @@ Mnemosyne Disaster Recovery System
 Comprehensive backup, restore, and integrity verification for Mnemosyne.
 """
 
+import contextlib
 import gzip
 import io
 import os
@@ -155,24 +156,21 @@ def create_backup(db_path: Path = None, backup_dir: Path = None) -> Dict:
         # approach only copied the .db file, missed .db-wal frames, and
         # could produce corrupted backups under concurrent write load.
         src = sqlite3.connect(str(db_path))
-        # Load sqlite-vec on BOTH connections involved in the backup.
-        # Without this, src.backup(dst) fails with "no such module: vec0"
-        # when copying vec0 virtual tables, AND dst.iterdump() (used to
-        # serialize the in-memory backup to gzipped SQL) fails the same
-        # way when introspecting the destination's vec0 schema.
-        # Uses the module-level helper, which always re-disables extension
-        # loading afterward so no connection leaks an enabled state (I-1).
-        _load_sqlite_vec(src)
-        dst = sqlite3.connect(":memory:")
-        _load_sqlite_vec(dst)
-        src.backup(dst)
-        src.close()
+        try:
+            _load_sqlite_vec(src)
+            dst = sqlite3.connect(":memory:")
+            try:
+                _load_sqlite_vec(dst)
+                src.backup(dst)
 
-        # Serialize the in-memory backup → gzip → disk
-        buf = io.BytesIO()
-        for line in dst.iterdump():
-            buf.write((line + "\n").encode("utf-8"))
-        dst.close()
+                # Serialize the in-memory backup → gzip → disk
+                buf = io.BytesIO()
+                for line in dst.iterdump():
+                    buf.write((line + "\n").encode("utf-8"))
+            finally:
+                dst.close()
+        finally:
+            src.close()
 
         dump_bytes = buf.getvalue()
         with gzip.open(staged_backup_path, "wb") as f_out:
@@ -563,9 +561,9 @@ def verify_integrity(db_path: Path = None) -> bool:
         return False
 
     try:
-        with sqlite3.connect(str(db_path)) as conn:
+        with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
             result = conn.execute("PRAGMA integrity_check").fetchone()
-            return result[0] == "ok"
+            return bool(result) and result[0] == "ok"
     except Exception:
         return False
 
@@ -597,7 +595,7 @@ def list_backups(backup_dir: Path = None) -> List[Dict]:
             try:
                 with open(meta_file) as f:
                     info["metadata"] = json.load(f)
-            except json.JSONDecodeError:
+            except (OSError, json.JSONDecodeError):
                 continue
 
         backups.append(info)
