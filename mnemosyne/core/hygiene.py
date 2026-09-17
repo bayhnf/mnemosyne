@@ -672,6 +672,10 @@ def clean_noise(
         now = datetime.now().isoformat()
 
         for c in candidates:
+            if c.table_name not in _ALLOWED_HYGIENE_TABLES:
+                result.errors.append(f"Invalid table name: {c.table_name}:{c.memory_id}")
+                continue
+
             effective_action = action if action != "keep" else c.suggested_action
 
             # Isolate each candidate in its own savepoint so a failure on one
@@ -785,6 +789,14 @@ def clean_noise(
                 except sqlite3.Error:
                     logger.warning("hygiene_savepoint_rollback_failed: %s:%s",
                                    c.table_name, c.memory_id)
+                    conn.rollback()
+                    result.deleted = 0
+                    result.archived = 0
+                    result.flagged = 0
+                    result.kept = 0
+                    result.log_entries = 0
+                    result.errors.append("hygiene_savepoint_rollback_failed")
+                    return result
                 # Structural, content-free error: identify which candidate
                 # failed without leaking raw exception text or a traceback.
                 # table_name:memory_id are candidate references (not content),
@@ -797,6 +809,11 @@ def clean_noise(
         conn.commit()
     except Exception:
         conn.rollback()
+        result.deleted = 0
+        result.archived = 0
+        result.flagged = 0
+        result.kept = 0
+        result.log_entries = 0
         result.errors.append("hygiene_transaction_failed")
     finally:
         conn.close()
