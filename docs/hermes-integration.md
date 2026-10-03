@@ -4,6 +4,15 @@ Mnemosyne is designed as a native memory backend for the [Hermes Agent Framework
 
 > **This is the canonical Hermes setup guide.** The README links here for full instructions.
 
+> **Desktop configuration compatibility:** current Hermes declared provider
+> schemas persist non-secret fields to provider-specific JSON (or Honcho's host
+> store); they cannot target `memory.mnemosyne` in `config.yaml`. Mnemosyne does
+> not declare that desktop surface because doing so would create a second,
+> ignored config store. Use `hermes memory setup` or `hermes config set
+> memory.mnemosyne.<key> <value>` until Hermes ships a config-backed provider
+> schema storage contract. This is an upstream release gate, not a Mnemosyne
+> runtime limitation.
+
 ## Mnemosyne-owned Hermes home contract
 
 For installer and status operations, Mnemosyne uses an explicitly supplied
@@ -79,6 +88,19 @@ Only the paths differ. See
 ```bash
 pip install mnemosyne-hermes
 ```
+
+> **Which Mnemosyne core does the plugin need?** `mnemosyne-hermes` 0.7.3 requires
+> `mnemosyne-memory>=4.0.0b3`, and no stable 4.0 core exists yet, so a stable-only
+> install (prereleases disabled) cannot resolve it. Choose a channel:
+>
+> - **4.0 beta:** allow prereleases and pin the pair:
+>   `pip install --pre 'mnemosyne-memory[embeddings]==4.0.0b3' 'mnemosyne-hermes==0.7.3'`
+> - **Stable:** stay on the last audited stable pair:
+>   `pip install 'mnemosyne-memory[embeddings]==3.15.1' 'mnemosyne-hermes==0.7.1'`
+>
+> Do not use `mnemosyne-hermes` 0.7.2. Its declared floor allows a core that lacks
+> the APIs it imports, so it installs cleanly and then fails when the provider
+> initializes. Once 4.0.0 is released as stable, the plain command above works again.
 
 **Debian / Trixie users:** newer Debian releases block bare pip installs. Use a venv:
 
@@ -416,6 +438,30 @@ ln -s "$PKG"/* "$TARGET/"
 
 If you installed in a custom venv (for example, `~/.hermes-venv`), replace `~/.hermes/hermes-agent/venv/bin/python` with the Python binary inside that venv. Do not combine this manual mode with a wrapper directory, and do not use it to link Docker profiles to the side venv's `site-packages` package.
 
+#### Migrating from the legacy `mnemosyne-install` route
+
+`mnemosyne-install` and `mnemosyne-uninstall` from the core `mnemosyne-memory`
+package remain available, but they are now a compatibility entry point rather
+than a second installer. They no longer create the historical
+`~/.hermes/plugins/mnemosyne -> hermes_memory_provider/` symlink (#651); they
+delegate to the standalone provider and verify the result:
+
+```bash
+mnemosyne-install             # migrate any legacy link, then delegate an install
+mnemosyne-install --status    # verify the provider, the plugin directory, and the config
+mnemosyne-install --migrate   # remove legacy links only
+mnemosyne-install --dry-run   # show what would change without changing it
+```
+
+A legacy install is detected by the resolved target of the plugin link, so a
+link into `mnemosyne_hermes` — including the manual fallback above — is left
+alone. A real directory is reported and preserved, never deleted. When the
+standalone provider is not importable in the current Python, not the
+`mnemosyne-hermes` console script, and not installed in Hermes' own venv, the
+command fails with the install commands instead of recreating the obsolete
+link. `--status` exits non-zero on any of those conditions, so it is usable as
+a check in scripts.
+
 ### Step 3: Activate
 
 ```bash
@@ -496,6 +542,15 @@ mnemosyne doctor --bank default --format both
 mnemosyne repair --report mnemosyne-doctor.json --select working_memory:<ID> --dry-run
 ```
 
+For a database containing sqlite-vec `vec0` tables, install the optional
+`embeddings` extra (or compatible `sqlite-vec`) in the **same runtime** for
+Doctor and repair, then generate a fresh report on the offline copy. Without
+it Doctor can report `present_but_unloadable`, but the incomplete schema
+fingerprint cannot authorize repair, including `expire`. Repair loads sqlite-vec
+on planning and bound write connections and disables further extension loading
+before checking the schema or selecting rows. This does not relax the separate
+trigger, WAL/sidecar, or filesystem-binding restrictions (#1040 D2–D4).
+
 ### Preflight a direct JSON file import
 
 Before importing a JSON file directly through the Hermes provider, run:
@@ -544,10 +599,29 @@ mnemosyne mcp --transport streamable-http --port 8080  # native MCP http transpo
 ```
 
 The HTTP transports bind to loopback (`127.0.0.1`) by default and need no
-token there. A non-loopback bind exposes the selected local SQLite-backed
-memory bank to network clients, so it requires `MNEMOSYNE_MCP_TOKEN`; the
-`streamable-http` transport also requires `MNEMOSYNE_MCP_ALLOWED_HOSTS`, with
-`MNEMOSYNE_MCP_ALLOWED_ORIGINS` optionally restricting browser origins.
+token there unless `MNEMOSYNE_MCP_TOKENS` is set. `MNEMOSYNE_MCP_TOKENS`
+takes precedence; either it or `MNEMOSYNE_MCP_TOKEN` supplies HTTP
+authentication. For multi-agent deployments, set a JSON name-to-secret mapping
+(placeholders shown):
+
+```bash
+export MNEMOSYNE_MCP_TOKENS='{"agent-a":"replace-with-agent-a-secret","agent-b":"replace-with-agent-b-secret"}'
+```
+
+The matched token name becomes the authoritative memory author identity;
+conflicting client-supplied `author_id` values are rejected. Startup is rejected
+when the value is blank or whitespace, malformed JSON, a non-object or empty
+object, or contains non-string or blank names/secrets, duplicate names (including
+names equal after trimming), or duplicate secrets. See the
+[CLI reference](cli-reference.md#multi-agent-tokens-per-agent-identity) and
+[configuration reference](api/configuration.mdx) for the canonical contract.
+
+A non-loopback bind exposes the selected local SQLite-backed memory bank to
+network clients, so it requires authentication; the `streamable-http` transport
+additionally requires `MNEMOSYNE_MCP_ALLOWED_HOSTS`, with
+`MNEMOSYNE_MCP_ALLOWED_ORIGINS` optionally restricting browser origins. Bearer
+tokens on a non-loopback HTTP bind require TLS termination in front of the
+server, using a reverse proxy or secure tunnel.
 
 Mnemosyne does not currently expose a standalone REST API server.
 
