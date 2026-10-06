@@ -24,7 +24,7 @@ import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timedelta, timezone
 
 # Ensure mnemosyne core is importable from this directory
@@ -359,6 +359,68 @@ def _sync_turn_assistant_limit() -> int:
             raw,
         )
         return 800
+
+
+# Machine-only Hermes notice envelopes (background process completion, watch, cron, MCP reload, delegation, compaction)
+_HERMES_MACHINE_NOTICE_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"^\s*\[IMPORTANT:\s+Background\s+process\s+[\w.-]+\s+(?:completed|exited|terminated|matched)\b", re.IGNORECASE),
+    re.compile(r"^\s*\[IMPORTANT:\s+\d+\s+background\s+processes?\s+completed\b", re.IGNORECASE),
+    re.compile(r"^\s*\[IMPORTANT:\s+You\s+are\s+running\s+as\s+a\s+scheduled\s+cron\s+job\b", re.IGNORECASE),
+    re.compile(r"^\s*\[IMPORTANT:\s+MCP\s+servers\s+have\s+been\s+reloaded\b", re.IGNORECASE),
+    re.compile(r"^\s*\[ASYNC\s+(?:DELEGATION\s+)?(?:BATCH\s+)?(?:COMPLETE|TASK\s+FAILED)\b", re.IGNORECASE),
+    re.compile(r"^\s*\[CONTEXT\s+(?:COMPACTION|SUMMARY)\b", re.IGNORECASE),
+    re.compile(r"^\s*\[PRIOR\s+CONTEXT\b", re.IGNORECASE),
+    re.compile(r"^\s*\[Your\s+active\s+task\s+list\s+was\s+preserved\b", re.IGNORECASE),
+    re.compile(r"^\s*\[Planning\s+state\s+preserved\b", re.IGNORECASE),
+    re.compile(r"^\s*A\s+background\s+(?:fan-out\s+of\s+\d+\s+subagent\(s\)|subagent)\s+you\s+dispatched\s+earlier\s+has\s+finished\.(?:\s+You\s+may\s+have\s+moved\s+on\.)?\s*$", re.IGNORECASE),
+)
+
+_HERMES_STRIPPABLE_PREFIXES: Tuple[re.Pattern, ...] = (
+    re.compile(r"^\s*\[System\s+note:[^\]]*\]\s*", re.IGNORECASE),
+    re.compile(r"^\s*\[Replying\s+to:\s+\"Cronjob\s+Response:[^\"]*\"\s*\]\s*", re.IGNORECASE),
+)
+
+
+def _sanitize_hermes_machine_envelope(user_content: str) -> Optional[str]:
+    """Strip known machine-only envelopes while preserving genuine user requests.
+
+    Returns:
+        - None if user_content is purely a machine-generated notice (autosave should be skipped).
+        - Stripped user content if user_content had a leading machine envelope prefix
+          followed by a genuine user prompt (e.g. interruption notice preceding human input).
+        - Unmodified user_content if it is genuine user input.
+    """
+    text = (user_content or "").strip()
+    if not text:
+        return ""
+
+    # Strip machine envelope prefixes (e.g. system note before interrupted prompt)
+    changed = True
+    while changed:
+        changed = False
+        for pat in _HERMES_STRIPPABLE_PREFIXES:
+            m = pat.match(text)
+            if m:
+                text = text[m.end():].strip()
+                changed = True
+
+    if not text:
+        return None
+
+    for pat in _HERMES_MACHINE_NOTICE_PATTERNS:
+        if pat.match(text):
+            # Check for trailing interrupted prompt inside or after the notice
+            if "[System note:" in text:
+                parts = text.split("[System note:")
+                last_part = "[System note:" + parts[-1]
+                m = _HERMES_STRIPPABLE_PREFIXES[0].match(last_part)
+                if m:
+                    tail = last_part[m.end():].strip()
+                    if tail and not any(p.match(tail) for p in _HERMES_MACHINE_NOTICE_PATTERNS):
+                        return tail
+            return None
+
+    return text
 
 def _sanitize_prefetch_query(query: str) -> str:
     """Use core's shared sanitizer lazily to preserve diagnostic CLI imports."""
@@ -2344,36 +2406,41 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 ledger_session_id = str(session_id or "").strip()
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
                     self._active_session_id = ledger_session_id
-                if "user" in self._sync_roles and user_content and len(user_content) > 5:
-                    user_limit = _sync_turn_user_limit()
-                    uc = user_content[:user_limit] if user_limit > 0 else user_content
-                    stored_user = f"[USER] {uc}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, user_content, **kw)) if capture else self._beam.remember
-                    user_memory_id = remember(
-                        content=stored_user,
-                        source="conversation",
-                        importance=0.5,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=user_content,
-                    )
-                    if user_memory_id is not None:
-                        self._capture_identity_signals(user_content)
-                if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
-                    assistant_limit = _sync_turn_assistant_limit()
-                    ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
-                    stored_assistant = f"[ASSISTANT] {ac}"
-                    capture = ledger.capture if ledger else None
-                    remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, assistant_content, **kw)) if capture else self._beam.remember
-                    remember(
-                        content=stored_assistant,
-                        source="conversation",
-                        importance=0.15,
-                        scope=self._default_scope,
-                        extract_entities=True,
-                        _write_policy_content=assistant_content,
-                    )
+                clean_user = _sanitize_hermes_machine_envelope(user_content)
+                beam = self._beam
+                if beam is None:
+                    return
+                if clean_user is not None:
+                    if "user" in self._sync_roles and clean_user and len(clean_user) > 5:
+                        user_limit = _sync_turn_user_limit()
+                        uc = clean_user[:user_limit] if user_limit > 0 else clean_user
+                        stored_user = f"[USER] {uc}"
+                        capture = ledger.capture if ledger else None
+                        remember = (lambda **kw: capture(ledger_session_id, ticket, beam, clean_user, **kw)) if capture else beam.remember
+                        user_memory_id = remember(
+                            content=stored_user,
+                            source="conversation",
+                            importance=0.5,
+                            scope=self._default_scope,
+                            extract_entities=True,
+                            _write_policy_content=clean_user,
+                        )
+                        if user_memory_id is not None:
+                            self._capture_identity_signals(clean_user)
+                    if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
+                        assistant_limit = _sync_turn_assistant_limit()
+                        ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
+                        stored_assistant = f"[ASSISTANT] {ac}"
+                        capture = ledger.capture if ledger else None
+                        remember = (lambda **kw: capture(ledger_session_id, ticket, beam, assistant_content, **kw)) if capture else beam.remember
+                        remember(
+                            content=stored_assistant,
+                            source="conversation",
+                            importance=0.15,
+                            scope=self._default_scope,
+                            extract_entities=True,
+                            _write_policy_content=assistant_content,
+                        )
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
                 self._maybe_auto_sleep()
